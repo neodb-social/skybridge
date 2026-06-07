@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Archive · Skybridge{% endblock %}
+{% block content %}
+<h2>Archive</h2>
+<form method="get" action="/archive">
+  <input type="search" name="q" value="{{ q or '' }}" placeholder="search title / handle / collection">
+  <button type="submit">Search</button>
+</form>
+<p class="muted">{{ total }} record(s){% if q %} matching “{{ q }}”{% endif %}.</p>
+<table>
+  <tr><th>When</th><th>Author</th><th>Type</th><th>Title</th><th></th></tr>
+  {% for r in rows %}
+  <tr>
+    <td class="muted">{{ r.updated_at.strftime("%Y-%m-%d %H:%M") }}</td>
+    <td>{{ r.handle }}</td>
+    <td><span class="pill">{{ r.op }}</span> {{ r.collection.split(".")[-1] }}</td>
+    <td>{{ r.title or r.rkey }}</td>
+    <td><a href="/archive/{{ r.at_uri | urlencode }}">view</a></td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}

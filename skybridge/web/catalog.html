@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Catalog · Skybridge{% endblock %}
+{% block content %}
+<h2>Catalogued works</h2>
+<p class="muted">{{ works|length }} work(s) referenced by bridged marks &amp; reviews.</p>
+<table>
+  <tr><th>Title</th><th>Type</th><th>Identifiers</th><th></th></tr>
+  {% for w in works %}
+  <tr>
+    <td>{{ w.title or w.work_key }}</td>
+    <td><span class="pill">{{ w.creative_work_type }}</span></td>
+    <td class="muted"><code>{{ w.identifiers_json }}</code></td>
+    <td><a href="/catalog/{{ w.work_type }}/{{ w.work_id }}">AP</a></td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}

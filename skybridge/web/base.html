@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Skybridge{% endblock %}</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, sans-serif; max-width: 60rem; margin: 0 auto;
+           padding: 1.5rem; line-height: 1.5; }
+    header { display: flex; gap: 1rem; align-items: baseline; flex-wrap: wrap;
+             border-bottom: 1px solid #8884; padding-bottom: .75rem; margin-bottom: 1rem; }
+    header h1 { margin: 0; font-size: 1.4rem; }
+    nav a { margin-right: 1rem; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+            gap: .75rem; margin: 1rem 0; }
+    .card { border: 1px solid #8884; border-radius: .6rem; padding: .8rem; }
+    .card .n { font-size: 1.8rem; font-weight: 700; }
+    .card .l { color: #888; font-size: .85rem; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: .4rem .5rem; border-bottom: 1px solid #8883;
+             vertical-align: top; font-size: .9rem; }
+    code, pre { background: #8881; border-radius: .3rem; padding: .1rem .3rem; }
+    pre { padding: .8rem; overflow-x: auto; }
+    .pill { font-size: .75rem; padding: .1rem .5rem; border-radius: 1rem; background: #8882; }
+    .two { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    @media (max-width: 40rem) { .two { grid-template-columns: 1fr; } }
+    .muted { color: #888; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1><a href="/" style="text-decoration:none">🌉 Skybridge</a></h1>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/archive">Archive</a>
+      <a href="/catalog">Catalog</a>
+      <a href="/optout">Opt out</a>
+      <a href="/stats">Stats (JSON)</a>
+    </nav>
+  </header>
+  {% block content %}{% endblock %}
+</body>
+</html>

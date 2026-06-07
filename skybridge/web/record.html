@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}{{ record.rkey }} · Skybridge{% endblock %}
+{% block content %}
+<p><a href="/archive">&larr; Archive</a></p>
+<h2>{{ record.collection.split(".")[-1] }} <span class="pill">{{ record.op }}</span></h2>
+<p class="muted">
+  <code>{{ record.at_uri }}</code><br>
+  author {{ record.handle }} · updated {{ record.updated_at.strftime("%Y-%m-%d %H:%M:%S") }}
+  {% if record.deleted_at %} · <strong>deleted {{ record.deleted_at.strftime("%Y-%m-%d %H:%M") }}</strong>{% endif %}
+</p>
+{% if work %}
+<p>Catalog work: <a href="/catalog/{{ work.work_type }}/{{ work.work_id }}">{{ work.title or work.work_key }}</a></p>
+{% endif %}
+<div class="two">
+  <div>
+    <h3>Original popfeed record</h3>
+    <pre>{{ source_pretty }}</pre>
+  </div>
+  <div>
+    <h3>Translated ActivityPub</h3>
+    <pre>{{ ap_pretty }}</pre>
+  </div>
+</div>
+{% endblock %}

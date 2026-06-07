@@ -1,0 +1,124 @@
+"""Skybridge CLI: ``python -m skybridge {serve|ingest|replay|backfill}``.
+
+All subcommands honour ``SKYBRIDGE_DOMAIN`` (and the other env settings); the
+domain is never hardcoded.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import sys
+
+from skybridge.config import get_settings
+from skybridge.db import init_db
+
+
+def _cmd_serve(args: argparse.Namespace) -> int:
+    import uvicorn
+
+    init_db()
+    uvicorn.run("skybridge.main:app", host=args.host, port=args.port, log_level="info")
+    return 0
+
+
+def _cmd_ingest(args: argparse.Namespace) -> int:
+    from skybridge.activitypub.delivery import DeliveryWorker
+    from skybridge.atproto.jetstream import run as jetstream_run
+
+    init_db()
+
+    async def _go() -> int:
+        worker = DeliveryWorker()
+        worker.start()
+        try:
+            return await jetstream_run(worker, stop_after=args.limit)
+        finally:
+            await worker.stop()
+
+    n = asyncio.run(_go())
+    print(f"processed {n} popfeed event(s)")
+    return 0
+
+
+def _cmd_replay(args: argparse.Namespace) -> int:
+    from skybridge.activitypub.delivery import DeliveryWorker
+    from skybridge.atproto.replay import replay_file
+
+    init_db(reset=args.reset)
+
+    async def _go() -> int:
+        worker = DeliveryWorker() if args.deliver else None
+        if worker:
+            worker.start()
+        try:
+            results = await replay_file(args.path, worker=worker, allow_network=args.network)
+            return len(results)
+        finally:
+            if worker:
+                await worker.stop()
+
+    n = asyncio.run(_go())
+    print(f"replayed {n} popfeed record(s) from {args.path}")
+    return 0
+
+
+def _cmd_backfill(args: argparse.Namespace) -> int:
+    from skybridge.activitypub.delivery import DeliveryWorker
+    from skybridge.atproto.backfill import backfill_did
+
+    init_db()
+
+    async def _go() -> int:
+        worker = DeliveryWorker() if args.deliver else None
+        if worker:
+            worker.start()
+        try:
+            results = await backfill_did(args.did, worker=worker, limit=args.limit)
+            return len(results)
+        finally:
+            if worker:
+                await worker.stop()
+
+    n = asyncio.run(_go())
+    print(f"backfilled {n} record(s) for {args.did}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="skybridge", description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_serve = sub.add_parser("serve", help="run the ActivityPub + web server")
+    p_serve.add_argument("--host", default="0.0.0.0")
+    p_serve.add_argument("--port", type=int, default=8000)
+    p_serve.set_defaults(func=_cmd_serve)
+
+    p_ingest = sub.add_parser("ingest", help="stream live popfeed activity from Jetstream")
+    p_ingest.add_argument("--limit", type=int, default=None, help="stop after N events")
+    p_ingest.set_defaults(func=_cmd_ingest)
+
+    p_replay = sub.add_parser("replay", help="replay a captured JSONL fixture")
+    p_replay.add_argument("path")
+    p_replay.add_argument("--reset", action="store_true", help="reset the DB first")
+    p_replay.add_argument("--deliver", action="store_true", help="actually deliver")
+    p_replay.add_argument("--network", action="store_true", help="allow identity resolution")
+    p_replay.set_defaults(func=_cmd_replay)
+
+    p_backfill = sub.add_parser("backfill", help="seed from a DID's existing records")
+    p_backfill.add_argument("did")
+    p_backfill.add_argument("--limit", type=int, default=100)
+    p_backfill.add_argument("--deliver", action="store_true")
+    p_backfill.set_defaults(func=_cmd_backfill)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    settings = get_settings()
+    print(f"skybridge @ {settings.base_url} (db={settings.db_path})", file=sys.stderr)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

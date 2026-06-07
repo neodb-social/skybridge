@@ -1,0 +1,56 @@
+[project]
+name = "skybridge"
+version = "0.1.0"
+description = "Bridge AT Protocol activity (e.g. popfeed) into the Fediverse as NeoDB-compatible ActivityPub."
+requires-python = ">=3.13"
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+dependencies = [
+    "fastapi>=0.136.3",
+    "uvicorn[standard]>=0.49.0",
+    "sqlalchemy>=2.0.50",
+    "pydantic>=2.13.4",
+    "cryptography>=46.0.7,<47",
+    "httpx>=0.28.1",
+    "websockets>=15.0.1,<16",
+    "atproto>=0.0.67",
+    "jinja2>=3.1.6",
+    "python-multipart>=0.0.32",  # FastAPI form parsing for the opt-out endpoint
+]
+
+[dependency-groups]
+# Installed by `uv sync` by default; excluded from published wheels.
+dev = ["pytest>=9.0.3", "ruff>=0.15.16", "ty>=0.0.44", "pre-commit>=4.6.0"]
+
+[build-system]
+requires = ["setuptools>=77"]  # PEP 639 SPDX license expression support
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["skybridge*"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["skybridge", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4", "SIM", "PIE", "RUF"]
+ignore = ["B008"]  # FastAPI dependency-injection defaults (Depends(...) in arg defaults)
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+
+[tool.ty.environment]
+python-version = "3.13"
+
+[tool.ty.rules]
+# ORM .get()/scalar() return Optionals we narrow at runtime via asserts/None
+# checks; keep these as warnings rather than failing the gate.
+unresolved-attribute = "warn"
+possibly-missing-attribute = "warn"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

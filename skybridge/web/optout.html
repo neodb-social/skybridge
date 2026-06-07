@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}Opt out · Skybridge{% endblock %}
+{% block content %}
+<h2>Manage bridging of your AT Protocol account</h2>
+
+<p class="muted">
+  Skybridge republishes <strong>public</strong> popfeed activity into the
+  Fediverse. Check what is bridged for your account below; if you'd rather not
+  be bridged, authenticate and opt out — we'll stop mirroring your activity and
+  ask remote servers to delete what was already federated.
+</p>
+
+<h3>Check status</h3>
+<form method="get" action="/optout">
+  <p>
+    <input name="q" placeholder="alice.bsky.social or did:plc:…" required
+           value="{{ q or '' }}" style="min-width:22rem">
+    <button type="submit">Check status</button>
+  </p>
+</form>
+
+{% if status %}
+<div class="card">
+  <p>
+    <strong>{{ status.handle }}</strong>
+    {% if status.did %} <code>{{ status.did }}</code>{% endif %}
+  </p>
+  <p>
+    {% if status.opted_out %}
+    <span class="pill">opted out</span> Not being bridged.
+    {% elif status.bridged %}
+    <span class="pill">bridged</span> {{ status.record_count }} active record(s) —
+    <a href="/users/{{ status.handle }}">bridged profile</a>
+    {% else %}
+    <span class="pill">not bridged</span> No bridged records.
+    {% if status.unresolved %}<span class="muted">(handle could not be resolved)</span>{% endif %}
+    {% endif %}
+  </p>
+  {% if status.recent %}
+  <table>
+    <tr><th>When</th><th>Type</th><th>Record</th></tr>
+    {% for r in status.recent %}
+    <tr>
+      <td class="muted">{{ r.updated_at.strftime("%Y-%m-%d %H:%M") }}</td>
+      <td><span class="pill">{{ r.op }}</span> {{ r.collection.split(".")[-1] }}</td>
+      <td><a href="/archive/{{ r.at_uri | urlencode }}">{{ r.title or r.rkey }}</a></td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+</div>
+{% endif %}
+
+{% if message %}
+<p class="card"><strong>{{ message }}</strong></p>
+{% endif %}
+
+<h3>Opt out or opt back in</h3>
+<form method="post" action="/optout">
+  <p>
+    <label>Handle or DID<br>
+      <input name="identifier" placeholder="alice.bsky.social" required
+             value="{{ q or '' }}" style="min-width:22rem">
+    </label>
+  </p>
+  <p>
+    <label>App password<br>
+      <input name="app_password" type="password" placeholder="xxxx-xxxx-xxxx-xxxx" required
+             style="min-width:22rem">
+    </label>
+  </p>
+  <p class="muted">
+    Use an <strong>app password</strong> (created in your client's
+    Settings → App Passwords), never your main password. It is used once to
+    verify you control the account and is <strong>never stored</strong>.
+  </p>
+  <p>
+    <button type="submit" name="action" value="opt-out">Opt out &amp; delete</button>
+    <button type="submit" name="action" value="opt-in">Opt back in</button>
+  </p>
+</form>
+{% endblock %}
