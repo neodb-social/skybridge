@@ -23,11 +23,11 @@ def document() -> dict:
     return {
         "version": "2.1",
         "software": {
-            "name": "skybridge",
+            "name": "neodb-skybridge",
             "version": "0.1.0",
             "repository": "https://github.com/neodb-social/skybridge",
         },
-        "protocols": ["activitypub"],
+        "protocols": ["activitypub", "neodb"],
         "services": {"inbound": ["atproto"], "outbound": ["activitypub"]},
         "openRegistrations": False,
         "usage": {
