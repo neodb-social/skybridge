@@ -1,9 +1,11 @@
-# NeoDB Sky Bridge
+# 🌁 NeoDB Sky Bridge
 
-NeoDB Sky Bridge relays public AT Protocol activity (e.g. popfeed) into the Fediverse
-as NeoDB-compatible ActivityPub. 
+NeoDB Sky Bridge relays public AT Protocol records (e.g. popfeed) into the Fediverse
+as NeoDB-compatible ActivityPub activities. 
 
 Any AT Protocol user may optout by themselves.
+
+Any NeoDB server may subscribe to the relay service (`https://SKYBRIDGE_DOMAIN/actor`) to receive the activities.
 
 ## How it works
 
@@ -11,7 +13,7 @@ Any AT Protocol user may optout by themselves.
 Jetstream (atproto firehose)  ─┐
    or replayed fixtures        │   ┌───────────── translate ─────────────┐
                                ▼   │ popfeed record → NeoDB AP object    │
-  filter popfeed collections ──►   │  (one Note per author+work, with    │
+  filter popfeed collections   ├──►│  (one Note per author+work, with    │
   resolve DID → bridged Person │   │   Status/Rating/Comment relatedWith │
   (mint RSA keypair on sight)  │   │   the work) in Create/Update/Delete │
                                │   └─────────────────┬───────────────────┘
@@ -57,10 +59,10 @@ Works are deduplicated across records by *any* shared external identifier
 (imdb/tmdb/igdb/steam/isbn/musicbrainz), so a review and a listItem carrying
 different identifier subsets point at the same catalog entry.
 
-Known but not bridged: `social.popfeed.feed.post` (legacy free-text posts,
-superseded by `feed.review` in 2025), `social.popfeed.feed.reaction` (emoji
-reactions; would become AP `Like`/`EmojiReact`), and the per-episode
-`watchedEpisodes` array on tv listItems.
+Known but not bridged: 
+- `social.popfeed.feed.post` (legacy)
+- `social.popfeed.feed.reaction` (emoji reactions; maybe later `Like`/`EmojiReact` in AP)
+- per-episode `watchedEpisodes` array on tv listItems.
 
 ---
 
@@ -95,12 +97,22 @@ SKYBRIDGE_DOMAIN=bridge.example.social uv run python -m skybridge serve --port 8
 # Stream live popfeed activity from Jetstream (Ctrl-C to stop; --limit N to bound).
 SKYBRIDGE_DOMAIN=bridge.example.social uv run python -m skybridge ingest
 
-# Replay a captured JSONL fixture through the full pipeline (offline).
-uv run python -m skybridge replay fixtures/jetstream_sample.jsonl --reset
-
 # Seed from a single DID's existing popfeed records.
 uv run python -m skybridge backfill did:plc:i6k6scfcdaup4e2va33nkprb
+
+# Replay a captured JSONL fixture through the full pipeline (offline).
+uv run python -m skybridge replay fixtures/jetstream_sample.jsonl --reset
 ```
+
+### Docker
+
+```bash
+cp .env.example .env   # set SKYBRIDGE_DOMAIN (+ SKYBRIDGE_INGEST=1 to go live)
+docker compose up -d   # serves on :8000; SQLite lives in the skybridge-data volume
+```
+
+Every push to `main` runs the checks and publishes multi-arch
+(amd64/arm64) images to Docker Hub as `neodb/skybridge` (`latest` + commit sha tags) 
 
 ### Endpoints
 

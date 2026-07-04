@@ -1,0 +1,27 @@
+services:
+  skybridge:
+    build: .
+    image: neodb/skybridge:latest
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - path: .env # cp .env.example .env and edit
+        required: false
+    volumes:
+      - skybridge-data:/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/stats', timeout=5)",
+        ]
+      interval: 30s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  skybridge-data:
