@@ -381,12 +381,10 @@ def _record_rows(rows: list[Record]) -> list[dict[str, Any]]:
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request) -> Response:
     stats = collect_stats()
-    with session_scope() as session:
-        recent = list(session.scalars(select(Record).order_by(Record.updated_at.desc()).limit(15)))
     return _TEMPLATES.TemplateResponse(
         request,
         "dashboard.html",
-        {"stats": stats, "recent": _record_rows(recent), "settings": get_settings()},
+        {"stats": stats, "settings": get_settings()},
     )
 
 
@@ -403,7 +401,7 @@ async def archive(request: Request, q: str = "") -> Response:
                     Record.source_json.like(like),
                 )
             )
-        rows = list(session.scalars(stmt.limit(200)))
+        rows = list(session.scalars(stmt.limit(100)))
     return _TEMPLATES.TemplateResponse(
         request,
         "archive.html",

@@ -19,16 +19,4 @@
   {% endfor %}
 </table>
 
-<h2>Recent activity</h2>
-<table>
-  <tr><th>When</th><th>Author</th><th>Type</th><th>Record</th></tr>
-  {% for r in recent %}
-  <tr>
-    <td class="muted">{{ r.updated_at.strftime("%Y-%m-%d %H:%M") }}</td>
-    <td>{{ r.handle }}</td>
-    <td><span class="pill">{{ r.op }}</span> {{ r.collection.split(".")[-1] }}</td>
-    <td><a href="/archive/{{ r.at_uri | urlencode }}">{{ r.title or r.rkey }}</a></td>
-  </tr>
-  {% endfor %}
-</table>
 {% endblock %}

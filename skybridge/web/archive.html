@@ -1,12 +1,12 @@
 {% extends "base.html" %}
-{% block title %}Archive · Skybridge{% endblock %}
+{% block title %}Recent · Skybridge{% endblock %}
 {% block content %}
-<h2>Archive</h2>
+<h2>Recent</h2>
 <form method="get" action="/archive">
   <input type="search" name="q" value="{{ q or '' }}" placeholder="search title / handle / collection">
   <button type="submit">Search</button>
 </form>
-<p class="muted">{{ total }} record(s){% if q %} matching “{{ q }}”{% endif %}.</p>
+<p class="muted">{{ total }} most recent record(s){% if q %} matching “{{ q }}”{% endif %} (up to 100).</p>
 <table>
   <tr><th>When</th><th>Author</th><th>Type</th><th>Title</th><th></th></tr>
   {% for r in rows %}
