@@ -98,20 +98,3 @@ def _resolve_identity(identifier: str) -> tuple[str | None, str | None]:
                 )
                 break
     return did, pds
-
-
-def resolve_did(identifier: str) -> str | None:
-    """Best-effort handle-or-DID → DID resolution. Returns ``None`` on failure.
-
-    Syntactically invalid identifiers are rejected before any network I/O so
-    unauthenticated callers cannot use us to probe arbitrary hosts.
-    """
-    ident = identifier.strip()
-    if not is_valid_identifier(ident):
-        return None
-    try:
-        did, _ = _resolve_identity(ident)
-        return did
-    except Exception as exc:
-        log.info("identity resolution failed for %s: %s", identifier, type(exc).__name__)
-        return None

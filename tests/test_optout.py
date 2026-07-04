@@ -7,7 +7,7 @@ import asyncio
 import pytest
 from fastapi.testclient import TestClient
 from skybridge import optout
-from skybridge.atproto import auth, oauth
+from skybridge.atproto import oauth
 from skybridge.atproto.replay import replay_file
 from skybridge.db import session_scope
 from skybridge.main import app
@@ -179,48 +179,25 @@ def test_optout_endpoint_rejects_unknown_action(client):
     assert not optout.is_opted_out(DID)
 
 
-def test_status_lookup_by_did(client):
+def test_status_not_shown_without_login(client):
+    # The old unauthenticated ?q= lookup is gone: no way to enumerate what we
+    # hold about an account without signing in as it.
     r = client.get("/optout", params={"q": DID})
     assert r.status_code == 200
-    assert DID in r.text
-    assert "active record" in r.text
+    assert DID not in r.text
+    assert "active record" not in r.text
 
 
-def test_status_lookup_by_handle(client):
-    with session_scope() as session:
-        actor = session.get(BridgedActor, DID)
-        assert actor is not None
-        actor.handle = "author.test"
-    r = client.get("/optout", params={"q": "@author.test"})
+def test_status_action_via_oauth_shows_card_without_changes(client):
+    before = _active_records(DID)
+    assert before > 0
+    r = client.get("/oauth/callback", params={"state": "status", "code": "c", "iss": "x"})
     assert r.status_code == 200
-    assert "/users/author.test" in r.text
-    assert "active record" in r.text
-
-
-def test_status_lookup_shows_opted_out(client):
-    asyncio.run(optout.opt_out(DID))
-    r = client.get("/optout", params={"q": DID})
-    assert r.status_code == 200
-    assert "opted out" in r.text
-
-
-def test_status_lookup_unresolvable_handle(client, monkeypatch):
-    monkeypatch.setattr(auth, "resolve_did", lambda ident: None)
-    r = client.get("/optout", params={"q": "nobody.test"})
-    assert r.status_code == 200
-    assert "No bridged records" in r.text
-    assert "could not be resolved" in r.text
-
-
-def test_status_lookup_preemptive_optout(client, monkeypatch):
-    # Opted out by DID without ever being bridged: lookup by handle must still
-    # report it, which requires the network handle->DID resolve (stubbed here).
-    other = "did:plc:neverbridged0000000000000"
-    asyncio.run(optout.opt_out(other))
-    monkeypatch.setattr(auth, "resolve_did", lambda ident: other)
-    r = client.get("/optout", params={"q": "somebody.test"})
-    assert r.status_code == 200
-    assert "opted out" in r.text
+    assert "Signed in as author.test" in r.text
+    assert "active record" in r.text  # the status card
+    # purely informational: nothing purged, no opt-out recorded
+    assert _active_records(DID) == before
+    assert not optout.is_opted_out(DID)
 
 
 def test_opted_out_actor_is_gone(client):

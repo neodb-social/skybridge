@@ -11,7 +11,6 @@ import asyncio
 import json
 import logging
 import os
-import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -27,7 +26,7 @@ from skybridge.activitypub import nodeinfo, objects, webfinger
 from skybridge.activitypub.actors import RELAY_DID, person_actor, relay_actor
 from skybridge.activitypub.delivery import DeliveryWorker
 from skybridge.activitypub.inbox import handle_inbox
-from skybridge.atproto import auth, oauth
+from skybridge.atproto import oauth
 from skybridge.config import get_settings
 from skybridge.db import init_db, session_scope
 from skybridge.models import BridgedActor, Record, Work
@@ -238,63 +237,14 @@ def _status_ctx(did: str, fallback_handle: str | None = None) -> dict[str, Any]:
     }
 
 
-# The lookup is unauthenticated, so bound the outbound resolution it can
-# trigger: a small TTL cache absorbs repeats and a semaphore caps concurrency.
-_RESOLVE_CACHE: dict[str, tuple[float, str | None]] = {}
-_RESOLVE_CACHE_TTL = 300.0
-_RESOLVE_CACHE_MAX = 1024
-_RESOLVE_SEM = asyncio.Semaphore(4)
-
-
-async def _resolve_did_bounded(ident: str) -> str | None:
-    cached = _RESOLVE_CACHE.get(ident)
-    if cached is not None and time.monotonic() - cached[0] < _RESOLVE_CACHE_TTL:
-        return cached[1]
-    async with _RESOLVE_SEM:
-        did = await asyncio.to_thread(auth.resolve_did, ident)
-    if len(_RESOLVE_CACHE) >= _RESOLVE_CACHE_MAX:
-        _RESOLVE_CACHE.clear()
-    _RESOLVE_CACHE[ident] = (time.monotonic(), did)
-    return did
-
-
-async def _lookup_status(query: str) -> dict[str, Any]:
-    """Resolve a handle-or-DID query to a bridging-status template context."""
-    ident = query.strip().lstrip("@")
-    if ident.startswith("did:"):
-        return _status_ctx(ident)
-    with session_scope() as session:
-        actor = session.scalar(select(BridgedActor).where(BridgedActor.handle == ident))
-        did = actor.did if actor is not None else None
-    if did is None:
-        # Pre-emptive opt-outs are keyed by DID only, so an unknown handle
-        # needs a network handle→DID resolve (best effort, off the event loop).
-        did = await _resolve_did_bounded(ident)
-    if did is None:
-        return {
-            "did": None,
-            "handle": ident,
-            "bridged": False,
-            "opted_out": False,
-            "record_count": 0,
-            "recent": [],
-            "unresolved": True,
-        }
-    return _status_ctx(did, fallback_handle=ident)
-
-
 @app.get("/optout", response_class=HTMLResponse)
-async def optout_form(request: Request, q: str = "") -> Response:
-    status = await _lookup_status(q) if q.strip() else None
+async def optout_form(request: Request) -> Response:
+    # Status is only shown after the account holder signs in (OAuth callback):
+    # an open lookup would let anyone enumerate what we hold about a user.
     return _TEMPLATES.TemplateResponse(
         request,
         "optout.html",
-        {
-            "message": None,
-            "q": q.strip().lstrip("@"),
-            "status": status,
-            "settings": get_settings(),
-        },
+        {"message": None, "q": "", "status": None, "settings": get_settings()},
     )
 
 
@@ -324,7 +274,7 @@ async def optout_submit(
     executes in the OAuth callback.
     """
     wants_html = "text/html" in request.headers.get("accept", "")
-    if action not in ("opt-out", "opt-in"):
+    if action not in ("status", "opt-out", "opt-in"):
         # Never let a malformed action fall through to the destructive default.
         return _optout_error(request, wants_html, "Unknown action.", "invalid_action", 400)
     flow = await asyncio.to_thread(oauth.start_flow, identifier, action)
@@ -371,7 +321,9 @@ async def oauth_callback(
         )
 
     worker = getattr(app.state, "worker", None)
-    if result.action == "opt-in":
+    if result.action == "status":
+        msg = f"Signed in as {result.handle}."
+    elif result.action == "opt-in":
         was_out = optout.opt_in(result.did)
         msg = (
             f"{result.handle} is opted back in; future activity will bridge again."

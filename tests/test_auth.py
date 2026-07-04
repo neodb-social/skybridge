@@ -30,13 +30,10 @@ def test_is_valid_identifier_rejects_special_use_hosts():
     assert auth.is_valid_identifier("did:web:pds.example.com%3A8443:alice")
 
 
-def test_resolve_did_rejects_invalid_identifier_without_network(monkeypatch):
-    def _boom(_ident: str):
-        raise AssertionError("must not resolve invalid identifiers")
-
-    monkeypatch.setattr(auth, "_resolve_identity", _boom)
-    assert auth.resolve_did("not a handle!") is None
-    assert auth.resolve_did("' OR 1=1 --") is None
+def test_invalid_identifiers_rejected_before_any_network():
+    # oauth.start_flow gates on is_valid_identifier before resolving
+    assert not auth.is_valid_identifier("not a handle!")
+    assert not auth.is_valid_identifier("' OR 1=1 --")
 
 
 def test_is_public_https_rejects_unsafe_endpoints():

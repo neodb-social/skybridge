@@ -5,19 +5,10 @@
 
 <p class="muted">
   Skybridge republishes <strong>public</strong> popfeed activity into the
-  Fediverse. Check what is bridged for your account below; if you'd rather not
-  be bridged, authenticate and opt out — we'll stop mirroring your activity and
-  ask remote servers to delete what was already federated.
+  Fediverse. Sign in with your AT Protocol account to see what is bridged for
+  it; if you'd rather not be bridged, opt out — we'll stop mirroring your
+  activity and ask remote servers to delete what was already federated.
 </p>
-
-<h3>Check status</h3>
-<form method="get" action="/optout">
-  <p>
-    <input name="q" placeholder="alice.bsky.social or did:plc:…" required
-           value="{{ q or '' }}" style="min-width:22rem">
-    <button type="submit">Check status</button>
-  </p>
-</form>
 
 {% if status %}
 <div class="card">
@@ -55,7 +46,7 @@
 <p class="card"><strong>{{ message }}</strong></p>
 {% endif %}
 
-<h3>Opt out or opt back in</h3>
+<h3>Check status, opt out, or opt back in</h3>
 <form method="post" action="/optout">
   <p>
     <label>Handle or DID<br>
@@ -70,6 +61,7 @@
     action you chose.
   </p>
   <p>
+    <button type="submit" name="action" value="status">Check status</button>
     <button type="submit" name="action" value="opt-out">Opt out &amp; delete</button>
     <button type="submit" name="action" value="opt-in">Opt back in</button>
   </p>

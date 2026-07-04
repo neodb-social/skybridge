@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 <p class="muted">{{ settings.relay_summary }}</p>
-<p>Relay actor: <code>{{ settings.acct(settings.relay_username) }}</code></p>
+<p>Relay url: <code>{{ settings.relay_actor_id }}</code></p>
 
 <div class="grid">
   <div class="card"><div class="n">{{ stats.bridged_actors }}</div><div class="l">bridged authors</div></div>
