@@ -2,6 +2,7 @@
 .github
 .venv
 .env
+data
 *.db
 __pycache__
 *.egg-info

@@ -85,10 +85,11 @@ Known but not bridged:
 |---|---|---|
 | `SKYBRIDGE_DOMAIN` | `localhost:8000` | Public host of this relay (the single source of identity) |
 | `SKYBRIDGE_SCHEME` | `https` (`http` for localhost) | URL scheme |
-| `SKYBRIDGE_DB` | `skybridge.db` | SQLite path (`:memory:` for ephemeral) |
+| `SKYBRIDGE_DATA` | `./data` (`/data` in Docker) | Folder for all mutable state (SQLite DB, relay key) |
+| `SKYBRIDGE_DB` | `$SKYBRIDGE_DATA/skybridge.db` | SQLite path override (`:memory:` for ephemeral) |
 | `SKYBRIDGE_JETSTREAM` | public jetstream2 us-east | Jetstream WebSocket endpoint |
 | `SKYBRIDGE_RELAY_KEY` | unset | Relay actor private key (PEM); wins over the key file |
-| `SKYBRIDGE_RELAY_KEY_FILE` | `relay_key.pem` (`/data/relay_key.pem` in Docker) | Relay key PEM file, minted on first use |
+| `SKYBRIDGE_RELAY_KEY_FILE` | `$SKYBRIDGE_DATA/relay_key.pem` | Relay key PEM file override, minted on first use |
 
 The relay actor signs outbound activities with an RSA key that lives outside
 the database. If you don't provide one, it is minted into

@@ -52,7 +52,10 @@ class Settings:
 
     domain: str = "localhost:8000"
     scheme: str = "https"
-    db_path: str = "skybridge.db"
+    # All mutable state (SQLite DB, relay key) lives under SKYBRIDGE_DATA;
+    # the individual paths can still be overridden separately.
+    data_dir: str = "data"
+    db_path: str = "data/skybridge.db"
     jetstream_url: str = DEFAULT_JETSTREAM
     wanted_collections: tuple[str, ...] = WANTED_COLLECTIONS
     # Relay actor identity.
@@ -62,7 +65,7 @@ class Settings:
     # otherwise the PEM file at SKYBRIDGE_RELAY_KEY_FILE, minted on first use,
     # so the secret lives outside the database.
     relay_key_pem: str | None = None
-    relay_key_file: str = "relay_key.pem"
+    relay_key_file: str = "data/relay_key.pem"
     relay_summary: str = (
         "Skybridge mirrors public AT Protocol activities (e.g. popfeed) into the "
         "Fediverse as NeoDB-compatible ActivityPub."
@@ -110,13 +113,16 @@ def _from_env() -> Settings:
     scheme = os.environ.get(
         "SKYBRIDGE_SCHEME", "http" if domain.startswith("localhost") else "https"
     )
+    data_dir = os.environ.get("SKYBRIDGE_DATA", "data")
     return Settings(
         domain=domain,
         scheme=scheme,
-        db_path=os.environ.get("SKYBRIDGE_DB", "skybridge.db"),
+        data_dir=data_dir,
+        db_path=os.environ.get("SKYBRIDGE_DB") or os.path.join(data_dir, "skybridge.db"),
         jetstream_url=os.environ.get("SKYBRIDGE_JETSTREAM", DEFAULT_JETSTREAM),
         relay_key_pem=os.environ.get("SKYBRIDGE_RELAY_KEY") or None,
-        relay_key_file=os.environ.get("SKYBRIDGE_RELAY_KEY_FILE", "relay_key.pem"),
+        relay_key_file=os.environ.get("SKYBRIDGE_RELAY_KEY_FILE")
+        or os.path.join(data_dir, "relay_key.pem"),
     )
 
 

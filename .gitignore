@@ -1,4 +1,5 @@
 # runtime state
+data/
 *.db
 
 # python

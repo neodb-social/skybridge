@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -30,6 +31,7 @@ def _make_engine() -> Engine:
             poolclass=StaticPool,
             future=True,
         )
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     return create_engine(
         f"sqlite:///{path}", connect_args={"check_same_thread": False}, future=True
     )
