@@ -21,6 +21,7 @@ from skybridge.models import BridgedActor, utcnow
 
 PLC_DIRECTORY = "https://plc.directory"
 _PROFILE_COLLECTION = "social.popfeed.actor.profile"
+_BSKY_PROFILE_COLLECTION = "app.bsky.actor.profile"
 
 
 @dataclass
@@ -46,28 +47,82 @@ def _fallback_handle(did: str) -> str:
     return f"{tail}.did"
 
 
+def _profile_record(pds: str, did: str, collection: str) -> dict:
+    prof = _http_json(
+        f"{pds}/xrpc/com.atproto.repo.getRecord?repo={did}&collection={collection}&rkey=self"
+    )
+    return (prof or {}).get("value", {}) if isinstance(prof, dict) else {}
+
+
+def _avatar_url(value: dict, *, did: str, pds: str) -> str | None:
+    """Extract an avatar blob URL from a profile record's ``avatar`` field.
+
+    Handles both the modern blob shape (``{"ref": {"$link": cid}, ...}``) and
+    the legacy shape (a plain ``"cid"`` key). Defensive by design: any
+    missing/unexpected shape yields ``None`` rather than raising, since this
+    only ever runs opportunistically during best-effort identity resolution.
+    """
+    try:
+        blob = value.get("avatar")
+        if not isinstance(blob, dict):
+            return None
+        cid = blob.get("cid") or blob.get("ref", {}).get("$link")
+        if not cid:
+            return None
+        return f"{pds}/xrpc/com.atproto.sync.getBlob?did={did}&cid={cid}"
+    except Exception:
+        return None
+
+
+def _pds_from_doc(doc: dict) -> str | None:
+    """Extract the atproto PDS endpoint from a PLC document."""
+    for svc in doc.get("service", []):
+        if svc.get("id") == "#atproto_pds":
+            return svc.get("serviceEndpoint")
+    return None
+
+
+def resolve_pds(did: str) -> str | None:
+    """Fetch the PLC doc for ``did`` and return its atproto PDS endpoint.
+
+    Offline-safe: yields ``None`` on any failure (unresolvable DID, network
+    error, malformed doc, no ``#atproto_pds`` service) rather than raising.
+    """
+    doc = _http_json(f"{PLC_DIRECTORY}/{did}")
+    return _pds_from_doc(doc) if doc else None
+
+
 def resolve_remote(did: str) -> Identity:
-    """Resolve a DID to a handle (+ optional display name) over the network."""
+    """Resolve a DID to a handle (+ optional display name/avatar) over the network.
+
+    Profile info comes from the ``social.popfeed.actor.profile`` record first.
+    Observed popfeed profiles never carry an ``avatar`` blob (and sometimes
+    have an empty ``displayName``), so whenever either field is still missing
+    we fall back to the ``app.bsky.actor.profile`` record on the same PDS —
+    in practice the only real source of an avatar. Popfeed values win over the
+    bsky fallback whenever present. Avatars are blobs served off the PDS via
+    the ``com.atproto.sync.getBlob`` endpoint, not plain URLs.
+    """
     doc = _http_json(f"{PLC_DIRECTORY}/{did}")
     handle: str | None = None
-    pds: str | None = None
     if doc:
         for aka in doc.get("alsoKnownAs", []):
             if isinstance(aka, str) and aka.startswith("at://"):
                 handle = aka[len("at://") :]
                 break
-        for svc in doc.get("service", []):
-            if svc.get("id") == "#atproto_pds":
-                pds = svc.get("serviceEndpoint")
+    pds = _pds_from_doc(doc) if doc else None
     display_name: str | None = None
     avatar: str | None = None
     if pds:
-        prof = _http_json(
-            f"{pds}/xrpc/com.atproto.repo.getRecord"
-            f"?repo={did}&collection={_PROFILE_COLLECTION}&rkey=self"
-        )
-        val = (prof or {}).get("value", {}) if isinstance(prof, dict) else {}
-        display_name = val.get("displayName") or val.get("name")
+        val = _profile_record(pds, did, _PROFILE_COLLECTION)
+        display_name = val.get("displayName") or val.get("name") or None
+        avatar = _avatar_url(val, did=did, pds=pds)
+        if not display_name or not avatar:
+            bsky_val = _profile_record(pds, did, _BSKY_PROFILE_COLLECTION)
+            if not display_name:
+                display_name = bsky_val.get("displayName") or bsky_val.get("name") or None
+            if not avatar:
+                avatar = _avatar_url(bsky_val, did=did, pds=pds)
     return Identity(
         did=did,
         handle=handle or _fallback_handle(did),

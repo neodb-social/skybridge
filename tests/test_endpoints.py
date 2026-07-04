@@ -76,6 +76,18 @@ def test_person_actor_document(client, settings):
     assert "publicKey" in doc
 
 
+def test_person_actor_document_includes_icon_when_avatar_set(client, settings):
+    handle = _a_bridged_handle()
+    avatar_url = "https://pds.example/xrpc/com.atproto.sync.getBlob?did=did:plc:test&cid=bafkrei"
+    with session_scope() as session:
+        actor = session.scalar(select(BridgedActor).where(BridgedActor.handle == handle))
+        assert actor is not None
+        actor.avatar = avatar_url
+    r = client.get(f"/users/{handle}", headers=AP)
+    assert r.status_code == 200
+    assert r.json()["icon"] == {"type": "Image", "url": avatar_url}
+
+
 def test_webfinger_resolves_bridged_user(client, settings):
     handle = _a_bridged_handle()
     r = client.get("/.well-known/webfinger", params={"resource": settings.acct(handle)})
