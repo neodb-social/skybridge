@@ -91,6 +91,8 @@ def test_nodeinfo(client):
     doc = client.get("/nodeinfo/2.1").json()
     assert doc["software"]["name"] == "neodb-skybridge"
     assert doc["usage"]["users"]["total"] >= 1
+    assert doc["metadata"]["nodeEnvironment"] == "production"
+    assert "neodb" in doc["protocols"]
 
 
 def test_review_object_dereferenceable(client, settings):

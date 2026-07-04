@@ -35,6 +35,9 @@ def document() -> dict:
             "localPosts": stats["records_active"],
         },
         "metadata": {
+            # NeoDB's peer discovery (takahe get_neodb_peers) requires
+            # metadata.nodeEnvironment == "production" plus "neodb" in protocols
+            "nodeEnvironment": "production",
             "nodeName": get_settings().relay_name,
             "nodeDescription": get_settings().relay_summary,
             "subscribers": stats["subscribers_accepted"],
