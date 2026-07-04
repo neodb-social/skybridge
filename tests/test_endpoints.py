@@ -89,7 +89,7 @@ def test_nodeinfo(client):
     href = disc.json()["links"][0]["href"]
     assert href.endswith("/nodeinfo/2.1")
     doc = client.get("/nodeinfo/2.1").json()
-    assert doc["software"]["name"] == "skybridge"
+    assert doc["software"]["name"] == "neodb-skybridge"
     assert doc["usage"]["users"]["total"] >= 1
 
 
@@ -150,17 +150,21 @@ def test_never_published_deleted_record_is_404(client, settings):
     assert r.status_code == 404
 
 
-def test_catalog_object(client):
-    with session_scope() as session:
-        rec = session.scalar(select(Record).where(Record.work_key.isnot(None)))
-        assert rec is not None
-        work_key = rec.work_key
-        assert work_key is not None
-    work_type, _, work_id = work_key.partition(":")
-    r = client.get(f"/catalog/{work_type}/{work_id}", headers=AP)
+def test_catalog_object_is_neodb_item(client, settings):
+    # The fixture review's movie work, in NeoDB ItemSchema shape.
+    r = client.get("/catalog/movie/imdbId-tt6710474", headers=AP)
     assert r.status_code == 200
     doc = r.json()
-    assert doc["id"].endswith(f"/catalog/{work_type}/{work_id}")
+    # catalog/sites/fedi.py requirements: supported type, id == fetched url
+    assert doc["type"] == "Movie"
+    assert doc["id"] == settings.catalog_id("movie", "imdbId-tt6710474")
+    assert doc["display_title"] == "Everything Everywhere All at Once"
+    # identifier URLs let the peer merge with its existing catalog
+    urls = [e["url"] for e in doc["external_resources"]]
+    assert "https://www.imdb.com/title/tt6710474" in urls
+    assert "https://www.themoviedb.org/movie/545611" in urls
+    assert doc["imdb"] == "tt6710474"
+    assert doc["cover_image_url"].startswith("https://")
 
 
 def test_stats_json(client):

@@ -28,6 +28,61 @@ WORK_TYPE_TO_CATEGORY: dict[str, str] = {
     "podcast": "podcast",
 }
 
+# popfeed creativeWorkType -> NeoDB catalog item AP type. This is the `type`
+# NeoDB peers require both on the Note's work tag and on the dereferenced
+# catalog object (neodb takahe/ap_handlers._supported_ap_catalog_item_types
+# and catalog/sites/fedi.py supported_types); anything else is dropped.
+WORK_TYPE_TO_AP_TYPE: dict[str, str] = {
+    "movie": "Movie",
+    "tv_show": "TVShow",
+    "tv_season": "TVSeason",
+    "video_game": "Game",
+    "book": "Edition",
+    "music": "Album",
+    "album": "Album",
+    "ep": "Album",
+    "podcast": "Podcast",
+}
+
+
+def ap_type_for(work_type: str) -> str | None:
+    return WORK_TYPE_TO_AP_TYPE.get(work_type)
+
+
+def external_resource_urls(work_type: str, identifiers: dict) -> list[str]:
+    """Canonical external-site URLs for the work's identifiers.
+
+    NeoDB resolves these against its catalog site URL patterns
+    (catalog/sites/{imdb,tmdb,igdb,steam,musicbrainz}.py) to merge our work
+    with an already-known catalog item instead of minting a duplicate.
+    """
+    urls: list[str] = []
+    imdb = identifiers.get("imdbId")
+    if imdb and str(imdb).startswith("tt"):
+        urls.append(f"https://www.imdb.com/title/{imdb}")
+    tmdb = identifiers.get("tmdbId")
+    if tmdb and work_type == "movie":
+        urls.append(f"https://www.themoviedb.org/movie/{tmdb}")
+    elif tmdb and work_type == "tv_show":
+        urls.append(f"https://www.themoviedb.org/tv/{tmdb}")
+    series = identifiers.get("tmdbTvSeriesId")
+    season = identifiers.get("seasonNumber")
+    if work_type == "tv_season" and series and season is not None:
+        urls.append(f"https://www.themoviedb.org/tv/{series}/season/{season}")
+    slug = identifiers.get("slug")
+    if slug and work_type == "video_game":
+        # IGDB urls are slug-based; the numeric igdbId is not resolvable.
+        urls.append(f"https://www.igdb.com/games/{slug}")
+    steam = identifiers.get("steamId")
+    if steam:
+        urls.append(f"https://store.steampowered.com/app/{steam}")
+    if identifiers.get("mbId"):
+        urls.append(f"https://musicbrainz.org/release-group/{identifiers['mbId']}")
+    if identifiers.get("mbReleaseId"):
+        urls.append(f"https://musicbrainz.org/release/{identifiers['mbReleaseId']}")
+    return urls
+
+
 # Preferred identifier per work type (first match wins), then any remaining.
 # isbn13 over isbn10 (canonical form); mbId (musicbrainz release group, stable
 # across pressings) over mbReleaseId.

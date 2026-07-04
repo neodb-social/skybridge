@@ -128,18 +128,29 @@ def test_review_becomes_rating_and_comment(settings):
     assert note is not None
     assert note["published"] == REVIEW["createdAt"]
     ratings = [r for r in note["relatedWith"] if r["type"] == "Rating"]
-    assert ratings == [
-        {"type": "Rating", "withRegardTo": ref.url, "value": 9, "best": 10, "worst": 1}
-    ]
+    assert len(ratings) == 1
+    rating = ratings[0]
+    assert rating["withRegardTo"] == ref.url
+    assert (rating["value"], rating["best"], rating["worst"]) == (9, 10, 1)
+    # NeoDB ingest requires id + published on every relatedWith entry
+    assert rating["id"] and rating["href"] == rating["id"]
+    assert rating["published"] == REVIEW["createdAt"]
+    assert rating["attributedTo"] == note["attributedTo"]
     # review text is an untitled Comment on the mark — never a Review/Article
     comments = [r for r in note["relatedWith"] if r["type"] == "Comment"]
     assert comments and comments[0]["withRegardTo"] == ref.url
     assert comments[0]["content"] == note["content"]
+    assert comments[0]["id"] != rating["id"]  # facet ids are unique
     assert not any(r["type"] == "Review" for r in note["relatedWith"])
     # spoilers become a content warning
     assert note["sensitive"] is True
     assert "Spoilers" in note["summary"]
-    # record tags + work link + category hashtag
+    # the work rides in tag as a typed NeoDB catalog ref + category hashtag
+    work_tags = [t for t in note["tag"] if t["type"] == "Movie"]
+    assert len(work_tags) == 1
+    assert work_tags[0]["href"] == ref.url
+    assert work_tags[0]["name"] == REVIEW["title"]
+    assert work_tags[0]["image"] == REVIEW["posterUrl"]
     assert {"type": "Hashtag", "name": "#a24"} in note["tag"]
     assert {"type": "Hashtag", "name": "#movie"} in note["tag"]
     assert activity["type"] == "Create"

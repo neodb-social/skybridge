@@ -162,16 +162,40 @@ def render_facets(text: str, facets: list[dict] | None) -> str:
 
 
 def _work_tag(ref: works.WorkRef) -> dict:
-    return {
-        "type": "Link",
+    """Catalog-item tag in NeoDB's ``ap_object_ref`` shape.
+
+    The ``type`` must be a NeoDB catalog type (Movie/Edition/Game/...) —
+    NeoDB's inbound handler only accepts posts whose ``tag`` contains exactly
+    one such entry and resolves the item from its ``href``.
+    """
+    tag = {
+        "type": works.ap_type_for(ref.work_type) or "Link",
         "href": ref.url,
         "name": ref.title or ref.work_id,
-        "mediaType": "application/activity+json",
     }
+    if ref.poster_url:
+        tag["image"] = ref.poster_url
+    return tag
 
 
-def _related(kind: str, work_url: str, extra: dict | None = None) -> dict:
-    obj = {"type": kind, "withRegardTo": work_url}
+def _related(note: dict, kind: str, work_url: str, extra: dict | None = None) -> dict:
+    """A ``relatedWith`` entry in NeoDB's wire shape.
+
+    ``id`` and ``published`` are hard requirements — NeoDB's journal
+    ``update_by_ap_object`` reads ``obj["id"]`` / ``obj["published"]`` on
+    ingest. ``updated`` advances on Note updates so edits pass the peer's
+    staleness check (``edited_time >= updated`` skips the write).
+    """
+    facet_id = f"{note['id']}#{kind.lower()}"
+    obj: dict[str, Any] = {
+        "id": facet_id,
+        "type": kind,
+        "withRegardTo": work_url,
+        "attributedTo": note["attributedTo"],
+        "href": facet_id,
+        "published": note["published"],
+        "updated": note.get("updated") or note["published"],
+    }
     if extra:
         obj.update(extra)
     return obj
@@ -187,6 +211,7 @@ def build_note(
     time_us: int | None,
     ref: works.WorkRef | None,
     shelf_status: str | None = None,
+    operation: str = "create",
 ) -> dict:
     """Build the AP ``Note`` for a popfeed record, including ``relatedWith``.
 
@@ -210,6 +235,10 @@ def build_note(
         "tag": [],
         "relatedWith": [],
     }
+    if operation != "create":
+        # A fresh `updated` also stamps the relatedWith facets so peers
+        # accept the new state (see _related).
+        note["updated"] = datetime.now(UTC).isoformat()
 
     # (Legacy social.popfeed.feed.post — free text about a work, superseded by
     # feed.review in 2025 — is no longer bridged; see config.WANTED_COLLECTIONS.)
@@ -270,6 +299,7 @@ def _populate_review(
         if rating is not None:
             note["relatedWith"].append(
                 _related(
+                    note,
                     "Rating",
                     ref.url,
                     {"value": rating, "best": _RATING_BEST, "worst": _RATING_WORST},
@@ -279,9 +309,11 @@ def _populate_review(
             # popfeed review text is untitled (Letterboxd-style), so it maps
             # to a NeoDB Comment on the mark — never a titled Review (which
             # NeoDB renders as an Article-like page). We emit Notes only.
-            note["relatedWith"].append(_related("Comment", ref.url, {"content": note["content"]}))
+            note["relatedWith"].append(
+                _related(note, "Comment", ref.url, {"content": note["content"]})
+            )
         if shelf_status:
-            note["relatedWith"].append(_related("Status", ref.url, {"status": shelf_status}))
+            note["relatedWith"].append(_related(note, "Status", ref.url, {"status": shelf_status}))
 
 
 def _populate_list(
@@ -304,6 +336,9 @@ def _populate_list(
         "name": name,
         "summary": desc,
         "totalItems": 0,
+        "attributedTo": note["attributedTo"],
+        "published": note["published"],
+        "updated": note.get("updated") or note["published"],
     }
     for tag in record.get("tags") or []:
         note["tag"].append({"type": "Hashtag", "name": f"#{tag}"})
@@ -330,9 +365,10 @@ def _populate_list_item(note: dict, record: dict, ref: works.WorkRef | None) -> 
         ]
     if ref is not None:
         note["tag"].append(_work_tag(ref))
+        note["tag"].append({"type": "Hashtag", "name": f"#{works.category_for(ref.work_type)}"})
         status = shelf_status(list_type)
         if status:
-            note["relatedWith"].append(_related("Status", ref.url, {"status": status}))
+            note["relatedWith"].append(_related(note, "Status", ref.url, {"status": status}))
         # No shelf status => collection membership, which the pipeline archives
         # without AP emission (Collections aren't bridged yet), so no facet.
 
@@ -393,6 +429,7 @@ def translate(
         time_us=time_us,
         ref=ref,
         shelf_status=shelf_status,
+        operation=operation,
     )
     activity = wrap_activity(note, handle=handle, op=operation)
     return note, activity

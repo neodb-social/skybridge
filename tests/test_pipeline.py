@@ -171,6 +171,53 @@ def _related_types(note):
     return {r["type"] for r in note.get("relatedWith", [])}
 
 
+# Mirror of NeoDB's inbound requirements (takahe/ap_handlers.py +
+# journal update_by_ap_object + catalog/sites/fedi.py) — a Note failing any
+# of these is silently dropped or crashes ingestion on a NeoDB peer.
+_NEODB_ITEM_TYPES = {
+    "Edition",
+    "Movie",
+    "TVShow",
+    "TVSeason",
+    "TVEpisode",
+    "Album",
+    "Game",
+    "Podcast",
+    "PodcastEpisode",
+    "Performance",
+    "PerformanceProduction",
+}
+_NEODB_PIECE_TYPES = {"Status", "Rating", "Comment", "Review", "Note", "Shelf"}
+_NEODB_STATUSES = {"complete", "progress", "wishlist", "dropped"}
+
+
+def _assert_neodb_parseable(note):
+    from datetime import datetime
+
+    if isinstance(note, str):
+        note = json.loads(note)
+    # _parse_items: exactly one catalog-item tag, resolved via its href
+    items = [t for t in note.get("tag", []) if t["type"] in _NEODB_ITEM_TYPES]
+    assert len(items) == 1, f"need exactly one catalog item tag, got {items}"
+    assert items[0]["href"].startswith("http")
+    assert items[0]["type"] not in ("TVEpisode", "PodcastEpisode")  # unresolvable
+    # each relatedWith entry must be ingestible by update_by_ap_object
+    pieces = note.get("relatedWith", [])
+    assert pieces, "no pieces to ingest"
+    for p in pieces:
+        assert p["type"] in _NEODB_PIECE_TYPES
+        assert p["id"], f"{p['type']} missing id (used as remote_id)"
+        datetime.fromisoformat(p.get("updated") or p["published"])
+        datetime.fromisoformat(p["published"])
+        if p["type"] == "Status":
+            assert p["status"] in _NEODB_STATUSES
+        elif p["type"] == "Rating":
+            assert p["worst"] < p["best"]
+            assert p["worst"] <= p["value"] <= p["best"]
+        elif p["type"] == "Comment":
+            assert p["content"].strip()
+
+
 def _rows():
     with session_scope() as session:
         return session.get(Record, _REVIEW_URI), session.get(Record, _ITEM_URI)
@@ -189,6 +236,9 @@ def test_listitem_after_review_updates_review_note(settings):
     assert _related_types(review.ap_object_json) == {"Rating", "Status"}
     assert item.ap_object_json is None  # merged: no standalone post
     assert review.work_key == item.work_key  # paired via the deduped work
+    # every emitted state of the Note must be ingestible by a NeoDB peer
+    _assert_neodb_parseable(r1.activity["object"])
+    _assert_neodb_parseable(r2.activity["object"])
 
 
 def test_review_after_listitem_updates_item_note(settings):
@@ -203,6 +253,8 @@ def test_review_after_listitem_updates_item_note(settings):
     review, item = _rows()
     assert review.ap_object_json is None  # item row anchors the pair Note
     assert _related_types(item.ap_object_json) == {"Rating", "Status"}
+    _assert_neodb_parseable(r1.activity["object"])  # item-only Note
+    _assert_neodb_parseable(r2.activity["object"])  # combined Note
 
 
 def test_review_edit_updates_anchored_note(settings):

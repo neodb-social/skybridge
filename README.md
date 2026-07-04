@@ -26,11 +26,24 @@ Jetstream (atproto firehose)  ─┐
 ### NeoDB compatibility contract
 
 The activity object is a Mastodon-compatible `Note` so generic servers render
-it. NeoDB catalog semantics ride alongside in a `relatedWith` array of typed
-objects — `Status` (shelf mark), `Rating`, `Comment` — each carrying a
-`withRegardTo` pointing at a dereferenceable catalog item that we mint at
-`https://<domain>/catalog/<type>/<id>`. Deletes emit a `Delete` referencing a
-`Tombstone`. We emit `Note`s only — never `Article`/titled `Review` objects.
+it. NeoDB catalog semantics ride alongside, matching NeoDB's wire format
+(verified against its `takahe/ap_handlers.py` + `catalog/sites/fedi.py`
+ingest code):
+
+- `tag` carries exactly one typed catalog ref (`Movie`/`TVShow`/`TVSeason`/
+  `Edition`/`Game`/`Album`/`Podcast`) with `href`/`name`/`image` — this is how
+  a NeoDB peer locates the work; posts without one are dropped.
+- `relatedWith` holds the mark facets — `Status` (shelf mark), `Rating`,
+  `Comment` — each with the required `id`/`href`/`attributedTo`/`published`/
+  `updated` envelope and a `withRegardTo` link to the catalog item.
+- The catalog item at `https://<domain>/catalog/<type>/<id>` is served in
+  NeoDB's ItemSchema shape (`type` = catalog type, `id` = the URL itself,
+  `display_title`, `cover_image_url`) with `external_resources` (imdb / tmdb /
+  igdb-slug / steam / musicbrainz URLs) plus top-level `imdb`/`isbn`, so peers
+  merge it with items they already know instead of minting duplicates.
+
+Deletes emit a `Delete` referencing a `Tombstone`. We emit `Note`s only —
+never `Article`/titled `Review` objects.
 
 | popfeed record | becomes |
 |---|---|
