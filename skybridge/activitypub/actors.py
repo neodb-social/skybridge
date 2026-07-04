@@ -68,6 +68,8 @@ def relay_actor() -> dict[str, Any]:
         "followers": f"{actor_id}/followers",
         "following": f"{actor_id}/following",
         "endpoints": {"sharedInbox": settings.url("inbox")},
+        # Not a bridged identity itself (it's the relay/Application), so no
+        # alsoKnownAs / rel="me" account-linking is needed here.
         "url": settings.base_url,
         "publicKey": _public_key_block(actor_id, public_pem),
     }
@@ -78,15 +80,23 @@ def person_actor(actor: BridgedActor) -> dict[str, Any]:
     settings = get_settings()
     actor_id = settings.actor_id(actor.handle)
     doc: dict[str, Any] = {
-        "@context": [AS_CONTEXT, SECURITY_CONTEXT],
+        "@context": [
+            AS_CONTEXT,
+            SECURITY_CONTEXT,
+            {"alsoKnownAs": {"@id": "as:alsoKnownAs", "@type": "@id"}},
+        ],
         "id": actor_id,
         "type": "Person",
         "preferredUsername": actor.handle,
         "name": actor.display_name or actor.handle,
         "summary": (
             f"Bridged from Atmosphere. Original account: "
-            f'<a href="https://bsky.app/profile/{actor.did}">{actor.handle}</a>'
+            f'<a href="https://bsky.app/profile/{actor.did}" rel="me">{actor.handle}</a>'
         ),
+        "alsoKnownAs": [
+            f"at://{actor.did}",
+            f"https://bsky.app/profile/{actor.did}",
+        ],
         "inbox": f"{actor_id}/inbox",
         "outbox": f"{actor_id}/outbox",
         "followers": f"{actor_id}/followers",

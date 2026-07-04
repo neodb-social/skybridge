@@ -44,6 +44,7 @@ def test_webfinger_relay(client, settings):
     assert r.status_code == 200
     body = r.json()
     assert body["links"][0]["href"] == settings.relay_actor_id
+    assert not any("bsky.app" in alias for alias in body["aliases"])
 
 
 def test_webfinger_unknown_returns_404(client):
@@ -68,12 +69,20 @@ def test_relay_actor_document(client, settings):
 
 def test_person_actor_document(client, settings):
     handle = _a_bridged_handle()
+    with session_scope() as session:
+        actor = session.scalar(select(BridgedActor).where(BridgedActor.handle == handle))
+        assert actor is not None
+        did = actor.did
     r = client.get(f"/users/{handle}", headers=AP)
     assert r.status_code == 200
     doc = r.json()
     assert doc["type"] == "Person"
     assert doc["preferredUsername"] == handle
     assert "publicKey" in doc
+    assert doc["alsoKnownAs"] == [f"at://{did}", f"https://bsky.app/profile/{did}"]
+    assert {"alsoKnownAs": {"@id": "as:alsoKnownAs", "@type": "@id"}} in doc["@context"]
+    assert 'rel="me"' in doc["attachment"][0]["value"]
+    assert 'rel="me"' in doc["summary"]
 
 
 def test_person_actor_document_includes_icon_when_avatar_set(client, settings):
@@ -90,9 +99,15 @@ def test_person_actor_document_includes_icon_when_avatar_set(client, settings):
 
 def test_webfinger_resolves_bridged_user(client, settings):
     handle = _a_bridged_handle()
+    with session_scope() as session:
+        actor = session.scalar(select(BridgedActor).where(BridgedActor.handle == handle))
+        assert actor is not None
+        did = actor.did
     r = client.get("/.well-known/webfinger", params={"resource": settings.acct(handle)})
     assert r.status_code == 200
-    assert r.json()["links"][0]["href"] == settings.actor_id(handle)
+    body = r.json()
+    assert body["links"][0]["href"] == settings.actor_id(handle)
+    assert f"https://bsky.app/profile/{did}" in body["aliases"]
 
 
 def test_nodeinfo(client):

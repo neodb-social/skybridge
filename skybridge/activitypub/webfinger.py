@@ -10,10 +10,10 @@ from skybridge.db import session_scope
 from skybridge.models import BridgedActor
 
 
-def _jrd(subject: str, actor_id: str) -> dict:
+def _jrd(subject: str, actor_id: str, extra_aliases: list[str] | None = None) -> dict:
     return {
         "subject": subject,
-        "aliases": [actor_id],
+        "aliases": [actor_id, *(extra_aliases or [])],
         "links": [
             {
                 "rel": "self",
@@ -60,4 +60,8 @@ def resolve(resource: str) -> dict | None:
         )
         if actor is None or actor.opted_out:
             return None
-        return _jrd(settings.acct(actor.handle), settings.actor_id(actor.handle))
+        return _jrd(
+            settings.acct(actor.handle),
+            settings.actor_id(actor.handle),
+            extra_aliases=[f"https://bsky.app/profile/{actor.did}"],
+        )
