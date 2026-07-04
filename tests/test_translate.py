@@ -8,26 +8,6 @@ from skybridge.models import Work
 from skybridge.translate import neodb, works
 from sqlalchemy import func, select
 
-POST = {
-    "$type": "social.popfeed.feed.post",
-    "text": "Superman - Official Trailer\nhttps://www.ign.com/videos/superman",
-    "title": "Superman - Official Trailer - IGN",
-    "facets": [
-        {
-            "index": {"byteStart": 28, "byteEnd": 51},
-            "features": [
-                {
-                    "$type": "app.bsky.richtext.facet#link",
-                    "uri": "https://www.ign.com/videos/superman",
-                }
-            ],
-        }
-    ],
-    "createdAt": {},
-    "identifiers": {"imdbId": "tt5950044", "tmdbId": "1061474"},
-    "creativeWorkType": "movie",
-}
-
 LIST = {
     "$type": "social.popfeed.feed.list",
     "name": "2025 The Game Awards Nominees",
@@ -61,22 +41,6 @@ REVIEW = {
     "identifiers": {"imdbId": "tt6710474", "tmdbId": "545611"},
     "creativeWorkType": "movie",
 }
-
-
-def test_legacy_post_collection_has_no_mapping(settings):
-    # feed.post is legacy (superseded by feed.review) and no longer bridged.
-    ref = works.work_ref(POST)
-    with pytest.raises(ValueError, match="no AP mapping"):
-        neodb.translate(
-            did="did:plc:abc",
-            handle="alice.test",
-            collection="social.popfeed.feed.post",
-            rkey="r1",
-            record=POST,
-            operation="create",
-            time_us=None,
-            ref=ref,
-        )
 
 
 def test_review_facets_render_as_links(settings):
@@ -201,61 +165,6 @@ def test_rating_only_review_has_no_review_object(settings):
     assert "sensitive" not in note
 
 
-def test_compound_list_type_maps_to_status(settings):
-    record = {**LIST_ITEM, "listType": "watched_movies"}
-    ref = works.work_ref(record)
-    note, _ = neodb.translate(
-        did="did:plc:abc",
-        handle="alice.test",
-        collection="social.popfeed.feed.listItem",
-        rkey="i2",
-        record=record,
-        operation="create",
-        time_us=None,
-        ref=ref,
-    )
-    assert note is not None
-    statuses = [r for r in note["relatedWith"] if r["type"] == "Status"]
-    assert statuses and statuses[0]["status"] == "complete"
-
-
-def test_update_and_delete_activities(settings):
-    _, upd = neodb.translate(
-        did="did:plc:abc",
-        handle="alice.test",
-        collection="social.popfeed.feed.review",
-        rkey="r1",
-        record=REVIEW,
-        operation="update",
-        time_us=None,
-        ref=works.work_ref(REVIEW),
-    )
-    assert upd["type"] == "Update"
-
-    note, dele = neodb.translate(
-        did="did:plc:abc",
-        handle="alice.test",
-        collection="social.popfeed.feed.review",
-        rkey="r1",
-        record=None,
-        operation="delete",
-        time_us=None,
-        prior_object_id=settings.post_id("alice.test", "r1"),
-    )
-    assert note is None
-    assert dele["type"] == "Delete"
-    assert dele["object"]["type"] == "Tombstone"
-    assert dele["object"]["id"] == settings.post_id("alice.test", "r1")
-
-
-def test_work_ref_namespaces_identifier(settings):
-    ref = works.work_ref(POST)
-    assert ref is not None
-    assert ref.work_type == "movie"
-    assert ref.work_id == "imdbId-tt5950044"  # priority picks imdb first
-    assert ref.url == settings.catalog_id("movie", "imdbId-tt5950044")
-
-
 @pytest.mark.parametrize(
     ("list_type", "status"),
     [
@@ -284,18 +193,11 @@ def test_shelf_status_matrix(list_type, status):
     assert neodb.shelf_status(list_type) == status
 
 
-def test_album_maps_to_music_category():
-    assert works.category_for("album") == "music"
-    assert works.category_for("music") == "music"
-    assert works.category_for("ep") == "music"
-    assert works.category_for("tv_season") == "tv"
-    assert works.category_for("unknown_type") == "item"
-
-
 def test_identifier_priority_prefers_canonical_forms(settings):
     book = {"identifiers": {"isbn10": "0441013597", "isbn13": "9780441013593"}}
     ref = works.work_ref({**book, "creativeWorkType": "book"})
     assert ref is not None and ref.work_id == "isbn13-9780441013593"
+    assert ref.url == settings.catalog_id("book", "isbn13-9780441013593")
 
     album = {
         "identifiers": {

@@ -121,20 +121,6 @@ def test_list_delete_tombstones_without_activity(settings, fixture_path):
         assert row.ap_activity_json is None  # no Delete activity emitted
 
 
-def test_translated_activity_is_neodb_shaped(settings, fixture_path):
-    results = asyncio.run(replay_file(fixture_path, allow_network=False))
-    reviews = [
-        r
-        for r in results
-        if r.collection == "social.popfeed.feed.review" and r.operation == "create"
-    ]
-    assert reviews
-    activity = reviews[0].activity
-    assert activity["type"] == "Create"
-    assert activity["object"]["type"] == "Note"
-    assert "@context" in activity
-
-
 # --- review <-> listItem pairing: one AP Note per (author, work) -----------
 #
 # The Note id is anchored on whichever record publishes first; every later
@@ -194,6 +180,8 @@ def test_listitem_after_review_updates_review_note(settings):
     r1 = _run(_ev("social.popfeed.feed.review", "rv1", _REVIEW_REC))
     r2 = _run(_ev("social.popfeed.feed.listItem", "it1", _ITEM_REC))
     assert r1.activity["type"] == "Create"
+    assert r1.activity["object"]["type"] == "Note"
+    assert "@context" in r1.activity
     # The listItem updates the review-anchored Note, no second Create.
     assert r2.activity["type"] == "Update"
     assert r2.activity["object"]["id"] == r1.activity["object"]["id"]

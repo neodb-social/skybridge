@@ -184,13 +184,6 @@ def test_robots_txt_rejects_all(client):
     assert "Disallow: /" in r.text
 
 
-def test_outbox_lists_posts(client, settings):
-    handle = _a_bridged_handle()
-    r = client.get(f"/users/{handle}/outbox", headers=AP)
-    assert r.status_code == 200
-    assert r.json()["type"] == "OrderedCollection"
-
-
 def test_archive_only_list_records_not_published(client, settings):
     with session_scope() as session:
         rec = session.scalar(select(Record).where(Record.collection == "social.popfeed.feed.list"))
@@ -204,5 +197,6 @@ def test_archive_only_list_records_not_published(client, settings):
     assert r.status_code == 404
     # ...and absent from the outbox.
     outbox = client.get(f"/users/{handle}/outbox", headers=AP).json()
+    assert outbox["type"] == "OrderedCollection"
     assert settings.post_id(handle, rkey) not in outbox["orderedItems"]
     assert outbox["totalItems"] > 0
