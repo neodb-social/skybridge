@@ -23,7 +23,7 @@ from sqlalchemy import or_, select
 
 from skybridge import optout
 from skybridge.activitypub import nodeinfo, objects, webfinger
-from skybridge.activitypub.actors import RELAY_DID, person_actor, relay_actor
+from skybridge.activitypub.actors import RELAY_DID, get_relay_keys, person_actor, relay_actor
 from skybridge.activitypub.delivery import DeliveryWorker
 from skybridge.activitypub.inbox import handle_inbox
 from skybridge.atproto import oauth
@@ -42,6 +42,7 @@ _TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "web"))
 async def lifespan(app: FastAPI):
     logging.basicConfig(level=os.environ.get("SKYBRIDGE_LOG", "INFO"))
     init_db()
+    get_relay_keys()  # operator-provided; fail fast if missing
     worker = DeliveryWorker()
     worker.start()
     app.state.worker = worker

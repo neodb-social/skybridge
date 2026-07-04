@@ -91,7 +91,16 @@ def live(settings, fixture_path):
     mock_port = _free_port()
     from skybridge.config import Settings, set_settings
 
-    set_settings(Settings(domain=f"127.0.0.1:{relay_port}", scheme="http", db_path=":memory:"))
+    from tests.conftest import RELAY_KEY_PEM
+
+    set_settings(
+        Settings(
+            domain=f"127.0.0.1:{relay_port}",
+            scheme="http",
+            db_path=":memory:",
+            relay_key_pem=RELAY_KEY_PEM,
+        )
+    )
     from skybridge.db import init_db
 
     init_db(reset=True)

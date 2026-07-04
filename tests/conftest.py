@@ -6,9 +6,14 @@ from pathlib import Path
 
 import pytest
 from skybridge.config import Settings, set_settings
+from skybridge.crypto import generate_keypair
 from skybridge.db import init_db
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
+
+# The relay key is operator-provided (never minted); one throwaway key
+# serves every test via Settings.relay_key_pem.
+RELAY_KEY_PEM = generate_keypair()[0]
 
 
 @pytest.fixture
@@ -17,6 +22,7 @@ def settings(tmp_path) -> Settings:
         domain="bridge.test",
         scheme="https",
         db_path=":memory:",
+        relay_key_pem=RELAY_KEY_PEM,
         relay_key_file=str(tmp_path / "relay_key.pem"),
     )
     set_settings(s)

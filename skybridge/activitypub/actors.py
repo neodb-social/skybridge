@@ -1,19 +1,19 @@
 """ActivityPub actor documents: the relay ``Application`` + per-user ``Person``.
 
-The relay actor's private key lives OUTSIDE the database: either supplied
-explicitly via ``SKYBRIDGE_RELAY_KEY`` (PEM), or in the PEM file under the
-data dir (``$SKYBRIDGE_DATA/relay_key.pem``), minted there on first use.
+The relay actor's private key is ALWAYS operator-provided (never minted):
+either inline via ``SKYBRIDGE_RELAY_KEY`` (PEM) or as a PEM file the operator
+placed at ``$SKYBRIDGE_DATA/relay_key.pem``. Startup fails loudly when
+neither is present.
 """
 
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from skybridge.config import get_settings
-from skybridge.crypto import derive_public_pem, generate_keypair
+from skybridge.crypto import derive_public_pem
 from skybridge.models import BridgedActor
 
 RELAY_DID = "did:skybridge:relay"
@@ -41,11 +41,12 @@ def _relay_keys(inline_pem: str | None, key_file: str) -> tuple[str, str]:
         return inline_pem, derive_public_pem(inline_pem)
     path = Path(key_file)
     if not path.exists():
-        private_pem = generate_keypair()[0]
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(private_pem)
+        raise RuntimeError(
+            f"relay signing key not found: set SKYBRIDGE_RELAY_KEY or place a "
+            f"PEM at {path} — e.g.\n"
+            f"  printf 'SKYBRIDGE_RELAY_KEY=\"%s\"\\n' "
+            f'"$(openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048)" >> .env'
+        )
     private_pem = path.read_text()
     return private_pem, derive_public_pem(private_pem)
 

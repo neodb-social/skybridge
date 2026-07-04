@@ -88,13 +88,12 @@ Known but not bridged:
 | `SKYBRIDGE_DATA` | `./data` | Folder for all mutable state (`skybridge.db`, `relay_key.pem`); under compose it is the host folder bind-mounted to the container's `/data` |
 | `SKYBRIDGE_PORT` | `8000` | Host port docker compose publishes the server on (compose-only) |
 | `SKYBRIDGE_JETSTREAM` | public jetstream2 us-east | Jetstream WebSocket endpoint |
-| `SKYBRIDGE_RELAY_KEY` | unset | Relay actor private key (PEM); wins over the minted key file |
+| `SKYBRIDGE_RELAY_KEY` | **required** | Relay actor private key (PEM); alternatively place a PEM at `$SKYBRIDGE_DATA/relay_key.pem` |
 
-The relay actor signs outbound activities with an RSA key that lives outside
-the database. If you don't provide one, it is minted into
-`$SKYBRIDGE_DATA/relay_key.pem` on first use. To provision it explicitly,
-generate a key and put it in `.env` (compose supports quoted multi-line
-values):
+The relay actor signs outbound activities with an RSA key that **you must
+provide** — either as `SKYBRIDGE_RELAY_KEY` in `.env` (compose supports
+quoted multi-line values) or as a PEM file at `$SKYBRIDGE_DATA/relay_key.pem`.
+Startup fails if neither is present. To generate one:
 
 ```bash
 printf 'SKYBRIDGE_RELAY_KEY="%s"\n' \
@@ -138,6 +137,8 @@ uv run python -m skybridge replay fixtures/jetstream_sample.jsonl --reset
 
 ```bash
 cp .env.example .env   # set SKYBRIDGE_DOMAIN (+ SKYBRIDGE_INGEST=1 to go live)
+printf 'SKYBRIDGE_RELAY_KEY="%s"\n' \
+  "$(openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048)" >> .env
 docker compose up -d   # serves on :8000; state lives in ./data (bind mount)
 ```
 

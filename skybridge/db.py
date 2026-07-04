@@ -38,13 +38,26 @@ def _make_engine() -> Engine:
 
 
 def init_db(reset: bool = False) -> Engine:
-    """(Re)initialise the engine + schema. Idempotent."""
+    """(Re)initialise the engine + schema. Idempotent.
+
+    Ends with a write probe so a read-only database (e.g. a bind-mounted
+    data folder the container user cannot write) fails loudly at startup
+    instead of on the first ingested record.
+    """
     global _engine, _Session
     _engine = _make_engine()
     _Session = sessionmaker(bind=_engine, expire_on_commit=False, future=True)
     if reset:
         Base.metadata.drop_all(_engine)
     Base.metadata.create_all(_engine)
+    try:
+        with _engine.begin() as conn:
+            # Rewriting user_version (even unchanged) is a real header-page
+            # write, without leaving any schema residue behind.
+            version = conn.exec_driver_sql("PRAGMA user_version").scalar() or 0
+            conn.exec_driver_sql(f"PRAGMA user_version = {int(version)}")
+    except Exception as exc:
+        raise RuntimeError(f"database at {get_settings().db_path} is not writable: {exc}") from exc
     return _engine
 
 
