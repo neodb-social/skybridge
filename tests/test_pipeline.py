@@ -11,6 +11,7 @@ from skybridge.db import session_scope
 from skybridge.models import BridgedActor, Record, Work
 from skybridge.pipeline import process_event
 from skybridge.stats import collect_stats
+from skybridge.translate import neodb
 from sqlalchemy import func, select
 
 
@@ -316,3 +317,53 @@ def test_non_status_listitem_archived_without_emission(settings):
     assert r3.activity == {}
     review, _ = _rows()
     assert _related_types(review.ap_object_json) == {"Rating"}
+
+
+# --- listItem note wording: names the parent list -------------------------
+
+_LIST_REC = {
+    "$type": "social.popfeed.feed.list",
+    "name": "Best games of 2024",
+    "description": "A list of the top games that came out in 2024",
+    "listType": "default",
+    "createdAt": "2026-01-01T00:00:00.000Z",
+}
+
+
+def test_list_item_note_names_the_archived_list(settings):
+    _run(_ev("social.popfeed.feed.list", "lst1", _LIST_REC))
+    item = {
+        "$type": "social.popfeed.feed.listItem",
+        "title": "Elden Ring",
+        "listType": "complete",
+        "listUri": f"at://{_MERGE_DID}/social.popfeed.feed.list/lst1",
+        "identifiers": {"igdbId": "119133"},
+        "creativeWorkType": "video_game",
+        "addedAt": "2026-01-02T00:00:00.000Z",
+    }
+    result = _run(_ev("social.popfeed.feed.listItem", "it-list1", item))
+    assert result.activity["type"] == "Create"
+    note = result.activity["object"]
+    assert "Best games of 2024" in note["content"]
+    assert "name" not in note
+
+
+def test_list_item_note_falls_back_when_list_never_archived(settings, monkeypatch):
+    # Keep this offline: an archive miss now tries a live fetch of the parent
+    # list (see neodb._fetch_and_archive_list). Force it to fail so the test
+    # stays deterministic and exercises the generic fallback wording.
+    monkeypatch.setattr(neodb, "_fetch_and_archive_list", lambda list_uri: None)
+    item = {
+        "$type": "social.popfeed.feed.listItem",
+        "title": "Arc the Lad R",
+        "listType": "complete",
+        "listUri": f"at://{_MERGE_DID}/social.popfeed.feed.list/never-seen",
+        "identifiers": {"igdbId": "26382"},
+        "creativeWorkType": "video_game",
+        "addedAt": "2026-01-02T00:00:00.000Z",
+    }
+    result = _run(_ev("social.popfeed.feed.listItem", "it-list2", item))
+    assert result.activity["type"] == "Create"
+    note = result.activity["object"]
+    assert "to a list" in note["content"]
+    assert "name" not in note

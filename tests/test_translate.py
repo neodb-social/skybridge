@@ -2,11 +2,26 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
+
 import pytest
+from skybridge.atproto import identity
 from skybridge.db import session_scope
-from skybridge.models import Work
+from skybridge.models import Record, Work
 from skybridge.translate import neodb, works
 from sqlalchemy import func, select
+
+
+@pytest.fixture(autouse=True)
+def _clear_list_fetch_failed():
+    # _LIST_FETCH_FAILED is a module-level (process-lifetime) negative cache,
+    # not DB state, so it must be reset per test even though the DB itself is
+    # reinitialised by the `_db` autouse fixture in conftest.py.
+    neodb._LIST_FETCH_FAILED.clear()
+    yield
+    neodb._LIST_FETCH_FAILED.clear()
+
 
 LIST = {
     "$type": "social.popfeed.feed.list",
@@ -110,6 +125,191 @@ def test_list_item_status_mark(settings):
     assert statuses[0]["withRegardTo"] == ref.url
     # poster surfaced as an attachment
     assert note["attachment"][0]["url"] == LIST_ITEM["posterUrl"]
+    # listItem notes never carry a name (only a "to <list>" content line)
+    assert "name" not in note
+
+
+def test_list_item_content_uses_archived_list_name(settings):
+    list_uri = "at://did:plc:abc/social.popfeed.feed.list/l1"
+    with session_scope() as session:
+        session.add(
+            Record(
+                at_uri=list_uri,
+                did="did:plc:abc",
+                collection="social.popfeed.feed.list",
+                rkey="l1",
+                source_json=json.dumps({"name": "Best games of 2024", "description": "..."}),
+            )
+        )
+    record = {**LIST_ITEM, "listUri": list_uri}
+    ref = works.work_ref(record)
+    note, _ = neodb.translate(
+        did="did:plc:abc",
+        handle="alice.test",
+        collection="social.popfeed.feed.listItem",
+        rkey="i1",
+        record=record,
+        operation="create",
+        time_us=None,
+        ref=ref,
+    )
+    assert note is not None
+    assert "Best games of 2024" in note["content"]
+    assert "name" not in note
+
+
+def test_list_item_content_uses_description_when_list_unnamed(settings):
+    list_uri = "at://did:plc:abc/social.popfeed.feed.list/l2"
+    with session_scope() as session:
+        session.add(
+            Record(
+                at_uri=list_uri,
+                did="did:plc:abc",
+                collection="social.popfeed.feed.list",
+                rkey="l2",
+                source_json=json.dumps({"description": "Games nominated in 2025"}),
+            )
+        )
+    record = {**LIST_ITEM, "listUri": list_uri}
+    ref = works.work_ref(record)
+    note, _ = neodb.translate(
+        did="did:plc:abc",
+        handle="alice.test",
+        collection="social.popfeed.feed.listItem",
+        rkey="i1",
+        record=record,
+        operation="create",
+        time_us=None,
+        ref=ref,
+    )
+    assert note is not None
+    assert "Games nominated in 2025" in note["content"]
+    assert "name" not in note
+
+
+def test_list_item_falls_back_when_list_not_archived(settings, monkeypatch):
+    # Keep this test offline: on an archive miss, _list_label now tries a
+    # live fetch (see _fetch_and_archive_list). Force that fetch to fail so
+    # we stay on the generic fallback text without touching the network.
+    monkeypatch.setattr(neodb, "_fetch_and_archive_list", lambda list_uri: None)
+    record = {**LIST_ITEM, "listUri": "at://did:plc:abc/social.popfeed.feed.list/missing"}
+    ref = works.work_ref(record)
+    note, _ = neodb.translate(
+        did="did:plc:abc",
+        handle="alice.test",
+        collection="social.popfeed.feed.listItem",
+        rkey="i1",
+        record=record,
+        operation="create",
+        time_us=None,
+        ref=ref,
+    )
+    assert note is not None
+    assert "to a list" in note["content"]
+    assert "name" not in note
+
+
+def _fake_http_json(responses: Mapping[str, dict | None], calls: list[str]):
+    """A stand-in for ``identity._http_json`` keyed by URL substring.
+
+    Records every requested URL in ``calls`` so tests can assert a second
+    translation of the same list doesn't hit the network again.
+    """
+
+    def fake(url: str, timeout: float = 8.0) -> dict | None:
+        calls.append(url)
+        for substring, value in responses.items():
+            if substring in url:
+                return value
+        raise AssertionError(f"unexpected URL requested in test: {url}")
+
+    return fake
+
+
+def _translate_list_item(record, *, rkey="i1"):
+    ref = works.work_ref(record)
+    return neodb.translate(
+        did="did:plc:abc",
+        handle="alice.test",
+        collection="social.popfeed.feed.listItem",
+        rkey=rkey,
+        record=record,
+        operation="create",
+        time_us=None,
+        ref=ref,
+    )
+
+
+def test_list_item_fetches_and_archives_unarchived_list(settings, monkeypatch):
+    list_did = "did:plc:zzz"
+    list_uri = f"at://{list_did}/social.popfeed.feed.list/lst9"
+    calls: list[str] = []
+    responses = {
+        "plc.directory": {
+            "alsoKnownAs": ["at://lister.test"],
+            "service": [{"id": "#atproto_pds", "serviceEndpoint": "https://pds.example"}],
+        },
+        "xrpc/com.atproto.repo.getRecord": {
+            "cid": "bafyfakecid",
+            "value": {"$type": "social.popfeed.feed.list", "name": "My Shelf"},
+        },
+    }
+    monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses, calls))
+
+    record = {**LIST_ITEM, "listUri": list_uri}
+    note, _ = _translate_list_item(record)
+    assert note is not None
+    assert "My Shelf" in note["content"]
+
+    with session_scope() as session:
+        row = session.get(Record, list_uri)
+    assert row is not None
+    assert row.did == list_did
+    assert json.loads(row.source_json)["name"] == "My Shelf"
+
+    calls_after_first_fetch = len(calls)
+    assert calls_after_first_fetch > 0
+
+    # A second listItem pointing at the same (now-archived) list must hit the
+    # Record table, not the network again.
+    note2, _ = _translate_list_item(record, rkey="i2")
+    assert note2 is not None
+    assert "My Shelf" in note2["content"]
+    assert len(calls) == calls_after_first_fetch
+
+
+def test_list_item_fetch_failure_is_cached_and_not_retried(settings, monkeypatch):
+    list_did = "did:plc:zzz"
+    list_uri = f"at://{list_did}/social.popfeed.feed.list/deadlst"
+    calls: list[str] = []
+    responses = {
+        "plc.directory": {
+            "service": [{"id": "#atproto_pds", "serviceEndpoint": "https://pds.example"}],
+        },
+        # Simulates a 404/unreachable record: _http_json swallows the error
+        # and returns None.
+        "xrpc/com.atproto.repo.getRecord": None,
+    }
+    monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses, calls))
+
+    record = {**LIST_ITEM, "listUri": list_uri}
+    note, _ = _translate_list_item(record)
+    assert note is not None
+    assert "to a list" in note["content"]
+    assert list_uri in neodb._LIST_FETCH_FAILED
+
+    with session_scope() as session:
+        assert session.get(Record, list_uri) is None
+
+    calls_after_first_fetch = len(calls)
+    assert calls_after_first_fetch > 0
+
+    # A second listItem pointing at the same dead list must not retry the
+    # network at all — the negative cache short-circuits before any fetch.
+    note2, _ = _translate_list_item(record, rkey="i2")
+    assert note2 is not None
+    assert "to a list" in note2["content"]
+    assert len(calls) == calls_after_first_fetch
 
 
 def test_review_becomes_rating_and_comment(settings):

@@ -16,11 +16,15 @@ marks while generic Mastodon servers still render the base ``Note``):
 from __future__ import annotations
 
 import html
+import json
 import re
 from datetime import UTC, datetime
 from typing import Any
 
+from skybridge.atproto import identity
 from skybridge.config import get_settings
+from skybridge.db import session_scope
+from skybridge.models import Record
 from skybridge.translate import works
 
 PUBLIC = "https://www.w3.org/ns/activitystreams#Public"
@@ -345,6 +349,97 @@ def _populate_list(
     note["relatedWith"].append(shelf)
 
 
+_LIST_COLLECTION = "social.popfeed.feed.list"
+
+# Dead/unreachable list URIs we've already tried to fetch this process, so a
+# list that will never resolve (deleted, wrong PDS, network down) is only
+# attempted once — otherwise every listItem pointing at it would separately
+# pay a network timeout.
+_LIST_FETCH_FAILED: set[str] = set()
+
+
+def _list_value_label(value: dict) -> str | None:
+    """Shared name-or-description extraction for a ``feed.list`` record value."""
+    label = value.get("name") or value.get("description") or None
+    return label.strip() or None if isinstance(label, str) else None
+
+
+def _fetch_and_archive_list(list_uri: str) -> dict | None:
+    """Fetch an unarchived listItem's parent ``feed.list`` from its author's PDS.
+
+    Lists created before ingestion began are never archived by the pipeline
+    (see pipeline.ARCHIVE_ONLY_COLLECTIONS), so ``_list_label`` would
+    otherwise fall back to generic wording for them forever. This is a
+    best-effort, purely cosmetic fetch: worst case the note just says "a
+    list". A successfully fetched list is archived here (via ``Record``) so
+    every later listItem referencing it hits the DB instead of paying a
+    network round-trip; a failed fetch is remembered in
+    ``_LIST_FETCH_FAILED`` so it too is only ever attempted once per process.
+    """
+    if not list_uri.startswith("at://"):
+        return None
+    parts = list_uri[len("at://") :].split("/")
+    if len(parts) != 3 or parts[1] != _LIST_COLLECTION:
+        return None
+    if list_uri in _LIST_FETCH_FAILED:
+        return None
+    did, collection, rkey = parts
+    pds = identity.resolve_pds(did)
+    resp = (
+        identity._http_json(
+            f"{pds}/xrpc/com.atproto.repo.getRecord?repo={did}&collection={collection}&rkey={rkey}"
+        )
+        if pds
+        else None
+    )
+    value = resp.get("value") if isinstance(resp, dict) else None
+    if not isinstance(resp, dict) or not isinstance(value, dict):
+        _LIST_FETCH_FAILED.add(list_uri)
+        return None
+    with session_scope() as session:
+        session.merge(
+            Record(
+                at_uri=list_uri,
+                did=did,
+                collection=collection,
+                rkey=rkey,
+                cid=resp.get("cid"),
+                source_json=json.dumps(value),
+                op="create",
+            )
+        )
+    return value
+
+
+def _list_label(list_uri: Any) -> str | None:
+    """Best-effort display label for the parent ``feed.list`` of a listItem.
+
+    Looks up the archived ``feed.list`` record (every processed one is kept
+    in the ``Record`` table, see pipeline.ARCHIVE_ONLY_COLLECTIONS) and
+    prefers its ``name`` over its ``description``. On a miss, falls back to
+    fetching + archiving the list once (see ``_fetch_and_archive_list``)
+    rather than giving up outright, since plenty of lists predate ingestion.
+    Defensive throughout: any lookup/parse/fetch failure (unknown uri,
+    malformed JSON, missing fields, unreachable PDS) just yields ``None`` so
+    the caller can fall back to generic wording.
+    """
+    if not list_uri or not isinstance(list_uri, str):
+        return None
+    with session_scope() as session:
+        row = session.get(Record, list_uri)
+        source_json = row.source_json if row is not None else None
+    if source_json is not None:
+        try:
+            value = json.loads(source_json or "{}")
+        except Exception:
+            return None
+    else:
+        value = _fetch_and_archive_list(list_uri)
+    if not isinstance(value, dict):
+        return None
+    return _list_value_label(value)
+
+
 def _populate_list_item(note: dict, record: dict, ref: works.WorkRef | None) -> None:
     # Deliberately ignored for now: tv listItems may carry a
     # ``watchedEpisodes`` array ({tmdbId, seasonNumber, episodeNumber} per
@@ -352,8 +447,14 @@ def _populate_list_item(note: dict, record: dict, ref: works.WorkRef | None) -> 
     # whole-work Status until that mapping is designed.
     title = record.get("title") or "a work"
     list_type = (record.get("listType") or "").lower()
-    note["content"] = f"<p>Added <strong>{html.escape(title)}</strong> to a list</p>"
-    note["name"] = title
+    label = _list_label(record.get("listUri"))
+    if label:
+        note["content"] = (
+            f"<p>Added <strong>{html.escape(title)}</strong> to "
+            f"<strong>{html.escape(label)}</strong></p>"
+        )
+    else:
+        note["content"] = f"<p>Added <strong>{html.escape(title)}</strong> to a list</p>"
     if record.get("posterUrl"):
         note["attachment"] = [
             {
