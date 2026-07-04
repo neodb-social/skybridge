@@ -2,6 +2,9 @@
 {% block content %}
 <p class="muted">{{ settings.relay_summary }}</p>
 <p>Relay url: <code>{{ settings.relay_actor_id }}</code></p>
+{% if jetstream_url %}
+<p>Jetstream endpoint: <code>{{ jetstream_url }}</code></p>
+{% endif %}
 
 <div class="grid">
   <div class="card"><div class="n">{{ stats.bridged_actors }}</div><div class="l">bridged authors</div></div>

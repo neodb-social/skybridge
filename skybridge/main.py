@@ -51,6 +51,7 @@ async def lifespan(app: FastAPI):
         from skybridge.atproto.jetstream import run as jetstream_run
 
         ingest_task = asyncio.create_task(jetstream_run(worker), name="ingest")
+    app.state.ingest_task = ingest_task
     try:
         yield
     finally:
@@ -381,10 +382,16 @@ def _record_rows(rows: list[Record]) -> list[dict[str, Any]]:
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request) -> Response:
     stats = collect_stats()
+    ingest_task = getattr(app.state, "ingest_task", None)
+    ingesting = ingest_task is not None and not ingest_task.done()
     return _TEMPLATES.TemplateResponse(
         request,
         "dashboard.html",
-        {"stats": stats, "settings": get_settings()},
+        {
+            "stats": stats,
+            "jetstream_url": get_settings().jetstream_url if ingesting else None,
+            "settings": get_settings(),
+        },
     )
 
 

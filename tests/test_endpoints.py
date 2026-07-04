@@ -180,6 +180,23 @@ def test_dashboard_and_archive_html(client):
     assert client.get("/catalog").status_code == 200
 
 
+def test_dashboard_shows_jetstream_endpoint_only_when_ingesting(client, settings):
+    # no ingest task (or a finished one) -> not shown
+    assert settings.jetstream_url not in client.get("/").text
+
+    class _RunningTask:
+        def done(self) -> bool:
+            return False
+
+    app.state.ingest_task = _RunningTask()
+    try:
+        page = client.get("/").text
+        assert "Jetstream endpoint" in page
+        assert settings.jetstream_url in page
+    finally:
+        app.state.ingest_task = None
+
+
 def test_robots_txt_rejects_all(client):
     r = client.get("/robots.txt")
     assert r.status_code == 200
