@@ -86,6 +86,7 @@ Known but not bridged:
 | `SKYBRIDGE_DOMAIN` | `localhost:8000` | Public host of this relay (the single source of identity) |
 | `SKYBRIDGE_SCHEME` | `https` (`http` for localhost) | URL scheme |
 | `SKYBRIDGE_DATA` | `./data` | Folder for all mutable state (`skybridge.db`, `relay_key.pem`); under compose it is the host folder bind-mounted to the container's `/data` |
+| `SKYBRIDGE_PORT` | `8000` | Host port docker compose publishes the server on (compose-only) |
 | `SKYBRIDGE_JETSTREAM` | public jetstream2 us-east | Jetstream WebSocket endpoint |
 | `SKYBRIDGE_RELAY_KEY` | unset | Relay actor private key (PEM); wins over the minted key file |
 

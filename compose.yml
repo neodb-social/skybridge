@@ -4,7 +4,9 @@ services:
     image: neodb/skybridge:latest
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      # host port from .env's SKYBRIDGE_PORT (the app always listens on 8000
+      # inside the container)
+      - "${SKYBRIDGE_PORT:-8000}:8000"
     env_file:
       - path: .env # cp .env.example .env and edit
         required: false
