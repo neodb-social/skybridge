@@ -1,7 +1,7 @@
 [project]
 name = "skybridge"
 version = "0.1.0"
-description = "Bridge AT Protocol activity (e.g. popfeed) into the Fediverse as NeoDB-compatible ActivityPub."
+description = "Bridge AT Protocol to the Fediverse in NeoDB-compatible format."
 requires-python = ">=3.13"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -16,7 +16,8 @@ dependencies = [
     "websockets>=15.0.1,<16",
     "atproto>=0.0.67",
     "jinja2>=3.1.6",
-    "python-multipart>=0.0.32",  # FastAPI form parsing for the opt-out endpoint
+    "python-multipart>=0.0.32",
+    "sentry-sdk>=2.64.0",
 ]
 
 [dependency-groups]

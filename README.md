@@ -109,6 +109,7 @@ identity, and peers that cached the old public key will reject signatures
 until they re-fetch the actor.
 | `SKYBRIDGE_INGEST` | unset | set to `1` to start live ingestion inside `serve` |
 | `SKYBRIDGE_LOG` | `INFO` | log level |
+| `SKYBRIDGE_SENTRY_DSN` | unset | optional; enables Sentry error reporting and a `atproto.record_ingested` counter metric with `collection`/`operation` attributes |
 
 ---
 

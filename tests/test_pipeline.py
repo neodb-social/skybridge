@@ -6,7 +6,7 @@ import asyncio
 import json
 from collections.abc import Mapping
 
-from skybridge import optout
+from skybridge import optout, telemetry
 from skybridge.atproto import identity
 from skybridge.atproto.replay import read_events, replay_file
 from skybridge.config import WANTED_COLLECTIONS
@@ -525,3 +525,39 @@ def test_profile_collection_absent_from_fixture(fixture_path):
         for ev in read_events(fixture_path)
         if ev.get("kind") == "commit"
     )
+
+
+def test_ingest_metric_ticks_for_wanted_collection_only(settings, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        telemetry,
+        "record_ingested",
+        lambda collection, operation: calls.append((collection, operation)),
+    )
+
+    _run(_ev("social.popfeed.feed.review", "rv1", _REVIEW_REC))
+    assert calls == [("social.popfeed.feed.review", "create")]
+
+    # A collection we deliberately don't bridge (see config.WANTED_COLLECTIONS)
+    # must not tick the ingest counter.
+    assert "social.popfeed.feed.post" not in WANTED_COLLECTIONS
+    result = _run(_ev("social.popfeed.feed.post", "p1", {"text": "hi"}))
+    assert result is None
+    assert calls == [("social.popfeed.feed.review", "create")]
+
+
+def test_ingest_metric_not_ticked_for_opted_out_did(settings, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        telemetry,
+        "record_ingested",
+        lambda collection, operation: calls.append((collection, operation)),
+    )
+
+    opted_out_did = "did:plc:optedout"
+    asyncio.run(optout.opt_out(opted_out_did))
+
+    # Opted-out DID sends a wanted event: no metric tick, no processing.
+    result = _run(_ev("social.popfeed.feed.review", "rv1", _REVIEW_REC, did=opted_out_did))
+    assert result is None
+    assert calls == []

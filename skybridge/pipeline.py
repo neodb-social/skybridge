@@ -14,7 +14,7 @@ from typing import Any
 
 from sqlalchemy import select
 
-from skybridge import optout
+from skybridge import optout, telemetry
 from skybridge.activitypub import actors
 from skybridge.activitypub.delivery import DeliveryWorker, fanout, fanout_actor_update
 from skybridge.atproto import identity
@@ -95,12 +95,18 @@ async def process_event(
         return None
 
     did = event["did"]
+    operation = commit.get("operation", "create")
+
     # Honour opt-outs before creating any actor or persisting anything.
     if optout.is_opted_out(did):
         return None
 
+    # Ingest-volume metric: ticks for every wanted commit event from non-opted-out
+    # authors, regardless of what the pipeline later does with it (archive-only,
+    # merge, ...).
+    telemetry.record_ingested(collection, operation)
+
     rkey = commit.get("rkey", "")
-    operation = commit.get("operation", "create")
     time_us = event.get("time_us")
     at_uri = _at_uri(did, collection, rkey)
 

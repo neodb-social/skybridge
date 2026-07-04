@@ -20,6 +20,18 @@ def test_data_dir_defaults_to_local_data(monkeypatch):
     assert s.relay_key_file == "data/relay_key.pem"
 
 
+def test_sentry_dsn_from_env(monkeypatch):
+    monkeypatch.setenv("SKYBRIDGE_SENTRY_DSN", "https://key@o0.ingest.sentry.io/0")
+    s = _from_env()
+    assert s.sentry_dsn == "https://key@o0.ingest.sentry.io/0"
+
+
+def test_sentry_dsn_unset_is_none(monkeypatch):
+    monkeypatch.delenv("SKYBRIDGE_SENTRY_DSN", raising=False)
+    s = _from_env()
+    assert s.sentry_dsn is None
+
+
 def test_init_db_fails_loudly_on_readonly_database(tmp_path, monkeypatch):
     import os
 

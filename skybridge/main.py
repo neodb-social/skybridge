@@ -21,7 +21,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import or_, select
 
-from skybridge import optout
+from skybridge import optout, telemetry
 from skybridge.activitypub import nodeinfo, objects, webfinger
 from skybridge.activitypub.actors import RELAY_DID, get_relay_keys, person_actor, relay_actor
 from skybridge.activitypub.delivery import DeliveryWorker
@@ -41,6 +41,7 @@ _TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "web"))
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logging.basicConfig(level=os.environ.get("SKYBRIDGE_LOG", "INFO"))
+    telemetry.init_sentry()  # first, so failures below are captured when enabled
     init_db()
     get_relay_keys()  # operator-provided; fail fast if missing
     worker = DeliveryWorker()

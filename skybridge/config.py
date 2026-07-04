@@ -80,6 +80,9 @@ class Settings:
     # Delivery worker retry schedule (seconds).
     retry_backoff: tuple[int, ...] = (2, 4, 8, 16)
     user_agent: str = "skybridge/0.1 (+activitypub-relay)"
+    # Optional Sentry DSN: enables error tracking + a per-collection ingest
+    # counter metric. Unset (the default) keeps telemetry fully off.
+    sentry_dsn: str | None = None
 
     # --- URL builders: the single source of truth for our identity ----------
 
@@ -129,6 +132,7 @@ def _from_env() -> Settings:
         jetstream_url=os.environ.get("SKYBRIDGE_JETSTREAM", DEFAULT_JETSTREAM),
         relay_key_pem=os.environ.get("SKYBRIDGE_RELAY_KEY") or None,
         relay_key_file=os.path.join(data_dir, "relay_key.pem"),
+        sentry_dsn=os.environ.get("SKYBRIDGE_SENTRY_DSN") or None,
     )
 
 
