@@ -176,6 +176,14 @@ def test_dashboard_and_archive_html(client):
     assert client.get("/catalog").status_code == 200
 
 
+def test_robots_txt_rejects_all(client):
+    r = client.get("/robots.txt")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/plain")
+    assert "User-agent: *" in r.text
+    assert "Disallow: /" in r.text
+
+
 def test_outbox_lists_posts(client, settings):
     handle = _a_bridged_handle()
     r = client.get(f"/users/{handle}/outbox", headers=AP)

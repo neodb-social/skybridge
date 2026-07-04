@@ -18,7 +18,7 @@ from typing import Any
 from urllib.parse import unquote
 
 from fastapi import FastAPI, Form, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import or_, select
 
@@ -100,6 +100,12 @@ async def well_known_nodeinfo() -> Response:
 @app.get("/nodeinfo/2.1")
 async def nodeinfo_document() -> Response:
     return JSONResponse(nodeinfo.document())
+
+
+@app.get("/robots.txt")
+async def robots_txt() -> Response:
+    # Bridged content belongs to its atproto authors; keep crawlers out.
+    return PlainTextResponse("User-agent: *\nDisallow: /\n")
 
 
 # --------------------------------------------------------------------------- #

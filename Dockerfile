@@ -2,6 +2,7 @@
 
 # --- build: resolve the locked environment with uv -------------------------
 FROM python:3.13-slim AS build
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 
