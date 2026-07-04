@@ -18,7 +18,7 @@ from typing import Any
 from urllib.parse import unquote
 
 from fastapi import FastAPI, Form, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import or_, select
 
@@ -27,7 +27,7 @@ from skybridge.activitypub import nodeinfo, objects, webfinger
 from skybridge.activitypub.actors import RELAY_DID, person_actor, relay_actor
 from skybridge.activitypub.delivery import DeliveryWorker
 from skybridge.activitypub.inbox import handle_inbox
-from skybridge.atproto import auth
+from skybridge.atproto import auth, oauth
 from skybridge.config import get_settings
 from skybridge.db import init_db, session_scope
 from skybridge.models import BridgedActor, Record, Work
@@ -298,69 +298,99 @@ async def optout_form(request: Request, q: str = "") -> Response:
     )
 
 
+def _optout_error(
+    request: Request, wants_html: bool, msg: str, code: str, status: int, q: str = ""
+) -> Response:
+    if wants_html:
+        return _TEMPLATES.TemplateResponse(
+            request,
+            "optout.html",
+            {"message": msg, "q": q, "status": None, "settings": get_settings()},
+            status_code=status,
+        )
+    return JSONResponse({"ok": False, "error": code}, status_code=status)
+
+
 @app.post("/optout")
 async def optout_submit(
     request: Request,
     identifier: str = Form(...),
-    app_password: str = Form(...),
     action: str = Form("opt-out"),
 ) -> Response:
-    """Authenticate the atproto user, then opt them out (or back in)."""
+    """Start the atproto OAuth flow that authorizes the opt-out (or opt-in).
+
+    The user proves control of the account by logging in on their OWN
+    authorization server (no passwords ever touch this relay); the action
+    executes in the OAuth callback.
+    """
     wants_html = "text/html" in request.headers.get("accept", "")
     if action not in ("opt-out", "opt-in"):
         # Never let a malformed action fall through to the destructive default.
-        if wants_html:
-            return _TEMPLATES.TemplateResponse(
-                request,
-                "optout.html",
-                {
-                    "message": "Unknown action.",
-                    "q": identifier,
-                    "status": None,
-                    "settings": get_settings(),
-                },
-                status_code=400,
-            )
-        return JSONResponse({"ok": False, "error": "invalid_action"}, status_code=400)
+        return _optout_error(request, wants_html, "Unknown action.", "invalid_action", 400)
+    flow = await asyncio.to_thread(oauth.start_flow, identifier, action)
+    if flow is None:
+        return _optout_error(
+            request,
+            wants_html,
+            "Could not start sign-in for that account — check the handle or DID.",
+            "oauth_start_failed",
+            400,
+            q=identifier,
+        )
+    if wants_html:
+        return RedirectResponse(flow.authorize_url, status_code=303)
+    return JSONResponse({"ok": True, "authorize_url": flow.authorize_url, "state": flow.state})
 
-    result = await asyncio.to_thread(auth.verify_credentials, identifier, app_password)
+
+@app.get("/oauth/client-metadata.json")
+async def oauth_client_metadata() -> Response:
+    return JSONResponse(oauth.client_metadata())
+
+
+@app.get("/oauth/callback", response_class=HTMLResponse)
+async def oauth_callback(
+    request: Request,
+    state: str = "",
+    code: str = "",
+    iss: str = "",
+    error: str = "",
+    error_description: str = "",
+) -> Response:
+    """Finish the OAuth flow and execute the action it was started for."""
+    if error:
+        msg = error_description or f"Sign-in was not completed ({error})."
+        return _optout_error(request, True, msg, error, 400)
+    result = await asyncio.to_thread(oauth.finish_flow, state, code, iss or None)
     if result is None:
-        msg = "Authentication failed — check your handle and app password."
-        if wants_html:
-            return _TEMPLATES.TemplateResponse(
-                request,
-                "optout.html",
-                {"message": msg, "q": identifier, "status": None, "settings": get_settings()},
-                status_code=401,
-            )
-        return JSONResponse({"ok": False, "error": "authentication_failed"}, status_code=401)
+        return _optout_error(
+            request,
+            True,
+            "Sign-in could not be verified — please try again.",
+            "oauth_failed",
+            400,
+        )
 
     worker = getattr(app.state, "worker", None)
-    if action == "opt-in":
+    if result.action == "opt-in":
         was_out = optout.opt_in(result.did)
         msg = (
             f"{result.handle} is opted back in; future activity will bridge again."
             if was_out
             else f"{result.handle} was not opted out."
         )
-        payload = {"ok": True, "did": result.did, "opted_out": False, "rebridged": was_out}
     else:
         purged = await optout.opt_out(result.did, worker=worker)
         msg = f"{result.handle} opted out; {purged} bridged record(s) deleted."
-        payload = {"ok": True, "did": result.did, "opted_out": True, "deleted": purged}
-
-    if wants_html:
-        return _TEMPLATES.TemplateResponse(
-            request,
-            "optout.html",
-            {
-                "message": msg,
-                "q": result.handle,
-                "status": _status_ctx(result.did, result.handle),
-                "settings": get_settings(),
-            },
-        )
-    return JSONResponse(payload)
+    return _TEMPLATES.TemplateResponse(
+        request,
+        "optout.html",
+        {
+            "message": msg,
+            "q": result.handle,
+            "status": _status_ctx(result.did, result.handle),
+            "settings": get_settings(),
+        },
+    )
 
 
 # --------------------------------------------------------------------------- #

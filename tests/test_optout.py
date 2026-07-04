@@ -7,7 +7,7 @@ import asyncio
 import pytest
 from fastapi.testclient import TestClient
 from skybridge import optout
-from skybridge.atproto import auth
+from skybridge.atproto import auth, oauth
 from skybridge.atproto.replay import replay_file
 from skybridge.db import session_scope
 from skybridge.main import app
@@ -85,52 +85,93 @@ def test_opt_in_clears_optout(settings, fixture_path):
 @pytest.fixture
 def client(settings, fixture_path, monkeypatch) -> TestClient:
     asyncio.run(replay_file(fixture_path, allow_network=False))
-    # Stub credential verification so the test is fully offline.
+    # Complete the OAuth flow offline: any callback verifies as the fixture
+    # author, with the requested action smuggled through the state param.
     monkeypatch.setattr(
-        auth, "verify_credentials", lambda ident, pw: auth.AuthResult(did=DID, handle="author.test")
+        oauth,
+        "finish_flow",
+        lambda state, code, iss: oauth.FlowResult(did=DID, handle="author.test", action=state),
     )
-    # main.py imported `auth` as a module, so patching the attribute covers it.
     return TestClient(app)
 
 
-def test_optout_endpoint_authenticates_and_purges(client):
-    assert _active_records(DID) > 0
+def test_optout_submit_starts_oauth_redirect(client, monkeypatch):
+    monkeypatch.setattr(
+        oauth,
+        "start_flow",
+        lambda identifier, action: oauth.FlowStart("https://as.example/authorize?req=1", "st1"),
+    )
     r = client.post(
         "/optout",
-        data={"identifier": "author.test", "app_password": "good", "action": "opt-out"},
+        data={"identifier": "author.test", "action": "opt-out"},
+        headers={"accept": "text/html"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    assert r.headers["location"] == "https://as.example/authorize?req=1"
+    # JSON callers get the URL instead of a redirect
+    r = client.post(
+        "/optout",
+        data={"identifier": "author.test", "action": "opt-out"},
         headers={"accept": "application/json"},
     )
     assert r.status_code == 200
-    body = r.json()
-    assert body["ok"] and body["opted_out"] and body["deleted"] > 0
+    assert r.json()["authorize_url"] == "https://as.example/authorize?req=1"
+
+
+def test_optout_submit_rejects_unresolvable_account(client, monkeypatch):
+    monkeypatch.setattr(oauth, "start_flow", lambda identifier, action: None)
+    r = client.post(
+        "/optout",
+        data={"identifier": "nobody.test", "action": "opt-out"},
+        headers={"accept": "application/json"},
+    )
+    assert r.status_code == 400
+    assert r.json()["error"] == "oauth_start_failed"
+
+
+def test_oauth_callback_executes_optout(client):
+    assert _active_records(DID) > 0
+    r = client.get("/oauth/callback", params={"state": "opt-out", "code": "c", "iss": "x"})
+    assert r.status_code == 200
+    assert "record(s) deleted" in r.text  # action message
+    assert "opted out" in r.text  # status card reflects the new state
     assert _active_records(DID) == 0
     assert optout.is_opted_out(DID)
 
 
-def test_optout_endpoint_rejects_bad_credentials(settings, fixture_path, monkeypatch):
+def test_oauth_callback_with_unknown_flow_rejected(settings, fixture_path):
     asyncio.run(replay_file(fixture_path, allow_network=False))
-    monkeypatch.setattr(auth, "verify_credentials", lambda ident, pw: None)
-    client = TestClient(app)
-    r = client.post(
-        "/optout",
-        data={"identifier": "author.test", "app_password": "wrong", "action": "opt-out"},
-        headers={"accept": "application/json"},
-    )
-    assert r.status_code == 401
-    assert _active_records(DID) > 0  # nothing purged on auth failure
+    client = TestClient(app)  # no stub: the real finish_flow has no such state
+    r = client.get("/oauth/callback", params={"state": "bogus", "code": "c", "iss": "x"})
+    assert r.status_code == 400
+    assert _active_records(DID) > 0  # nothing purged
     assert not optout.is_opted_out(DID)
+
+
+def test_oauth_callback_denied_by_user(client):
+    r = client.get("/oauth/callback", params={"state": "s", "error": "access_denied"})
+    assert r.status_code == 400
+    assert _active_records(DID) > 0
 
 
 def test_optout_form_renders(client):
     r = client.get("/optout")
     assert r.status_code == 200
-    assert "app password" in r.text.lower()
+    assert "sign in" in r.text.lower()
+    assert "app password" not in r.text.lower()
+
+
+def test_client_metadata_endpoint(client, settings):
+    r = client.get("/oauth/client-metadata.json")
+    assert r.status_code == 200
+    assert r.json()["client_id"] == settings.url("oauth/client-metadata.json")
 
 
 def test_optout_endpoint_rejects_unknown_action(client):
     r = client.post(
         "/optout",
-        data={"identifier": "author.test", "app_password": "good", "action": "purge-everything"},
+        data={"identifier": "author.test", "action": "purge-everything"},
         headers={"accept": "application/json"},
     )
     assert r.status_code == 400
@@ -182,17 +223,6 @@ def test_status_lookup_preemptive_optout(client, monkeypatch):
     assert "opted out" in r.text
 
 
-def test_optout_post_html_shows_status(client):
-    r = client.post(
-        "/optout",
-        data={"identifier": "author.test", "app_password": "good", "action": "opt-out"},
-        headers={"accept": "text/html"},
-    )
-    assert r.status_code == 200
-    assert "record(s) deleted" in r.text  # action message
-    assert "opted out" in r.text  # status card reflects the new state
-
-
 def test_opted_out_actor_is_gone(client):
     handle = "author.test"
     with session_scope() as session:
@@ -200,11 +230,7 @@ def test_opted_out_actor_is_gone(client):
         actor = session.get(BridgedActor, DID)
         assert actor is not None
         actor.handle = handle
-    client.post(
-        "/optout",
-        data={"identifier": handle, "app_password": "good", "action": "opt-out"},
-        headers={"accept": "application/json"},
-    )
+    client.get("/oauth/callback", params={"state": "opt-out", "code": "c", "iss": "x"})
     r = client.get(f"/users/{handle}", headers={"accept": "application/activity+json"})
     assert r.status_code == 410
     wf = client.get("/.well-known/webfinger", params={"resource": f"acct:{handle}@bridge.test"})

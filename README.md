@@ -3,7 +3,7 @@
 NeoDB Sky Bridge relays public AT Protocol records (e.g. popfeed) into the Fediverse
 as NeoDB-compatible ActivityPub activities. 
 
-Any AT Protocol user may optout by themselves.
+Any AT Protocol user may opt out by themselves (verified via atproto OAuth).
 
 Any NeoDB server may subscribe to the relay service (`https://SKYBRIDGE_DOMAIN/actor`) to receive the activities.
 
@@ -152,7 +152,11 @@ Every push to `main` runs the checks and publishes multi-arch
   `GET /catalog/{type}/{id}` (catalog work)
 - UI / stats: `GET /` (dashboard), `GET /archive`, `GET /archive/{at_uri}`
   (original record vs. translated AP side-by-side), `GET /catalog`, `GET /stats`
-- Opt-out: `GET /optout` (form), `POST /optout` (authenticated; HTML or JSON)
+- Opt-out: `GET /optout` (status form), `POST /optout` (starts the sign-in),
+  `GET /oauth/client-metadata.json`, `GET /oauth/callback` — users prove
+  control of their account via **AT Protocol OAuth** against their own
+  authorization server (PAR + PKCE + DPoP); no passwords ever touch the relay
+  and tokens are discarded right after the identity check
 
 ## Development
 

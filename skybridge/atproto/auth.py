@@ -1,12 +1,9 @@
-"""Authenticate an AT Protocol user so they can manage their own bridging.
+"""AT Protocol identity resolution with SSRF hardening.
 
-We use an **app-password session** against the user's own PDS
-(``com.atproto.server.createSession`` via the atproto SDK). This proves the
-caller controls the DID without us ever storing the password: we create a
-session, read back the authenticated DID, and discard the credentials.
-
-Users should supply an *app password* (Settings → App Passwords on their
-client), never their main account password.
+Syntax-validates handles/DIDs, resolves them to ``(did, pds)`` and vets every
+URL we would fetch as public https. Authentication happens via OAuth against
+the user's own authorization server (see :mod:`skybridge.atproto.oauth`); no
+credentials ever touch this relay.
 """
 
 from __future__ import annotations
@@ -15,7 +12,6 @@ import ipaddress
 import logging
 import re
 import socket
-from dataclasses import dataclass
 from urllib.parse import unquote, urlparse
 
 log = logging.getLogger("skybridge.auth")
@@ -33,12 +29,6 @@ _RESOLVE_TIMEOUT = 5.0
 _SPECIAL_SUFFIXES = frozenset(
     {"localhost", "local", "internal", "arpa", "test", "invalid", "onion", "home", "corp", "lan"}
 )
-
-
-@dataclass(frozen=True)
-class AuthResult:
-    did: str
-    handle: str
 
 
 def _is_public_name(host: str) -> bool:
@@ -110,19 +100,6 @@ def _resolve_identity(identifier: str) -> tuple[str | None, str | None]:
     return did, pds
 
 
-def _login_request():
-    """HTTP transport for PDS logins: bounded timeout, no redirects.
-
-    The PDS endpoint was vetted by :func:`_is_public_https`; following
-    redirects would let a vetted host bounce the request to a private one.
-    """
-    from atproto_client.request import Request
-
-    request = Request(timeout=_RESOLVE_TIMEOUT)
-    request._client.follow_redirects = False
-    return request
-
-
 def resolve_did(identifier: str) -> str | None:
     """Best-effort handle-or-DID → DID resolution. Returns ``None`` on failure.
 
@@ -137,37 +114,4 @@ def resolve_did(identifier: str) -> str | None:
         return did
     except Exception as exc:
         log.info("identity resolution failed for %s: %s", identifier, type(exc).__name__)
-        return None
-
-
-def verify_credentials(identifier: str, app_password: str) -> AuthResult | None:
-    """Verify control of an atproto account; return the authenticated identity.
-
-    Returns ``None`` on any failure (bad credentials, unresolvable handle,
-    network error). The password is never stored or logged.
-    """
-    from atproto import Client
-
-    if not identifier or not app_password:
-        return None
-    if not is_valid_identifier(identifier.strip()):
-        return None
-    try:
-        did, pds = _resolve_identity(identifier.strip())
-        if pds is not None and not _is_public_https(pds):
-            log.warning("refusing non-public PDS endpoint for %s", identifier)
-            return None
-        client = Client(base_url=pds, request=_login_request()) if pds else Client()
-        profile = client.login(identifier.strip(), app_password)
-        authed_did = getattr(client.me, "did", None) or getattr(profile, "did", None)
-        if not authed_did:
-            return None
-        # If we resolved a DID up front, make sure it matches what we logged into.
-        if did and did != authed_did:
-            log.warning("login DID mismatch for %s", identifier)
-            return None
-        handle = getattr(profile, "handle", None) or getattr(client.me, "handle", identifier)
-        return AuthResult(did=authed_did, handle=handle)
-    except Exception as exc:
-        log.info("credential verification failed for %s: %s", identifier, type(exc).__name__)
         return None

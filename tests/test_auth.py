@@ -39,14 +39,6 @@ def test_resolve_did_rejects_invalid_identifier_without_network(monkeypatch):
     assert auth.resolve_did("' OR 1=1 --") is None
 
 
-def test_verify_credentials_rejects_invalid_identifier_without_network(monkeypatch):
-    def _boom(_ident: str):
-        raise AssertionError("must not resolve invalid identifiers")
-
-    monkeypatch.setattr(auth, "_resolve_identity", _boom)
-    assert auth.verify_credentials("not a handle!", "xxxx-xxxx-xxxx-xxxx") is None
-
-
 def test_is_public_https_rejects_unsafe_endpoints():
     assert not auth._is_public_https("http://pds.example.com")  # not https
     assert not auth._is_public_https("https://127.0.0.1:8443")  # loopback
@@ -54,16 +46,3 @@ def test_is_public_https_rejects_unsafe_endpoints():
     assert not auth._is_public_https("https://10.0.0.1")  # private range
     assert not auth._is_public_https("https://169.254.169.254")  # link-local
     assert not auth._is_public_https("not a url")
-
-
-def test_verify_credentials_refuses_private_pds(monkeypatch):
-    monkeypatch.setattr(
-        auth, "_resolve_identity", lambda i: ("did:plc:abc", "https://127.0.0.1:8443")
-    )
-    assert auth.verify_credentials("alice.bsky.social", "xxxx-xxxx-xxxx-xxxx") is None
-
-
-def test_login_request_does_not_follow_redirects():
-    # A vetted public PDS must not be able to bounce the login to a private host.
-    request = auth._login_request()
-    assert request._client.follow_redirects is False

@@ -63,16 +63,11 @@
              value="{{ q or '' }}" style="min-width:22rem">
     </label>
   </p>
-  <p>
-    <label>App password<br>
-      <input name="app_password" type="password" placeholder="xxxx-xxxx-xxxx-xxxx" required
-             style="min-width:22rem">
-    </label>
-  </p>
   <p class="muted">
-    Use an <strong>app password</strong> (created in your client's
-    Settings → App Passwords), never your main password. It is used once to
-    verify you control the account and is <strong>never stored</strong>.
+    You'll be redirected to <strong>your own AT Protocol server</strong> to
+    sign in (OAuth). No password ever touches this relay, and nothing is
+    stored — we only verify that you control the account, then perform the
+    action you chose.
   </p>
   <p>
     <button type="submit" name="action" value="opt-out">Opt out &amp; delete</button>
