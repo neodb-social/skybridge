@@ -85,16 +85,15 @@ Known but not bridged:
 |---|---|---|
 | `SKYBRIDGE_DOMAIN` | `localhost:8000` | Public host of this relay (the single source of identity) |
 | `SKYBRIDGE_SCHEME` | `https` (`http` for localhost) | URL scheme |
-| `SKYBRIDGE_DATA` | `./data` (`/data` in Docker) | Folder for all mutable state (SQLite DB, relay key) |
-| `SKYBRIDGE_DB` | `$SKYBRIDGE_DATA/skybridge.db` | SQLite path override (`:memory:` for ephemeral) |
+| `SKYBRIDGE_DATA` | `./data` (`/data` in Docker) | Folder for all mutable state (`skybridge.db`, `relay_key.pem`) |
 | `SKYBRIDGE_JETSTREAM` | public jetstream2 us-east | Jetstream WebSocket endpoint |
-| `SKYBRIDGE_RELAY_KEY` | unset | Relay actor private key (PEM); wins over the key file |
-| `SKYBRIDGE_RELAY_KEY_FILE` | `$SKYBRIDGE_DATA/relay_key.pem` | Relay key PEM file override, minted on first use |
+| `SKYBRIDGE_RELAY_KEY` | unset | Relay actor private key (PEM); wins over the minted key file |
 
 The relay actor signs outbound activities with an RSA key that lives outside
 the database. If you don't provide one, it is minted into
-`SKYBRIDGE_RELAY_KEY_FILE` on first use. To provision it explicitly, generate
-a key and put it in `.env` (compose supports quoted multi-line values):
+`$SKYBRIDGE_DATA/relay_key.pem` on first use. To provision it explicitly,
+generate a key and put it in `.env` (compose supports quoted multi-line
+values):
 
 ```bash
 printf 'SKYBRIDGE_RELAY_KEY="%s"\n' \

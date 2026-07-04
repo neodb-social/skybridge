@@ -1,8 +1,8 @@
 """ActivityPub actor documents: the relay ``Application`` + per-user ``Person``.
 
 The relay actor's private key lives OUTSIDE the database: either supplied
-explicitly via ``SKYBRIDGE_RELAY_KEY`` (PEM), or in the PEM file at
-``SKYBRIDGE_RELAY_KEY_FILE``, minted there on first use.
+explicitly via ``SKYBRIDGE_RELAY_KEY`` (PEM), or in the PEM file under the
+data dir (``$SKYBRIDGE_DATA/relay_key.pem``), minted there on first use.
 """
 
 from __future__ import annotations

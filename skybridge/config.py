@@ -52,8 +52,9 @@ class Settings:
 
     domain: str = "localhost:8000"
     scheme: str = "https"
-    # All mutable state (SQLite DB, relay key) lives under SKYBRIDGE_DATA;
-    # the individual paths can still be overridden separately.
+    # All mutable state (SQLite DB, relay key) lives under SKYBRIDGE_DATA.
+    # The individual paths below derive from it; only tests set them directly
+    # (e.g. db_path=":memory:").
     data_dir: str = "data"
     db_path: str = "data/skybridge.db"
     jetstream_url: str = DEFAULT_JETSTREAM
@@ -62,8 +63,8 @@ class Settings:
     relay_username: str = "relay"
     relay_name: str = "Skybridge"
     # Relay actor signing key: an explicit PEM (SKYBRIDGE_RELAY_KEY) wins;
-    # otherwise the PEM file at SKYBRIDGE_RELAY_KEY_FILE, minted on first use,
-    # so the secret lives outside the database.
+    # otherwise the PEM file under the data dir, minted on first use, so the
+    # secret lives outside the database.
     relay_key_pem: str | None = None
     relay_key_file: str = "data/relay_key.pem"
     relay_summary: str = (
@@ -118,11 +119,10 @@ def _from_env() -> Settings:
         domain=domain,
         scheme=scheme,
         data_dir=data_dir,
-        db_path=os.environ.get("SKYBRIDGE_DB") or os.path.join(data_dir, "skybridge.db"),
+        db_path=os.path.join(data_dir, "skybridge.db"),
         jetstream_url=os.environ.get("SKYBRIDGE_JETSTREAM", DEFAULT_JETSTREAM),
         relay_key_pem=os.environ.get("SKYBRIDGE_RELAY_KEY") or None,
-        relay_key_file=os.environ.get("SKYBRIDGE_RELAY_KEY_FILE")
-        or os.path.join(data_dir, "relay_key.pem"),
+        relay_key_file=os.path.join(data_dir, "relay_key.pem"),
     )
 
 
