@@ -85,7 +85,7 @@ Known but not bridged:
 |---|---|---|
 | `SKYBRIDGE_DOMAIN` | `localhost:8000` | Public host of this relay (the single source of identity) |
 | `SKYBRIDGE_SCHEME` | `https` (`http` for localhost) | URL scheme |
-| `SKYBRIDGE_DATA` | `./data` (`/data` in Docker) | Folder for all mutable state (`skybridge.db`, `relay_key.pem`) |
+| `SKYBRIDGE_DATA` | `./data` | Folder for all mutable state (`skybridge.db`, `relay_key.pem`); under compose it is the host folder bind-mounted to the container's `/data` |
 | `SKYBRIDGE_JETSTREAM` | public jetstream2 us-east | Jetstream WebSocket endpoint |
 | `SKYBRIDGE_RELAY_KEY` | unset | Relay actor private key (PEM); wins over the minted key file |
 
@@ -137,8 +137,11 @@ uv run python -m skybridge replay fixtures/jetstream_sample.jsonl --reset
 
 ```bash
 cp .env.example .env   # set SKYBRIDGE_DOMAIN (+ SKYBRIDGE_INGEST=1 to go live)
-docker compose up -d   # serves on :8000; SQLite lives in the skybridge-data volume
+docker compose up -d   # serves on :8000; state lives in ./data (bind mount)
 ```
+
+The container runs as uid 1000; on Linux make sure the data folder is
+writable by it (`mkdir -p data && chown 1000 data`).
 
 Every push to `main` runs the checks and publishes multi-arch
 (amd64/arm64) images to Docker Hub as `neodb/skybridge` (`latest` + commit sha tags) 

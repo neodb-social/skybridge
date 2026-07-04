@@ -9,7 +9,12 @@ services:
       - path: .env # cp .env.example .env and edit
         required: false
     volumes:
-      - skybridge-data:/data
+      # host folder from .env's SKYBRIDGE_DATA (default ./data next to this file)
+      - ${SKYBRIDGE_DATA:-./data}:/data
+    environment:
+      # inside the container the data dir is always the mount point above;
+      # env_file's SKYBRIDGE_DATA only picks the host-side folder
+      SKYBRIDGE_DATA: /data
     healthcheck:
       test:
         [
@@ -22,6 +27,3 @@ services:
       timeout: 10s
       start_period: 10s
       retries: 3
-
-volumes:
-  skybridge-data:
