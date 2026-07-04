@@ -2,9 +2,7 @@
 
 The relay actor's private key lives OUTSIDE the database: either supplied
 explicitly via ``SKYBRIDGE_RELAY_KEY`` (PEM), or in the PEM file at
-``SKYBRIDGE_RELAY_KEY_FILE``, minted there on first use. Pre-existing
-deployments that minted the key into the DB (reserved pseudo-DID row) are
-migrated to the file automatically so the relay identity survives upgrades.
+``SKYBRIDGE_RELAY_KEY_FILE``, minted there on first use.
 """
 
 from __future__ import annotations
@@ -16,7 +14,6 @@ from typing import Any
 
 from skybridge.config import get_settings
 from skybridge.crypto import derive_public_pem, generate_keypair
-from skybridge.db import session_scope
 from skybridge.models import BridgedActor
 
 RELAY_DID = "did:skybridge:relay"
@@ -44,20 +41,13 @@ def _relay_keys(inline_pem: str | None, key_file: str) -> tuple[str, str]:
         return inline_pem, derive_public_pem(inline_pem)
     path = Path(key_file)
     if not path.exists():
-        private_pem = _legacy_db_relay_key() or generate_keypair()[0]
+        private_pem = generate_keypair()[0]
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as f:
             f.write(private_pem)
     private_pem = path.read_text()
     return private_pem, derive_public_pem(private_pem)
-
-
-def _legacy_db_relay_key() -> str | None:
-    """Key from the pre-file-storage DB row, so upgrades keep the identity."""
-    with session_scope() as session:
-        row = session.get(BridgedActor, RELAY_DID)
-        return row.private_key_pem if row is not None else None
 
 
 def relay_actor() -> dict[str, Any]:

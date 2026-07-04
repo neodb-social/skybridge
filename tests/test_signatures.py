@@ -119,26 +119,3 @@ def test_relay_key_env_pem_wins(settings, tmp_path):
     import os
 
     assert not os.path.exists(settings.relay_key_file)
-
-
-def test_relay_key_migrates_legacy_db_row(settings):
-    from skybridge.activitypub.actors import RELAY_DID, get_relay_keys
-    from skybridge.db import session_scope
-    from skybridge.models import BridgedActor
-
-    legacy_priv, legacy_pub = generate_keypair()
-    with session_scope() as session:
-        session.add(
-            BridgedActor(
-                did=RELAY_DID,
-                handle="relay",
-                private_key_pem=legacy_priv,
-                public_key_pem=legacy_pub,
-            )
-        )
-    priv, pub = get_relay_keys()
-    # pre-file deployments keep their AP identity: key moves DB -> file
-    assert priv == legacy_priv
-    assert pub == legacy_pub
-    with open(settings.relay_key_file) as f:
-        assert f.read() == legacy_priv

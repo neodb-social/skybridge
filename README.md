@@ -88,7 +88,21 @@ Known but not bridged:
 | `SKYBRIDGE_DB` | `skybridge.db` | SQLite path (`:memory:` for ephemeral) |
 | `SKYBRIDGE_JETSTREAM` | public jetstream2 us-east | Jetstream WebSocket endpoint |
 | `SKYBRIDGE_RELAY_KEY` | unset | Relay actor private key (PEM); wins over the key file |
-| `SKYBRIDGE_RELAY_KEY_FILE` | `relay_key.pem` (`/data/relay_key.pem` in Docker) | Relay key PEM file, minted on first use; legacy DB-stored keys migrate here |
+| `SKYBRIDGE_RELAY_KEY_FILE` | `relay_key.pem` (`/data/relay_key.pem` in Docker) | Relay key PEM file, minted on first use |
+
+The relay actor signs outbound activities with an RSA key that lives outside
+the database. If you don't provide one, it is minted into
+`SKYBRIDGE_RELAY_KEY_FILE` on first use. To provision it explicitly, generate
+a key and put it in `.env` (compose supports quoted multi-line values):
+
+```bash
+printf 'SKYBRIDGE_RELAY_KEY="%s"\n' \
+  "$(openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048)" >> .env
+```
+
+Keep the key safe and back it up — losing it changes the relay's ActivityPub
+identity, and peers that cached the old public key will reject signatures
+until they re-fetch the actor.
 | `SKYBRIDGE_INGEST` | unset | set to `1` to start live ingestion inside `serve` |
 | `SKYBRIDGE_LOG` | `INFO` | log level |
 
