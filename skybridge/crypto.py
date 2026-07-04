@@ -41,6 +41,19 @@ def generate_keypair() -> tuple[str, str]:
     return private_pem, public_pem
 
 
+def derive_public_pem(private_pem: str) -> str:
+    """Public-key PEM derived from a private-key PEM."""
+    return (
+        load_private_key(private_pem)
+        .public_key()
+        .public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        .decode()
+    )
+
+
 def load_private_key(pem: str) -> RSAPrivateKey:
     key = serialization.load_pem_private_key(pem.encode(), password=None)
     assert isinstance(key, RSAPrivateKey)

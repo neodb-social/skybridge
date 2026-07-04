@@ -58,6 +58,11 @@ class Settings:
     # Relay actor identity.
     relay_username: str = "relay"
     relay_name: str = "Skybridge"
+    # Relay actor signing key: an explicit PEM (SKYBRIDGE_RELAY_KEY) wins;
+    # otherwise the PEM file at SKYBRIDGE_RELAY_KEY_FILE, minted on first use,
+    # so the secret lives outside the database.
+    relay_key_pem: str | None = None
+    relay_key_file: str = "relay_key.pem"
     relay_summary: str = (
         "Skybridge mirrors public AT Protocol activities (e.g. popfeed) into the "
         "Fediverse as NeoDB-compatible ActivityPub."
@@ -110,6 +115,8 @@ def _from_env() -> Settings:
         scheme=scheme,
         db_path=os.environ.get("SKYBRIDGE_DB", "skybridge.db"),
         jetstream_url=os.environ.get("SKYBRIDGE_JETSTREAM", DEFAULT_JETSTREAM),
+        relay_key_pem=os.environ.get("SKYBRIDGE_RELAY_KEY") or None,
+        relay_key_file=os.environ.get("SKYBRIDGE_RELAY_KEY_FILE", "relay_key.pem"),
     )
 
 

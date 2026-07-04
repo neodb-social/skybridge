@@ -26,7 +26,8 @@ RUN useradd --create-home --uid 1000 skybridge \
 COPY --from=build --chown=skybridge:skybridge /app /app
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
-    SKYBRIDGE_DB=/data/skybridge.db
+    SKYBRIDGE_DB=/data/skybridge.db \
+    SKYBRIDGE_RELAY_KEY_FILE=/data/relay_key.pem
 
 USER skybridge
 VOLUME /data

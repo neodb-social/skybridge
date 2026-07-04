@@ -1,17 +1,23 @@
 """ActivityPub actor documents: the relay ``Application`` + per-user ``Person``.
 
-The relay actor's keypair lives in the DB under a reserved pseudo-DID so it is
-managed exactly like a bridged actor (mint-on-first-use, stable thereafter).
+The relay actor's private key lives OUTSIDE the database: either supplied
+explicitly via ``SKYBRIDGE_RELAY_KEY`` (PEM), or in the PEM file at
+``SKYBRIDGE_RELAY_KEY_FILE``, minted there on first use. Pre-existing
+deployments that minted the key into the DB (reserved pseudo-DID row) are
+migrated to the file automatically so the relay identity survives upgrades.
 """
 
 from __future__ import annotations
 
+import os
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from skybridge.config import get_settings
-from skybridge.crypto import generate_keypair
+from skybridge.crypto import derive_public_pem, generate_keypair
 from skybridge.db import session_scope
-from skybridge.models import BridgedActor, utcnow
+from skybridge.models import BridgedActor
 
 RELAY_DID = "did:skybridge:relay"
 SECURITY_CONTEXT = "https://w3id.org/security/v1"
@@ -27,22 +33,31 @@ def _public_key_block(actor_id: str, public_pem: str) -> dict:
 
 
 def get_relay_keys() -> tuple[str, str]:
-    """Return ``(private_pem, public_pem)`` for the relay actor, minting once."""
+    """Return ``(private_pem, public_pem)`` for the relay actor."""
+    settings = get_settings()
+    return _relay_keys(settings.relay_key_pem, settings.relay_key_file)
+
+
+@lru_cache(maxsize=4)
+def _relay_keys(inline_pem: str | None, key_file: str) -> tuple[str, str]:
+    if inline_pem:
+        return inline_pem, derive_public_pem(inline_pem)
+    path = Path(key_file)
+    if not path.exists():
+        private_pem = _legacy_db_relay_key() or generate_keypair()[0]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(private_pem)
+    private_pem = path.read_text()
+    return private_pem, derive_public_pem(private_pem)
+
+
+def _legacy_db_relay_key() -> str | None:
+    """Key from the pre-file-storage DB row, so upgrades keep the identity."""
     with session_scope() as session:
         row = session.get(BridgedActor, RELAY_DID)
-        if row is None:
-            settings = get_settings()
-            private_pem, public_pem = generate_keypair()
-            row = BridgedActor(
-                did=RELAY_DID,
-                handle=settings.relay_username,
-                display_name=settings.relay_name,
-                private_key_pem=private_pem,
-                public_key_pem=public_pem,
-            )
-            session.add(row)
-        row.last_seen = utcnow()
-        return row.private_key_pem, row.public_key_pem
+        return row.private_key_pem if row is not None else None
 
 
 def relay_actor() -> dict[str, Any]:

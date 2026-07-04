@@ -84,3 +84,61 @@ def test_wrong_key_fails_verification():
         url="https://remote.example/x",
     )
     assert not verify_request(public_pem=other_public, method="GET", path="/x", headers=headers)
+
+
+# --- relay key management (env / file, outside the DB) ----------------------
+
+
+def test_relay_key_minted_to_file_and_stable(settings):
+    import os
+
+    from skybridge.activitypub.actors import get_relay_keys
+
+    priv1, pub1 = get_relay_keys()
+    assert priv1.startswith("-----BEGIN PRIVATE KEY-----")
+    assert os.path.exists(settings.relay_key_file)
+    assert oct(os.stat(settings.relay_key_file).st_mode & 0o777) == "0o600"
+    # stable across calls: the file is the source of truth
+    assert get_relay_keys() == (priv1, pub1)
+    with open(settings.relay_key_file) as f:
+        assert f.read() == priv1
+
+
+def test_relay_key_env_pem_wins(settings, tmp_path):
+    from dataclasses import replace
+
+    from skybridge.activitypub.actors import get_relay_keys
+    from skybridge.config import set_settings
+
+    private_pem, public_pem = generate_keypair()
+    set_settings(replace(settings, relay_key_pem=private_pem))
+    priv, pub = get_relay_keys()
+    assert priv == private_pem
+    assert pub == public_pem
+    # no key file gets written when the key comes from the environment
+    import os
+
+    assert not os.path.exists(settings.relay_key_file)
+
+
+def test_relay_key_migrates_legacy_db_row(settings):
+    from skybridge.activitypub.actors import RELAY_DID, get_relay_keys
+    from skybridge.db import session_scope
+    from skybridge.models import BridgedActor
+
+    legacy_priv, legacy_pub = generate_keypair()
+    with session_scope() as session:
+        session.add(
+            BridgedActor(
+                did=RELAY_DID,
+                handle="relay",
+                private_key_pem=legacy_priv,
+                public_key_pem=legacy_pub,
+            )
+        )
+    priv, pub = get_relay_keys()
+    # pre-file deployments keep their AP identity: key moves DB -> file
+    assert priv == legacy_priv
+    assert pub == legacy_pub
+    with open(settings.relay_key_file) as f:
+        assert f.read() == legacy_priv

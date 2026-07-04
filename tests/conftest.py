@@ -12,8 +12,13 @@ FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
 
 
 @pytest.fixture
-def settings() -> Settings:
-    s = Settings(domain="bridge.test", scheme="https", db_path=":memory:")
+def settings(tmp_path) -> Settings:
+    s = Settings(
+        domain="bridge.test",
+        scheme="https",
+        db_path=":memory:",
+        relay_key_file=str(tmp_path / "relay_key.pem"),
+    )
     set_settings(s)
     return s
 

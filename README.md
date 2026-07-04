@@ -87,6 +87,8 @@ Known but not bridged:
 | `SKYBRIDGE_SCHEME` | `https` (`http` for localhost) | URL scheme |
 | `SKYBRIDGE_DB` | `skybridge.db` | SQLite path (`:memory:` for ephemeral) |
 | `SKYBRIDGE_JETSTREAM` | public jetstream2 us-east | Jetstream WebSocket endpoint |
+| `SKYBRIDGE_RELAY_KEY` | unset | Relay actor private key (PEM); wins over the key file |
+| `SKYBRIDGE_RELAY_KEY_FILE` | `relay_key.pem` (`/data/relay_key.pem` in Docker) | Relay key PEM file, minted on first use; legacy DB-stored keys migrate here |
 | `SKYBRIDGE_INGEST` | unset | set to `1` to start live ingestion inside `serve` |
 | `SKYBRIDGE_LOG` | `INFO` | log level |
 
