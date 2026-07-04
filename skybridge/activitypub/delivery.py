@@ -193,6 +193,31 @@ def announce(activity: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def _deliver_direct(
+    worker: DeliveryWorker,
+    *,
+    record_uri: str,
+    did: str,
+    activity: dict[str, Any],
+) -> int:
+    """Direct path: the bridged author delivers ``activity`` to its own followers."""
+    count = 0
+    follower_inboxes = follower_targets(did)
+    if follower_inboxes:
+        with session_scope() as session:
+            actor_row = session.get(BridgedActor, did)
+            if actor_row is not None:
+                priv = actor_row.private_key_pem
+                key_id = f"{get_settings().actor_id(actor_row.handle)}#main-key"
+            else:
+                priv = key_id = None
+        if priv and key_id:
+            for inbox in follower_inboxes:
+                await worker.enqueue(Task(record_uri, inbox, key_id, priv, activity))
+                count += 1
+    return count
+
+
 async def fanout(
     worker: DeliveryWorker,
     *,
@@ -215,18 +240,21 @@ async def fanout(
             count += 1
 
     # Direct path: the bridged author delivers to its own followers.
-    follower_inboxes = follower_targets(did)
-    if follower_inboxes:
-        with session_scope() as session:
-            actor_row = session.get(BridgedActor, did)
-            if actor_row is not None:
-                priv = actor_row.private_key_pem
-                key_id = f"{settings.actor_id(actor_row.handle)}#main-key"
-            else:
-                priv = key_id = None
-        if priv and key_id:
-            for inbox in follower_inboxes:
-                await worker.enqueue(Task(record_uri, inbox, key_id, priv, activity))
-                count += 1
+    count += await _deliver_direct(worker, record_uri=record_uri, did=did, activity=activity)
 
     return count
+
+
+async def fanout_actor_update(
+    worker: DeliveryWorker,
+    *,
+    did: str,
+    activity: dict[str, Any],
+) -> int:
+    """Direct-deliver an actor ``Update`` to just that author's followers.
+
+    Profile updates are never relay-``Announce``d to instance subscribers
+    (that's the ``fanout`` relay path, for per-work content) — this is just a
+    refresh of the actor document itself.
+    """
+    return await _deliver_direct(worker, record_uri=activity["id"], did=did, activity=activity)

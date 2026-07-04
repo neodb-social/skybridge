@@ -40,6 +40,12 @@ WANTED_COLLECTIONS: tuple[str, ...] = (
     "social.popfeed.feed.list",
     "social.popfeed.feed.listItem",
     "social.popfeed.feed.review",
+    # profile edits refresh the bridged actor's display name/avatar and emit
+    # an AP Update(Person); deliberately NOT watching app.bsky.actor.profile
+    # on Jetstream (that would stream every profile edit network-wide) — the
+    # bsky profile is instead re-fetched as a fallback whenever a popfeed
+    # profile event arrives.
+    "social.popfeed.actor.profile",
 )
 
 # Default public Jetstream endpoint; only the collections above are requested.

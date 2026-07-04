@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Mapping
 
+from skybridge import optout
+from skybridge.atproto import identity
 from skybridge.atproto.replay import read_events, replay_file
 from skybridge.config import WANTED_COLLECTIONS
 from skybridge.db import session_scope
@@ -153,9 +156,9 @@ _REVIEW_URI = f"at://{_MERGE_DID}/social.popfeed.feed.review/rv1"
 _ITEM_URI = f"at://{_MERGE_DID}/social.popfeed.feed.listItem/it1"
 
 
-def _ev(collection, rkey, record, op="create"):
+def _ev(collection, rkey, record, op="create", *, did=_MERGE_DID):
     return {
-        "did": _MERGE_DID,
+        "did": did,
         "time_us": 1_700_000_000_000_000,
         "kind": "commit",
         "commit": {"operation": op, "collection": collection, "rkey": rkey, "record": record},
@@ -367,3 +370,158 @@ def test_list_item_note_falls_back_when_list_never_archived(settings, monkeypatc
     note = result.activity["object"]
     assert "to a list" in note["content"]
     assert "name" not in note
+
+
+# --- social.popfeed.actor.profile: refreshes identity, never mints one -----
+
+_PROFILE_COLLECTION = "social.popfeed.actor.profile"
+_PROFILE_DID = "did:plc:profiletest"
+
+
+def _fake_http_json(responses: Mapping[str, dict | None]):
+    """Stand-in for ``identity._http_json`` keyed by URL substring (mirrors
+    the helper of the same name in tests/test_identity.py)."""
+
+    def fake(url: str, timeout: float = 8.0) -> dict | None:
+        for substring, value in responses.items():
+            if substring in url:
+                return value
+        raise AssertionError(f"unexpected URL requested in test: {url}")
+
+    return fake
+
+
+def test_profile_event_without_actor_is_ignored(settings):
+    # A profile edit alone must never mint an actor.
+    event = _ev(_PROFILE_COLLECTION, "self", {"displayName": "Ghost"}, did=_PROFILE_DID)
+    assert _run(event) is None
+    with session_scope() as session:
+        assert session.get(BridgedActor, _PROFILE_DID) is None
+
+
+def test_profile_event_updates_display_name_offline(settings):
+    identity.ensure_actor(_PROFILE_DID, allow_network=False)
+    event = _ev(_PROFILE_COLLECTION, "self", {"displayName": "New Nick"}, did=_PROFILE_DID)
+    result = _run(event)  # allow_network=False
+    assert result is not None
+    assert result.activity["type"] == "Update"
+    assert result.activity["object"]["type"] == "Person"
+    assert result.activity["object"]["name"] == "New Nick"
+    with session_scope() as session:
+        actor = session.get(BridgedActor, _PROFILE_DID)
+        assert actor is not None
+        assert actor.display_name == "New Nick"
+        assert actor.avatar is None  # untouched offline
+        at_uri = f"at://{_PROFILE_DID}/{_PROFILE_COLLECTION}/self"
+        assert session.get(Record, at_uri) is None  # identity metadata, not archived
+
+
+def test_profile_event_refreshes_avatar_via_bsky_fallback(settings, monkeypatch):
+    identity.ensure_actor(_PROFILE_DID, allow_network=False)
+    pds = "https://pds.example"
+    avatar_cid = "bafkreiabc123"
+    responses = {
+        "plc.directory": {"service": [{"id": "#atproto_pds", "serviceEndpoint": pds}]},
+        "collection=app.bsky.actor.profile": {
+            "value": {"displayName": "Bsky Name", "avatar": {"ref": {"$link": avatar_cid}}}
+        },
+    }
+    monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
+
+    event = _ev(_PROFILE_COLLECTION, "self", {"displayName": ""}, did=_PROFILE_DID)
+    result = asyncio.run(process_event(event, allow_network=True))
+
+    expected_avatar = f"{pds}/xrpc/com.atproto.sync.getBlob?did={_PROFILE_DID}&cid={avatar_cid}"
+    assert result is not None
+    assert result.activity["object"]["icon"]["url"] == expected_avatar
+    with session_scope() as session:
+        actor = session.get(BridgedActor, _PROFILE_DID)
+        assert actor is not None
+        assert actor.avatar == expected_avatar
+
+
+def test_profile_event_clears_display_name_when_both_sources_empty(settings, monkeypatch):
+    identity.ensure_actor(_PROFILE_DID, allow_network=False)
+    with session_scope() as session:
+        actor = session.get(BridgedActor, _PROFILE_DID)
+        assert actor is not None
+        actor.display_name = "Old Name"
+        actor.avatar = "https://pds.example/old-avatar"
+
+    responses = {
+        "plc.directory": {
+            "service": [{"id": "#atproto_pds", "serviceEndpoint": "https://pds.example"}]
+        },
+        "collection=app.bsky.actor.profile": {"value": {"displayName": ""}},
+    }
+    monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
+
+    event = _ev(_PROFILE_COLLECTION, "self", {"displayName": ""}, did=_PROFILE_DID)
+    result = asyncio.run(process_event(event, allow_network=True))
+
+    assert result is not None
+    with session_scope() as session:
+        actor = session.get(BridgedActor, _PROFILE_DID)
+        assert actor is not None
+        assert actor.display_name is None  # both sources empty: genuinely removed
+        assert actor.avatar == "https://pds.example/old-avatar"  # avatar is never cleared
+
+
+def test_profile_event_keeps_display_name_when_plc_unreachable(settings, monkeypatch):
+    # allow_network=True but PLC is down: the bsky fallback was never actually
+    # consulted, so an empty popfeed displayName must NOT clear the stored one.
+    identity.ensure_actor(_PROFILE_DID, allow_network=False)
+    with session_scope() as session:
+        actor = session.get(BridgedActor, _PROFILE_DID)
+        assert actor is not None
+        actor.display_name = "Old Name"
+
+    monkeypatch.setattr(identity, "_http_json", _fake_http_json({"plc.directory": None}))
+
+    event = _ev(_PROFILE_COLLECTION, "self", {"displayName": ""}, did=_PROFILE_DID)
+    result = asyncio.run(process_event(event, allow_network=True))
+
+    assert result is not None
+    with session_scope() as session:
+        actor = session.get(BridgedActor, _PROFILE_DID)
+        assert actor is not None
+        assert actor.display_name == "Old Name"
+
+
+def test_profile_event_opted_out_is_ignored(settings):
+    identity.ensure_actor(_PROFILE_DID, allow_network=False)
+    asyncio.run(optout.opt_out(_PROFILE_DID))
+    event = _ev(_PROFILE_COLLECTION, "self", {"displayName": "New Nick"}, did=_PROFILE_DID)
+    assert _run(event) is None
+    with session_scope() as session:
+        actor = session.get(BridgedActor, _PROFILE_DID)
+        assert actor is not None
+        assert actor.display_name is None  # untouched: opt-out short-circuits first
+
+
+def test_profile_delete_is_a_noop(settings):
+    identity.ensure_actor(_PROFILE_DID, allow_network=False)
+    with session_scope() as session:
+        actor = session.get(BridgedActor, _PROFILE_DID)
+        assert actor is not None
+        actor.display_name = "Untouched"
+
+    event = _ev(_PROFILE_COLLECTION, "self", None, op="delete", did=_PROFILE_DID)
+    assert _run(event) is None
+
+    with session_scope() as session:
+        actor = session.get(BridgedActor, _PROFILE_DID)
+        assert actor is not None
+        assert actor.display_name == "Untouched"
+
+
+def test_profile_collection_absent_from_fixture(fixture_path):
+    # Guards the _counts_from_fixture assumptions above: WANTED_COLLECTIONS
+    # now includes the profile collection, but the fixture has no such
+    # events, so none of the existing count assertions change.
+    assert _PROFILE_COLLECTION in WANTED_COLLECTIONS
+    assert not any(
+        ev.get("commit", {}).get("collection") == _PROFILE_COLLECTION
+        for ev in read_events(fixture_path)
+        if ev.get("kind") == "commit"
+    )

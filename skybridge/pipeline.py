@@ -9,12 +9,14 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
 
 from skybridge import optout
-from skybridge.activitypub.delivery import DeliveryWorker, fanout
+from skybridge.activitypub import actors
+from skybridge.activitypub.delivery import DeliveryWorker, fanout, fanout_actor_update
 from skybridge.atproto import identity
 from skybridge.config import get_settings
 from skybridge.db import session_scope
@@ -42,6 +44,12 @@ ARCHIVE_ONLY_COLLECTIONS = frozenset({"social.popfeed.feed.list"})
 _REVIEW_COLLECTION = "social.popfeed.feed.review"
 _LIST_ITEM_COLLECTION = "social.popfeed.feed.listItem"
 _PAIRED_COLLECTIONS = (_REVIEW_COLLECTION, _LIST_ITEM_COLLECTION)
+
+# A profile edit refreshes the bridged actor's display name/avatar (see
+# identity.refresh_actor) and emits an Update(Person) to that author's own
+# followers. It carries no per-work content, so it never touches the Record
+# archive and never mints an actor of its own — see _process_profile.
+_PROFILE_COLLECTION = "social.popfeed.actor.profile"
 
 
 @dataclass
@@ -95,6 +103,20 @@ async def process_event(
     operation = commit.get("operation", "create")
     time_us = event.get("time_us")
     at_uri = _at_uri(did, collection, rkey)
+
+    if collection == _PROFILE_COLLECTION:
+        # A profile edit only ever refreshes an existing actor (see
+        # identity.refresh_actor) — it must never mint one, so this branches
+        # before ensure_actor is called below.
+        return await _process_profile(
+            at_uri=at_uri,
+            did=did,
+            operation=operation,
+            record=commit.get("record") or {},
+            time_us=time_us,
+            worker=worker,
+            allow_network=allow_network,
+        )
 
     ident = identity.ensure_actor(did, allow_network=allow_network)
     handle = ident.handle
@@ -305,6 +327,50 @@ def _process_archive_only(
         work_key=None,
     )
     return Processed(at_uri, operation, collection, {})
+
+
+async def _process_profile(
+    *,
+    at_uri: str,
+    did: str,
+    operation: str,
+    record: dict[str, Any],
+    time_us: int | None,
+    worker: DeliveryWorker | None,
+    allow_network: bool,
+) -> Processed | None:
+    """Refresh a bridged actor's display name/avatar from a profile edit and
+    emit an ``Update(Person)`` to that author's own followers.
+
+    Never archived in the ``Record`` table: a profile record is identity
+    metadata, not content, so keeping it out keeps /archive and stats
+    focused on actual posts.
+    """
+    if operation == "delete":
+        # Deleting the popfeed profile record doesn't change identity; bsky
+        # data remains authoritative on the next refresh.
+        return None
+
+    row = identity.refresh_actor(did, record, allow_network=allow_network)
+    if row is None:
+        return None
+
+    settings = get_settings()
+    actor_id = settings.actor_id(row.handle)
+    update_id = time_us or int(datetime.now(UTC).timestamp() * 1_000_000)
+    activity = {
+        "@context": [actors.AS_CONTEXT, actors.SECURITY_CONTEXT],
+        "id": f"{actor_id}#updates/{update_id}",
+        "type": "Update",
+        "actor": actor_id,
+        "to": [neodb.PUBLIC],
+        "cc": [f"{actor_id}/followers"],
+        "object": actors.person_actor(row),
+    }
+    delivered = 0
+    if worker is not None:
+        delivered = await fanout_actor_update(worker, did=did, activity=activity)
+    return Processed(at_uri, operation, _PROFILE_COLLECTION, activity, delivered)
 
 
 async def _process_delete(

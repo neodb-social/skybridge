@@ -158,6 +158,56 @@ def ensure_actor(did: str, *, allow_network: bool = True) -> Identity:
         return ident
 
 
+def refresh_actor(
+    did: str, popfeed_value: dict, *, allow_network: bool = True
+) -> BridgedActor | None:
+    """Refresh an existing bridged actor's display name/avatar from a fresh
+    ``social.popfeed.actor.profile`` record.
+
+    A profile edit alone must never mint an actor: returns ``None`` if none
+    exists yet for ``did``. Mirrors ``resolve_remote``'s source precedence —
+    the popfeed value (already in hand from the firehose event) wins, falling
+    back to the ``app.bsky.actor.profile`` record on the same PDS when either
+    field is still missing, network permitting.
+    """
+    with session_scope() as session:
+        row = session.get(BridgedActor, did)
+        if row is None:
+            return None
+
+        display_name = popfeed_value.get("displayName") or popfeed_value.get("name") or None
+        avatar: str | None = None
+        pds = resolve_pds(did) if allow_network else None
+        if pds:
+            avatar = _avatar_url(popfeed_value, did=did, pds=pds)
+
+        if pds and (not display_name or not avatar):
+            bsky_val = _profile_record(pds, did, _BSKY_PROFILE_COLLECTION)
+            if not display_name:
+                display_name = bsky_val.get("displayName") or bsky_val.get("name") or None
+            if not avatar:
+                avatar = _avatar_url(bsky_val, did=did, pds=pds)
+
+        if pds:
+            # Both popfeed and the bsky fallback were consulted and neither
+            # had a name: the user genuinely cleared it, so clear ours too.
+            row.display_name = display_name
+        elif display_name is not None:
+            # No PDS consulted (network disallowed, or PLC unreachable): only
+            # overwrite with a real value — never clear on partial information.
+            row.display_name = display_name
+
+        # Avatar is NEVER cleared here: a missing candidate could mean the
+        # user removed their avatar, or simply that the fetch failed / the
+        # network was disallowed — we can't tell those apart, so only
+        # overwrite when a fresh value was actually found.
+        if avatar is not None:
+            row.avatar = avatar
+
+        row.last_seen = utcnow()
+        return row
+
+
 def actor_by_handle(handle: str) -> BridgedActor | None:
     with session_scope() as session:
         return session.scalar(select(BridgedActor).where(BridgedActor.handle == handle))

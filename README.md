@@ -50,6 +50,7 @@ never `Article`/titled `Review` objects.
 | `social.popfeed.feed.review` | `Note` + `Rating` (0-10) and, when there is review text, an untitled `Comment` `withRegardTo` the work (never a titled `Review`/`Article`); `containsSpoilers` sets `sensitive` + a CW `summary` |
 | `social.popfeed.feed.list` | archived only (no AP emission): stored for `listUri` resolution and future NeoDB `Collection` mapping |
 | `social.popfeed.feed.listItem` | on a shelf-type list: `Note` + a `Status` mark (`status` derived from `listType`, including compound types like `watched_movies`) `withRegardTo` the work — folded into the review's Note when the same author reviewed the same work (see below). On a status-less list: archived only (collection membership is not bridged) |
+| `social.popfeed.actor.profile` | no `Note`: refreshes the bridged actor's display name/avatar and emits an `Update(Person)` directly to that author's followers (never relayed as an `Announce`); not archived — it's identity metadata, not content |
 
 One popfeed action ("watched + rated") writes a review *and* a listItem; the
 bridge emits ONE AP `Note` per (author, work) carrying `Status` + `Rating` +
@@ -76,6 +77,9 @@ Known but not bridged:
 - `social.popfeed.feed.post` (legacy)
 - `social.popfeed.feed.reaction` (emoji reactions; maybe later `Like`/`EmojiReact` in AP)
 - per-episode `watchedEpisodes` array on tv listItems.
+- `app.bsky.actor.profile` on Jetstream (deliberately not watched — that would
+  stream every profile edit network-wide); it's instead re-fetched as a
+  fallback whenever a `social.popfeed.actor.profile` event arrives.
 
 ---
 
