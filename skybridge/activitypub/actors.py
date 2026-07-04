@@ -84,7 +84,7 @@ def person_actor(actor: BridgedActor) -> dict[str, Any]:
         "preferredUsername": actor.handle,
         "name": actor.display_name or actor.handle,
         "summary": (
-            f"Bridged from popfeed on the AT Protocol. Original account: "
+            f"Bridged from Atmosphere. Original account: "
             f'<a href="https://bsky.app/profile/{actor.did}">{actor.handle}</a>'
         ),
         "inbox": f"{actor_id}/inbox",

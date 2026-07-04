@@ -153,3 +153,22 @@ def test_metadata_issuer_mismatch_rejected(settings, monkeypatch):
 
     monkeypatch.setattr(oauth, "_transport", httpx.MockTransport(handler))
     assert oauth.resolve_auth_server(PDS) is None
+
+
+def test_loopback_client_for_local_dev(settings):
+    from dataclasses import replace
+
+    from skybridge.config import set_settings
+
+    set_settings(replace(settings, domain="localhost:8000", scheme="http"))
+    # RFC 8252: redirect must use a loopback IP, never the "localhost" name
+    assert oauth.redirect_uri() == "http://127.0.0.1:8000/oauth/callback"
+    cid = oauth.client_id()
+    assert cid.startswith("http://localhost?")
+    assert "redirect_uri=http%3A%2F%2F127.0.0.1%3A8000%2Foauth%2Fcallback" in cid
+    assert "scope=atproto" in cid
+
+
+def test_hosted_client_id_for_https(settings):
+    assert oauth.client_id() == settings.url("oauth/client-metadata.json")
+    assert oauth.redirect_uri() == settings.url("oauth/callback")

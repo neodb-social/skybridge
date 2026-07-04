@@ -50,12 +50,21 @@ def _client() -> httpx.Client:
 # --------------------------------------------------------------------------- #
 # Client identity (a public client: client_id IS the metadata URL)
 # --------------------------------------------------------------------------- #
-def client_id() -> str:
-    return get_settings().url("oauth/client-metadata.json")
-
-
 def redirect_uri() -> str:
-    return get_settings().url("oauth/callback")
+    uri = get_settings().url("oauth/callback")
+    # RFC 8252: loopback redirects must use an IP literal, not "localhost" —
+    # authorization servers reject the hostname form outright.
+    return uri.replace("://localhost", "://127.0.0.1", 1)
+
+
+def client_id() -> str:
+    settings = get_settings()
+    if settings.scheme == "https":
+        return settings.url("oauth/client-metadata.json")
+    # Local development: hosted client metadata requires https, so use the
+    # atproto "loopback client" form — the authorization server synthesizes
+    # the metadata from the query parameters.
+    return "http://localhost?" + urlencode({"redirect_uri": redirect_uri(), "scope": "atproto"})
 
 
 def client_metadata() -> dict:
