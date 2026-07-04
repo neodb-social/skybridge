@@ -68,8 +68,8 @@ class Settings:
     relay_key_pem: str | None = None
     relay_key_file: str = "data/relay_key.pem"
     relay_summary: str = (
-        "Skybridge mirrors public AT Protocol activities (e.g. popfeed) into the "
-        "Fediverse as NeoDB-compatible ActivityPub."
+        "Skybridge mirrors activities from Atmosphere (e.g. popfeed) to "
+        "the Fediverse in NeoDB-compatible format."
     )
     # Delivery worker retry schedule (seconds).
     retry_backoff: tuple[int, ...] = (2, 4, 8, 16)

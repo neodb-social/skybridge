@@ -1,25 +1,52 @@
-{% extends "base.html" %}
-{% block content %}
+{% extends "base.html" %} {% block content %}
 <p class="muted">{{ settings.relay_summary }}</p>
-<p>Relay url: <code>{{ settings.relay_actor_id }}</code></p>
+<p>Relay url: <code>{{ settings.url("inbox") }}</code></p>
 {% if jetstream_url %}
 <p>Jetstream endpoint: <code>{{ jetstream_url }}</code></p>
 {% endif %}
 
 <div class="grid">
-  <div class="card"><div class="n">{{ stats.bridged_actors }}</div><div class="l">bridged authors</div></div>
-  <div class="card"><div class="n">{{ stats.records_active }}</div><div class="l">active records</div></div>
-  <div class="card"><div class="n">{{ stats.works }}</div><div class="l">works catalogued</div></div>
-  <div class="card"><div class="n">{{ stats.subscribers_accepted }}</div><div class="l">connected instances</div></div>
-  <div class="card"><div class="n">{{ stats.follows }}</div><div class="l">remote followers</div></div>
+    <div class="card">
+        <div class="n">{{ stats.bridged_actors }}</div>
+        <div class="l">bridged authors</div>
+    </div>
+    <div class="card">
+        <div class="n">{{ stats.records_active }}</div>
+        <div class="l">active records</div>
+    </div>
+    <div class="card">
+        <div class="n">{{ stats.works }}</div>
+        <div class="l">works catalogued</div>
+    </div>
+    <div class="card">
+        <div class="n">{{ stats.subscribers_accepted }}</div>
+        <div class="l">connected instances</div>
+    </div>
+    <div class="card">
+        <div class="n">{{ stats.follows }}</div>
+        <div class="l">remote followers</div>
+    </div>
 </div>
 
 <h2>By collection</h2>
 <table>
-  <tr><th>Collection</th><th>Records</th></tr>
-  {% for coll, n in stats.records_by_collection.items() %}
-  <tr><td><code>{{ coll }}</code></td><td>{{ n }}</td></tr>
-  {% endfor %}
+    <tr>
+        <th>Collection</th>
+        <th>Records</th>
+    </tr>
+    {% for coll, n in stats.records_by_collection.items() %}
+    <tr>
+        <td><code>{{ coll }}</code></td>
+        <td>{{ n }}</td>
+    </tr>
+    {% endfor %}
 </table>
 
+<footer>
+    <p class="muted">
+        skybridge is an
+        <a href="https://github.com/neodb-social/skybridge">open source</a>
+        project from <a href="https://neodb.net">NeoDB</a>.
+    </p>
+</footer>
 {% endblock %}
