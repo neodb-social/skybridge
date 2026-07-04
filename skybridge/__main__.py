@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 
 from skybridge.config import get_settings
@@ -18,7 +19,20 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
     init_db()
-    uvicorn.run("skybridge.main:app", host=args.host, port=args.port, log_level="info")
+    log_level = os.getenv("SKYBRIDGE_LOG", "INFO").lower()
+    if log_level not in {"critical", "error", "warning", "info", "debug", "trace"}:
+        log_level = "info"
+
+    # Access logs are noise outside debug/trace (healthcheck polls /stats constantly)
+    access_log = log_level in {"debug", "trace"}
+
+    uvicorn.run(
+        "skybridge.main:app",
+        host=args.host,
+        port=args.port,
+        log_level=log_level,
+        access_log=access_log,
+    )
     return 0
 
 
