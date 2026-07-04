@@ -13,19 +13,36 @@ from dataclasses import dataclass
 
 from skybridge.config import get_settings
 from skybridge.db import session_scope
-from skybridge.models import Work
+from skybridge.models import Work, WorkIdentifier
 
 # popfeed creativeWorkType -> NeoDB catalog category.
 WORK_TYPE_TO_CATEGORY: dict[str, str] = {
     "movie": "movie",
     "tv_show": "tv",
+    "tv_season": "tv",
     "video_game": "game",
     "book": "book",
     "music": "music",
+    "album": "music",
+    "ep": "music",
+    "podcast": "podcast",
 }
 
 # Preferred identifier per work type (first match wins), then any remaining.
-_ID_PRIORITY = ("imdbId", "tmdbId", "igdbId", "isbn", "musicbrainzId")
+# isbn13 over isbn10 (canonical form); mbId (musicbrainz release group, stable
+# across pressings) over mbReleaseId.
+_ID_PRIORITY = (
+    "imdbId",
+    "tmdbId",
+    "igdbId",
+    "steamId",
+    "isbn",
+    "isbn13",
+    "isbn10",
+    "musicbrainzId",
+    "mbId",
+    "mbReleaseId",
+)
 
 
 @dataclass
@@ -71,12 +88,38 @@ def work_ref(record: dict) -> WorkRef | None:
     )
 
 
+def _reref(ref: WorkRef, work_key: str) -> WorkRef:
+    """Re-point a ref at an already-minted work (same type, different key)."""
+    work_id = work_key.split(":", 1)[1]
+    settings = get_settings()
+    return WorkRef(
+        work_key=work_key,
+        work_type=ref.work_type,
+        work_id=work_id,
+        url=settings.catalog_id(ref.work_type, work_id),
+        title=ref.title,
+        poster_url=ref.poster_url,
+    )
+
+
 def mint(record: dict) -> WorkRef | None:
-    """Resolve a work ref and upsert its catalog row, returning the ref."""
+    """Resolve a work ref and upsert its catalog row, returning the ref.
+
+    Any identifier the record carries is registered as an alias, and an alias
+    hit redirects to the existing work — so records that carry different
+    identifier subsets for the same work share one catalog entry.
+    """
     ref = work_ref(record)
     if ref is None:
         return None
+    identifiers = {k: str(v) for k, v in (record.get("identifiers") or {}).items() if v}
     with session_scope() as session:
+        for key, val in identifiers.items():
+            alias = session.get(WorkIdentifier, (ref.work_type, key, val))
+            if alias is not None:
+                if alias.work_key != ref.work_key:
+                    ref = _reref(ref, alias.work_key)
+                break
         row = session.get(Work, ref.work_key)
         if row is None:
             session.add(
@@ -85,7 +128,7 @@ def mint(record: dict) -> WorkRef | None:
                     creative_work_type=ref.work_type,
                     title=ref.title,
                     poster_url=ref.poster_url,
-                    identifiers_json=json.dumps(record.get("identifiers") or {}),
+                    identifiers_json=json.dumps(identifiers),
                 )
             )
         else:
@@ -94,6 +137,18 @@ def mint(record: dict) -> WorkRef | None:
                 row.title = ref.title
             if ref.poster_url and not row.poster_url:
                 row.poster_url = ref.poster_url
+            merged = {**json.loads(row.identifiers_json or "{}"), **identifiers}
+            row.identifiers_json = json.dumps(merged)
+        for key, val in identifiers.items():
+            if session.get(WorkIdentifier, (ref.work_type, key, val)) is None:
+                session.add(
+                    WorkIdentifier(
+                        creative_work_type=ref.work_type,
+                        id_key=key,
+                        id_value=val,
+                        work_key=ref.work_key,
+                    )
+                )
     return ref
 
 

@@ -1,12 +1,14 @@
 """Translate popfeed atproto records into NeoDB-compatible ActivityPub.
 
 Output contract (so a real NeoDB/Takahe instance ingests our messages as
-marks/reviews while generic Mastodon servers still render the base ``Note``):
+marks while generic Mastodon servers still render the base ``Note``):
 
-* The activity object is a Mastodon-compatible ``Note``.
+* The activity object is always a Mastodon-compatible ``Note`` — never an
+  ``Article`` or titled ``Review``.
 * NeoDB catalog semantics ride in a ``relatedWith`` array of typed objects
-  (``Status`` / ``Review`` / ``Rating`` / ``Comment`` / ``Shelf``), each
-  carrying a ``withRegardTo`` pointing at a dereferenceable catalog item.
+  (``Status`` / ``Rating`` / ``Comment``), each carrying a ``withRegardTo``
+  pointing at a dereferenceable catalog item. (``Review`` / ``Shelf`` remain
+  declared in the JSON-LD context for compatibility but are not emitted.)
 * The ``Note`` is wrapped in ``Create`` / ``Update`` / ``Delete`` (the latter
   referencing a ``Tombstone``).
 """
@@ -14,6 +16,7 @@ marks/reviews while generic Mastodon servers still render the base ``Note``):
 from __future__ import annotations
 
 import html
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -41,21 +44,69 @@ AP_CONTEXT: list[Any] = [
     },
 ]
 
-# popfeed listType -> NeoDB shelf status (None => no shelf mark, just membership)
+# popfeed listType -> NeoDB shelf status (None => no shelf mark, just
+# membership). Keys match either the whole listType or a single token of a
+# compound one ("watched_movies", "books_to_read"); see _shelf_status. Covers
+# the do / doing / done / dropped verb per media type (watch, play, read,
+# listen), since popfeed names its system lists "<verb>_<media-plural>".
 _LIST_STATUS = {
+    # do (wishlist)
     "wishlist": "wishlist",
     "watchlist": "wishlist",
     "want": "wishlist",
+    "backlog": "wishlist",
+    "queued": "wishlist",
+    "planned": "wishlist",
+    # doing (progress)
     "progress": "progress",
+    "current": "progress",
     "watching": "progress",
     "playing": "progress",
     "reading": "progress",
+    "listening": "progress",
+    # done (complete)
     "complete": "complete",
-    "watched": "complete",
-    "played": "complete",
     "completed": "complete",
     "finished": "complete",
+    "done": "complete",
+    "watched": "complete",
+    "played": "complete",
+    "read": "complete",
+    "listened": "complete",
+    # dropped
+    "dropped": "dropped",
+    "abandoned": "dropped",
+    "shelved": "dropped",
+    "dnf": "dropped",
 }
+
+# popfeed ratings are on a 0-10 scale (half-star increments doubled).
+_RATING_BEST = 10
+_RATING_WORST = 1
+
+
+def shelf_status(list_type: str) -> str | None:
+    """Map a popfeed ``listType`` to a NeoDB shelf status.
+
+    listTypes can be compound (``watched_movies``, ``books_to_read``), so after
+    an exact lookup fall back to matching individual tokens.
+    """
+    if not list_type:
+        return None
+    status = _LIST_STATUS.get(list_type)
+    if status:
+        return status
+    tokens = re.split(r"[_\-\s]+", list_type)
+    for i, token in enumerate(tokens):
+        status = _LIST_STATUS.get(token)
+        if status is None:
+            continue
+        # "to_<verb>" ("to_read", "books_to_read") is a want-list even though
+        # the bare past-tense verb ("read") means completed.
+        if status == "complete" and i > 0 and tokens[i - 1] == "to":
+            return "wishlist"
+        return status
+    return None
 
 
 def _published(record: dict, time_us: int | None) -> str:
@@ -135,8 +186,14 @@ def build_note(
     record: dict,
     time_us: int | None,
     ref: works.WorkRef | None,
+    shelf_status: str | None = None,
 ) -> dict:
-    """Build the AP ``Note`` for a popfeed record, including ``relatedWith``."""
+    """Build the AP ``Note`` for a popfeed record, including ``relatedWith``.
+
+    ``shelf_status`` folds a companion listItem's shelf mark into a review's
+    Note so one user action ("watched + rated") stays one AP post (see
+    pipeline merge handling).
+    """
     settings = get_settings()
     actor = settings.actor_id(handle)
     object_id = settings.post_id(handle, rkey)
@@ -154,12 +211,16 @@ def build_note(
         "relatedWith": [],
     }
 
+    # (Legacy social.popfeed.feed.post — free text about a work, superseded by
+    # feed.review in 2025 — is no longer bridged; see config.WANTED_COLLECTIONS.)
     if collection.endswith("feed.list"):
         _populate_list(note, record, handle, rkey, ref)
     elif collection.endswith("feed.listItem"):
         _populate_list_item(note, record, ref)
-    else:  # feed.post
-        _populate_post(note, record, ref)
+    elif collection.endswith("feed.review"):
+        _populate_review(note, record, ref, shelf_status)
+    else:
+        raise ValueError(f"no AP mapping for collection {collection!r}")
 
     # Drop empty optional arrays to keep payloads tidy.
     if not note["tag"]:
@@ -169,21 +230,67 @@ def build_note(
     return note
 
 
-def _populate_post(note: dict, record: dict, ref: works.WorkRef | None) -> None:
+def _populate_review(
+    note: dict, record: dict, ref: works.WorkRef | None, shelf_status: str | None = None
+) -> None:
+    title = record.get("title") or "a work"
     text = record.get("text") or ""
-    note["content"] = render_facets(text, record.get("facets"))
+    rating = record.get("rating")
+    if not isinstance(rating, int | float) or isinstance(rating, bool):
+        rating = None
+
+    if text:
+        note["content"] = render_facets(text, record.get("facets"))
+    elif rating is not None:
+        note["content"] = (
+            f"<p>Rated <strong>{html.escape(title)}</strong> {rating:g}/{_RATING_BEST}</p>"
+        )
+    else:
+        note["content"] = f"<p>Reviewed <strong>{html.escape(title)}</strong></p>"
     if record.get("title"):
         note["name"] = record["title"]
+    if record.get("containsSpoilers"):
+        # Mastodon renders ``summary`` as the content warning text.
+        note["sensitive"] = True
+        note["summary"] = f"Spoilers: {title}"
+    for tag in record.get("tags") or []:
+        note["tag"].append({"type": "Hashtag", "name": f"#{tag}"})
+    if record.get("posterUrl"):
+        note["attachment"] = [
+            {
+                "type": "Document",
+                "mediaType": "image/jpeg",
+                "url": record["posterUrl"],
+                "name": title,
+            }
+        ]
     if ref is not None:
         note["tag"].append(_work_tag(ref))
         note["tag"].append({"type": "Hashtag", "name": f"#{works.category_for(ref.work_type)}"})
-        # A generic catalog comment ties the note to the work for NeoDB.
-        note["relatedWith"].append(_related("Comment", ref.url, {"content": note["content"]}))
+        if rating is not None:
+            note["relatedWith"].append(
+                _related(
+                    "Rating",
+                    ref.url,
+                    {"value": rating, "best": _RATING_BEST, "worst": _RATING_WORST},
+                )
+            )
+        if text:
+            # popfeed review text is untitled (Letterboxd-style), so it maps
+            # to a NeoDB Comment on the mark — never a titled Review (which
+            # NeoDB renders as an Article-like page). We emit Notes only.
+            note["relatedWith"].append(_related("Comment", ref.url, {"content": note["content"]}))
+        if shelf_status:
+            note["relatedWith"].append(_related("Status", ref.url, {"status": shelf_status}))
 
 
 def _populate_list(
     note: dict, record: dict, handle: str, rkey: str, ref: works.WorkRef | None
 ) -> None:
+    # Currently unreachable from the pipeline: feed.list is archive-only (see
+    # pipeline.ARCHIVE_ONLY_COLLECTIONS) because we don't emit AP posts for
+    # lists/collections yet. Kept (and unit-tested) as the intended mapping
+    # for when custom lists are bridged as NeoDB Collections.
     settings = get_settings()
     name = record.get("name") or "Untitled list"
     desc = record.get("description") or ""
@@ -204,6 +311,10 @@ def _populate_list(
 
 
 def _populate_list_item(note: dict, record: dict, ref: works.WorkRef | None) -> None:
+    # Deliberately ignored for now: tv listItems may carry a
+    # ``watchedEpisodes`` array ({tmdbId, seasonNumber, episodeNumber} per
+    # episode). NeoDB supports episode-level marks; we only emit the
+    # whole-work Status until that mapping is designed.
     title = record.get("title") or "a work"
     list_type = (record.get("listType") or "").lower()
     note["content"] = f"<p>Added <strong>{html.escape(title)}</strong> to a list</p>"
@@ -219,11 +330,11 @@ def _populate_list_item(note: dict, record: dict, ref: works.WorkRef | None) -> 
         ]
     if ref is not None:
         note["tag"].append(_work_tag(ref))
-        status = _LIST_STATUS.get(list_type)
+        status = shelf_status(list_type)
         if status:
             note["relatedWith"].append(_related("Status", ref.url, {"status": status}))
-        else:
-            note["relatedWith"].append(_related("Comment", ref.url, {"content": note["content"]}))
+        # No shelf status => collection membership, which the pipeline archives
+        # without AP emission (Collections aren't bridged yet), so no facet.
 
 
 def wrap_activity(note: dict, *, handle: str, op: str, prior_object_id: str | None = None) -> dict:
@@ -263,6 +374,7 @@ def translate(
     time_us: int | None,
     ref: works.WorkRef | None = None,
     prior_object_id: str | None = None,
+    shelf_status: str | None = None,
 ) -> tuple[dict | None, dict]:
     """Translate one record op into ``(note, activity)``.
 
@@ -280,6 +392,7 @@ def translate(
         record=record,
         time_us=time_us,
         ref=ref,
+        shelf_status=shelf_status,
     )
     activity = wrap_activity(note, handle=handle, op=operation)
     return note, activity

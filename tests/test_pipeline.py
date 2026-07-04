@@ -3,20 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 from skybridge.atproto.replay import read_events, replay_file
+from skybridge.config import WANTED_COLLECTIONS
 from skybridge.db import session_scope
 from skybridge.models import BridgedActor, Record, Work
+from skybridge.pipeline import process_event
 from skybridge.stats import collect_stats
 from sqlalchemy import func, select
 
 
 def _counts_from_fixture(path):
-    wanted = {
-        "social.popfeed.feed.post",
-        "social.popfeed.feed.list",
-        "social.popfeed.feed.listItem",
-    }
+    wanted = set(WANTED_COLLECTIONS)
     processed = 0
     creates = set()
     deletes = set()
@@ -67,7 +66,9 @@ def test_update_mutates_same_uri(settings, fixture_path):
     assert len(updated) == 1
     assert len(deleted) == 1
     assert deleted[0].deleted_at is not None
-    assert deleted[0].ap_activity_json is not None
+    # The deleted record is collection membership (status-less listItem):
+    # never published to AP, so its delete emits no activity either.
+    assert deleted[0].ap_activity_json is None
 
 
 def test_stats_reflect_replay(settings, fixture_path):
@@ -77,22 +78,201 @@ def test_stats_reflect_replay(settings, fixture_path):
     assert stats["records_total"] == distinct_uris
     assert stats["records_active"] == distinct_uris - n_deletes
     assert stats["works"] > 0
-    assert set(stats["records_by_collection"]).issubset(
-        {
-            "social.popfeed.feed.post",
-            "social.popfeed.feed.list",
-            "social.popfeed.feed.listItem",
-        }
-    )
+    assert set(stats["records_by_collection"]).issubset(set(WANTED_COLLECTIONS))
+
+
+def test_lists_are_archived_but_not_translated(settings, fixture_path):
+    asyncio.run(replay_file(fixture_path, allow_network=False))
+    with session_scope() as session:
+        lists = list(
+            session.scalars(select(Record).where(Record.collection == "social.popfeed.feed.list"))
+        )
+    assert lists  # stored in the archive...
+    for row in lists:
+        assert row.source_json != "{}"
+        assert row.ap_object_json is None  # ...but never translated
+        assert row.ap_activity_json is None
+
+
+def test_list_delete_tombstones_without_activity(settings, fixture_path):
+    asyncio.run(replay_file(fixture_path, allow_network=False))
+    with session_scope() as session:
+        row = session.scalars(
+            select(Record).where(Record.collection == "social.popfeed.feed.list")
+        ).first()
+        assert row is not None
+        at_uri = row.at_uri
+        did, rkey = row.did, row.rkey
+    event = {
+        "did": did,
+        "kind": "commit",
+        "commit": {
+            "operation": "delete",
+            "collection": "social.popfeed.feed.list",
+            "rkey": rkey,
+        },
+    }
+    result = asyncio.run(process_event(event, allow_network=False))
+    assert result is not None and result.operation == "delete"
+    with session_scope() as session:
+        row = session.get(Record, at_uri)
+        assert row is not None
+        assert row.deleted_at is not None
+        assert row.ap_activity_json is None  # no Delete activity emitted
 
 
 def test_translated_activity_is_neodb_shaped(settings, fixture_path):
     results = asyncio.run(replay_file(fixture_path, allow_network=False))
-    posts = [
-        r for r in results if r.collection == "social.popfeed.feed.post" and r.operation == "create"
+    reviews = [
+        r
+        for r in results
+        if r.collection == "social.popfeed.feed.review" and r.operation == "create"
     ]
-    assert posts
-    activity = posts[0].activity
+    assert reviews
+    activity = reviews[0].activity
     assert activity["type"] == "Create"
     assert activity["object"]["type"] == "Note"
     assert "@context" in activity
+
+
+# --- review <-> listItem pairing: one AP Note per (author, work) -----------
+#
+# The Note id is anchored on whichever record publishes first; every later
+# change to either record re-derives the combined Note and emits an Update
+# with the same id.
+
+_MERGE_DID = "did:plc:mergetest"
+
+_REVIEW_REC = {
+    "$type": "social.popfeed.feed.review",
+    "title": "Everything Everywhere All at Once",
+    "text": "",
+    "rating": 9,
+    "createdAt": "2026-07-03T17:16:24.038Z",
+    "identifiers": {"imdbId": "tt6710474", "tmdbId": "545611"},
+    "creativeWorkType": "movie",
+}
+
+_ITEM_REC = {
+    "$type": "social.popfeed.feed.listItem",
+    "title": "Everything Everywhere All at Once",
+    "listType": "watched_movies",
+    "addedAt": "2026-07-03T17:16:55.308Z",
+    "identifiers": {"tmdbId": "545611"},
+    "creativeWorkType": "movie",
+}
+
+_REVIEW_URI = f"at://{_MERGE_DID}/social.popfeed.feed.review/rv1"
+_ITEM_URI = f"at://{_MERGE_DID}/social.popfeed.feed.listItem/it1"
+
+
+def _ev(collection, rkey, record, op="create"):
+    return {
+        "did": _MERGE_DID,
+        "time_us": 1_700_000_000_000_000,
+        "kind": "commit",
+        "commit": {"operation": op, "collection": collection, "rkey": rkey, "record": record},
+    }
+
+
+def _run(event):
+    return asyncio.run(process_event(event, allow_network=False))
+
+
+def _related_types(note):
+    if isinstance(note, str):
+        note = json.loads(note)
+    return {r["type"] for r in note.get("relatedWith", [])}
+
+
+def _rows():
+    with session_scope() as session:
+        return session.get(Record, _REVIEW_URI), session.get(Record, _ITEM_URI)
+
+
+def test_listitem_after_review_updates_review_note(settings):
+    r1 = _run(_ev("social.popfeed.feed.review", "rv1", _REVIEW_REC))
+    r2 = _run(_ev("social.popfeed.feed.listItem", "it1", _ITEM_REC))
+    assert r1.activity["type"] == "Create"
+    # The listItem updates the review-anchored Note, no second Create.
+    assert r2.activity["type"] == "Update"
+    assert r2.activity["object"]["id"] == r1.activity["object"]["id"]
+    review, item = _rows()
+    assert _related_types(review.ap_object_json) == {"Rating", "Status"}
+    assert item.ap_object_json is None  # merged: no standalone post
+    assert review.work_key == item.work_key  # paired via the deduped work
+
+
+def test_review_after_listitem_updates_item_note(settings):
+    r1 = _run(_ev("social.popfeed.feed.listItem", "it1", _ITEM_REC))
+    r2 = _run(_ev("social.popfeed.feed.review", "rv1", _REVIEW_REC))
+    assert r1.activity["type"] == "Create"
+    # The already-published item Note is reused: Update, same id, review
+    # content folded in — no Delete/Create churn.
+    assert r2.activity["type"] == "Update"
+    assert r2.activity["object"]["id"] == r1.activity["object"]["id"]
+    assert _related_types(r2.activity["object"]) == {"Rating", "Status"}
+    review, item = _rows()
+    assert review.ap_object_json is None  # item row anchors the pair Note
+    assert _related_types(item.ap_object_json) == {"Rating", "Status"}
+
+
+def test_review_edit_updates_anchored_note(settings):
+    _run(_ev("social.popfeed.feed.review", "rv1", _REVIEW_REC))
+    _run(_ev("social.popfeed.feed.listItem", "it1", _ITEM_REC))
+    edited = {**_REVIEW_REC, "text": "so good", "rating": 10}
+    r3 = _run(_ev("social.popfeed.feed.review", "rv1", edited, op="update"))
+    assert r3.activity["type"] == "Update"
+    assert _related_types(r3.activity["object"]) == {"Rating", "Comment", "Status"}
+    review, _ = _rows()
+    note = json.loads(review.ap_object_json)
+    assert "so good" in note["content"]
+
+
+def test_partner_delete_rederives_note(settings):
+    _run(_ev("social.popfeed.feed.review", "rv1", _REVIEW_REC))
+    _run(_ev("social.popfeed.feed.listItem", "it1", _ITEM_REC))
+    r3 = _run(_ev("social.popfeed.feed.listItem", "it1", None, op="delete"))
+    # Merged-away partner: nothing of its own to retract; the anchored Note
+    # is re-derived without the Status.
+    assert r3.activity["type"] == "Update"
+    review, item = _rows()
+    assert item.deleted_at is not None
+    assert _related_types(review.ap_object_json) == {"Rating"}
+
+
+def test_anchor_delete_deletes_note_then_partner_heals(settings):
+    r1 = _run(_ev("social.popfeed.feed.review", "rv1", _REVIEW_REC))
+    _run(_ev("social.popfeed.feed.listItem", "it1", _ITEM_REC))
+    r3 = _run(_ev("social.popfeed.feed.review", "rv1", None, op="delete"))
+    # Deleting the anchoring record deletes the combined Note.
+    assert r3.activity["type"] == "Delete"
+    assert r3.activity["object"]["id"] == r1.activity["object"]["id"]
+    review, item = _rows()
+    assert review.deleted_at is not None
+    assert item.deleted_at is None and item.ap_object_json is None  # AP-silent
+    # The surviving partner re-publishes under its own rkey on its next event.
+    r4 = _run(_ev("social.popfeed.feed.listItem", "it1", _ITEM_REC, op="update"))
+    assert r4.activity["type"] == "Create"
+    assert r4.activity["object"]["id"] != r1.activity["object"]["id"]
+    assert _related_types(r4.activity["object"]) == {"Status"}
+
+
+def test_non_status_listitem_archived_without_emission(settings):
+    _run(_ev("social.popfeed.feed.review", "rv1", _REVIEW_REC))
+    fav = {**_ITEM_REC, "listType": "favorites"}
+    r2 = _run(_ev("social.popfeed.feed.listItem", "it2", fav))
+    # No shelf status => collection membership: archived, no AP emission.
+    assert r2.activity == {}
+    with session_scope() as session:
+        item = session.get(Record, f"at://{_MERGE_DID}/social.popfeed.feed.listItem/it2")
+    assert item is not None
+    assert item.ap_object_json is None and item.ap_activity_json is None
+    assert item.work_key is not None  # still linked to the catalog work
+    review, _ = _rows()
+    assert _related_types(review.ap_object_json) == {"Rating"}  # unaffected
+    # Deleting membership emits nothing and leaves the review Note untouched.
+    r3 = _run(_ev("social.popfeed.feed.listItem", "it2", None, op="delete"))
+    assert r3.activity == {}
+    review, _ = _rows()
+    assert _related_types(review.ap_object_json) == {"Rating"}

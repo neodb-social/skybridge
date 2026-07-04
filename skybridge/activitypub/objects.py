@@ -31,9 +31,14 @@ def get_post_object(ident: str, rkey: str) -> dict[str, Any] | None:
     record = _record_for(ident, rkey)
     if record is None:
         return None
+    if record.ap_object_json is None and record.ap_activity_json is None:
+        # Archived without ever being published to AP (lists, collection
+        # membership, merged-away pair records) — deleted or not, there is
+        # nothing to dereference and nothing to tombstone.
+        return None
     settings = get_settings()
     object_id = settings.post_id(ident, rkey)
-    if record.deleted_at is not None or record.ap_object_json is None:
+    if record.deleted_at is not None:
         return {
             "@context": "https://www.w3.org/ns/activitystreams",
             "id": object_id,
@@ -41,6 +46,8 @@ def get_post_object(ident: str, rkey: str) -> dict[str, Any] | None:
             "formerType": "Note",
             "deleted": record.deleted_at.isoformat() if record.deleted_at else None,
         }
+    if record.ap_object_json is None:
+        return None
     obj = json.loads(record.ap_object_json)
     obj.setdefault("@context", "https://www.w3.org/ns/activitystreams")
     return obj

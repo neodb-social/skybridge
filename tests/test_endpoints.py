@@ -16,6 +16,7 @@ from skybridge.atproto.replay import replay_file
 from skybridge.db import session_scope
 from skybridge.main import app
 from skybridge.models import BridgedActor, Record
+from skybridge.pipeline import process_event
 from sqlalchemy import select
 
 AP = {"accept": "application/activity+json"}
@@ -92,30 +93,61 @@ def test_nodeinfo(client):
     assert doc["usage"]["users"]["total"] >= 1
 
 
-def test_post_object_dereferenceable(client, settings):
+def test_review_object_dereferenceable(client, settings):
     with session_scope() as session:
         rec = session.scalar(
-            select(Record).where(
-                Record.collection == "social.popfeed.feed.post",
-                Record.deleted_at.is_(None),
-            )
+            select(Record).where(Record.collection == "social.popfeed.feed.review")
         )
-        handle = session.get(BridgedActor, rec.did).handle
+        assert rec is not None
+        actor = session.get(BridgedActor, rec.did)
+        assert actor is not None
+        handle = actor.handle
         rkey = rec.rkey
     r = client.get(f"/users/{handle}/posts/{rkey}", headers=AP)
     assert r.status_code == 200
-    assert r.json()["type"] == "Note"
+    doc = r.json()
+    assert doc["type"] == "Note"
+    assert any(rel["type"] == "Rating" for rel in doc["relatedWith"])
 
 
 def test_deleted_object_is_tombstone(client, settings):
+    # Delete a published record (a review), then expect a 410 Tombstone.
     with session_scope() as session:
-        rec = session.scalar(select(Record).where(Record.deleted_at.isnot(None)))
+        rec = session.scalar(
+            select(Record).where(
+                Record.collection == "social.popfeed.feed.review",
+                Record.ap_object_json.isnot(None),
+            )
+        )
         assert rec is not None
-        handle = session.get(BridgedActor, rec.did).handle
-        rkey = rec.rkey
+        actor = session.get(BridgedActor, rec.did)
+        assert actor is not None
+        handle = actor.handle
+        did, collection, rkey = rec.did, rec.collection, rec.rkey
+    event = {
+        "did": did,
+        "kind": "commit",
+        "commit": {"operation": "delete", "collection": collection, "rkey": rkey},
+    }
+    asyncio.run(process_event(event, allow_network=False))
     r = client.get(f"/users/{handle}/posts/{rkey}", headers=AP)
     assert r.status_code == 410
     assert r.json()["type"] == "Tombstone"
+
+
+def test_never_published_deleted_record_is_404(client, settings):
+    # The fixture's delete is collection membership: never federated, so its
+    # URL was never valid — 404, not a Tombstone.
+    with session_scope() as session:
+        rec = session.scalar(select(Record).where(Record.deleted_at.isnot(None)))
+        assert rec is not None
+        assert rec.ap_object_json is None and rec.ap_activity_json is None
+        actor = session.get(BridgedActor, rec.did)
+        assert actor is not None
+        handle = actor.handle
+        rkey = rec.rkey
+    r = client.get(f"/users/{handle}/posts/{rkey}", headers=AP)
+    assert r.status_code == 404
 
 
 def test_catalog_object(client):
@@ -123,6 +155,7 @@ def test_catalog_object(client):
         rec = session.scalar(select(Record).where(Record.work_key.isnot(None)))
         assert rec is not None
         work_key = rec.work_key
+        assert work_key is not None
     work_type, _, work_id = work_key.partition(":")
     r = client.get(f"/catalog/{work_type}/{work_id}", headers=AP)
     assert r.status_code == 200
@@ -148,3 +181,20 @@ def test_outbox_lists_posts(client, settings):
     r = client.get(f"/users/{handle}/outbox", headers=AP)
     assert r.status_code == 200
     assert r.json()["type"] == "OrderedCollection"
+
+
+def test_archive_only_list_records_not_published(client, settings):
+    with session_scope() as session:
+        rec = session.scalar(select(Record).where(Record.collection == "social.popfeed.feed.list"))
+        assert rec is not None
+        actor = session.get(BridgedActor, rec.did)
+        assert actor is not None
+        handle = actor.handle
+        rkey = rec.rkey
+    # Never emitted to AP: not dereferenceable (404, not a Tombstone)...
+    r = client.get(f"/users/{handle}/posts/{rkey}", headers=AP)
+    assert r.status_code == 404
+    # ...and absent from the outbox.
+    outbox = client.get(f"/users/{handle}/outbox", headers=AP).json()
+    assert settings.post_id(handle, rkey) not in outbox["orderedItems"]
+    assert outbox["totalItems"] > 0

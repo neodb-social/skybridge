@@ -15,10 +15,31 @@ from functools import lru_cache
 # atproto collections we bridge. Everything else on the firehose is ignored.
 # (app.popsky.post is the app's pre-rebrand "Popsky" collection — deprecated and
 # no longer written since March 2025, so we don't bridge it.)
+#
+# Known but deliberately NOT bridged (yet), with observed shapes:
+#   social.popfeed.feed.post — LEGACY: popfeed's original "post about a work"
+#     (free text + facets + work identifiers, no rating). Last written ~May
+#     2025; superseded by feed.review. Existing repos still hold them, but we
+#     don't bridge historical content.
+#   social.popfeed.feed.reaction — emoji reaction to another popfeed record
+#     ({value, subjectUri, subjectType}); would translate to an AP Like /
+#     EmojiReact on the bridged note rather than a Note of its own.
+#   social.popfeed.challenge.definition — a challenge spec, e.g. a yearly
+#     reading goal ({title, description, challenge.readingGoal{startsAt,
+#     endsAt, targetBooks, targetPages}}). No per-work activity; nothing to
+#     mark on a NeoDB catalog item.
+#   social.popfeed.challenge.participation — a user joining a challenge
+#     ({title, progress.readingGoalProgress{status, currentBooks,
+#     currentPages}, challengeUri -> the definition}). Aggregate progress
+#     only, again no per-work activity.
+#   social.popfeed.feed.definition — a custom feed spec ({name, description,
+#     icon blob, creativeWorkTypes, genres, lists}); app-level curation
+#     config, not user activity. (Note: uses creativeWorkTypes like "album"
+#     and "ep" — keep translate.works.WORK_TYPE_TO_CATEGORY in sync.)
 WANTED_COLLECTIONS: tuple[str, ...] = (
-    "social.popfeed.feed.post",
     "social.popfeed.feed.list",
     "social.popfeed.feed.listItem",
+    "social.popfeed.feed.review",
 )
 
 # Default public Jetstream endpoint; only the collections above are requested.
@@ -38,7 +59,7 @@ class Settings:
     relay_username: str = "relay"
     relay_name: str = "Skybridge"
     relay_summary: str = (
-        "Skybridge mirrors public popfeed (AT Protocol) activity into the "
+        "Skybridge mirrors public AT Protocol activities (e.g. popfeed) into the "
         "Fediverse as NeoDB-compatible ActivityPub."
     )
     # Delivery worker retry schedule (seconds).

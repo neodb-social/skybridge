@@ -11,9 +11,9 @@ Any AT Protocol user may optout by themselves.
 Jetstream (atproto firehose)  ─┐
    or replayed fixtures        │   ┌───────────── translate ─────────────┐
                                ▼   │ popfeed record → NeoDB AP object    │
-  filter popfeed collections ──►   │  (Note + relatedWith Status/Review/ │
-  resolve DID → bridged Person │   │   Comment/Shelf, withRegardTo work) │
-  (mint RSA keypair on sight)  │   │  wrapped in Create/Update/Delete    │
+  filter popfeed collections ──►   │  (one Note per author+work, with    │
+  resolve DID → bridged Person │   │   Status/Rating/Comment relatedWith │
+  (mint RSA keypair on sight)  │   │   the work) in Create/Update/Delete │
                                │   └─────────────────┬───────────────────┘
                                ▼                     ▼
                       persist to SQLite        enqueue delivery
@@ -25,19 +25,42 @@ Jetstream (atproto firehose)  ─┐
 
 The activity object is a Mastodon-compatible `Note` so generic servers render
 it. NeoDB catalog semantics ride alongside in a `relatedWith` array of typed
-objects — `Status` (shelf mark), `Review`, `Rating`, `Comment`, `Shelf` — each
-carrying a `withRegardTo` pointing at a dereferenceable catalog item that we
-mint at `https://<domain>/catalog/<type>/<id>`. Deletes emit a `Delete`
-referencing a `Tombstone`.
+objects — `Status` (shelf mark), `Rating`, `Comment` — each carrying a
+`withRegardTo` pointing at a dereferenceable catalog item that we mint at
+`https://<domain>/catalog/<type>/<id>`. Deletes emit a `Delete` referencing a
+`Tombstone`. We emit `Note`s only — never `Article`/titled `Review` objects.
 
 | popfeed record | becomes |
 |---|---|
-| `social.popfeed.feed.post` | `Note` + `Comment` `relatedWith` the work, tagged with a `Link` + category `Hashtag` |
-| `social.popfeed.feed.list` | `Note` carrying a `Shelf` (name, summary, tags) |
-| `social.popfeed.feed.listItem` | `Note` + a `Status` mark (`status` derived from `listType`) `withRegardTo` the work |
+| `social.popfeed.feed.review` | `Note` + `Rating` (0-10) and, when there is review text, an untitled `Comment` `withRegardTo` the work (never a titled `Review`/`Article`); `containsSpoilers` sets `sensitive` + a CW `summary` |
+| `social.popfeed.feed.list` | archived only (no AP emission): stored for `listUri` resolution and future NeoDB `Collection` mapping |
+| `social.popfeed.feed.listItem` | on a shelf-type list: `Note` + a `Status` mark (`status` derived from `listType`, including compound types like `watched_movies`) `withRegardTo` the work — folded into the review's Note when the same author reviewed the same work (see below). On a status-less list: archived only (collection membership is not bridged) |
 
-`creativeWorkType` maps to NeoDB categories: `movie`→movie, `tv_show`→tv,
-`video_game`→game, `book`→book, `music`→music.
+One popfeed action ("watched + rated") writes a review *and* a listItem; the
+bridge emits ONE AP `Note` per (author, work) carrying `Status` + `Rating` +
+`Comment` together. The Note id is anchored on whichever record publishes
+first (`/users/<handle>/posts/<rkey>` — rkeys are immutable, unlike work
+identifiers); any later change to either record re-derives the combined Note
+and sends an `Update` with the same id (rewatches included). Deleting the
+anchoring record `Delete`s the Note (the surviving partner re-publishes under
+its own rkey on its next event); deleting the partner just re-derives the
+Note.
+
+`listType` verbs map to the NeoDB shelf statuses wishlist / progress /
+complete / dropped (do / doing / done / dropped per media type: watch, play,
+read, listen); unrecognized listTypes fall back to plain list membership.
+
+`creativeWorkType` maps to NeoDB categories: `movie`→movie, `tv_show`/
+`tv_season`→tv, `video_game`→game, `book`→book, `music`/`album`/`ep`→music,
+`podcast`→podcast (anything else falls back to `item`).
+Works are deduplicated across records by *any* shared external identifier
+(imdb/tmdb/igdb/steam/isbn/musicbrainz), so a review and a listItem carrying
+different identifier subsets point at the same catalog entry.
+
+Known but not bridged: `social.popfeed.feed.post` (legacy free-text posts,
+superseded by `feed.review` in 2025), `social.popfeed.feed.reaction` (emoji
+reactions; would become AP `Like`/`EmojiReact`), and the per-episode
+`watchedEpisodes` array on tv listItems.
 
 ---
 

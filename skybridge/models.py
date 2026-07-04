@@ -100,6 +100,23 @@ class Work(Base):
     first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class WorkIdentifier(Base):
+    """Secondary index: every known external identifier -> its minted work.
+
+    Records for the same work can carry different identifier subsets (e.g. a
+    review with imdb+tmdb ids but a listItem with only the tmdb id). Looking up
+    each incoming identifier here lets them all resolve to one catalog entry
+    instead of minting duplicates keyed by whichever id happened to win.
+    """
+
+    __tablename__ = "work_identifier"
+
+    creative_work_type: Mapped[str] = mapped_column(String, primary_key=True)
+    id_key: Mapped[str] = mapped_column(String, primary_key=True)
+    id_value: Mapped[str] = mapped_column(String, primary_key=True)
+    work_key: Mapped[str] = mapped_column(String, index=True)
+
+
 class Record(Base):
     """Archive of every processed atproto record + its translated AP forms.
 

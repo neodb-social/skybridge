@@ -1,0 +1,9 @@
+# runtime state
+*.db
+
+# python
+__pycache__/
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/

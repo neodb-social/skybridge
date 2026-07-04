@@ -87,6 +87,14 @@ async def opt_out(did: str, *, worker: DeliveryWorker | None = None) -> int:
             session.scalars(select(Record).where(Record.did == did, Record.deleted_at.is_(None)))
         )
         for row in rows:
+            was_published = row.ap_object_json is not None
+            row.op = "delete"
+            row.deleted_at = utcnow()
+            row.updated_at = utcnow()
+            if not was_published:
+                # Archived-only (lists, collection membership, merged-away
+                # pair records): nothing was federated, nothing to retract.
+                continue
             _, activity = neodb.translate(
                 did=did,
                 handle=handle,
@@ -97,9 +105,6 @@ async def opt_out(did: str, *, worker: DeliveryWorker | None = None) -> int:
                 time_us=None,
                 prior_object_id=settings.post_id(handle, row.rkey),
             )
-            row.op = "delete"
-            row.deleted_at = utcnow()
-            row.updated_at = utcnow()
             row.ap_activity_json = json.dumps(activity)
             pending.append((row.at_uri, activity))
 

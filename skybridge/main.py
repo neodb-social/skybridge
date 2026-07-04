@@ -170,7 +170,12 @@ async def user_outbox(ident: str) -> Response:
         if actor is not None:
             rows = session.execute(
                 select(Record.rkey)
-                .where(Record.did == actor.did, Record.deleted_at.is_(None))
+                .where(
+                    Record.did == actor.did,
+                    Record.deleted_at.is_(None),
+                    # Exclude archive-only records that were never published.
+                    Record.ap_object_json.isnot(None),
+                )
                 .order_by(Record.created_at.desc())
             ).all()
             items = [settings.post_id(ident, r[0]) for r in rows]

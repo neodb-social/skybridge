@@ -43,9 +43,13 @@ def test_opt_out_tombstones_existing_records(settings, fixture_path):
         assert actor is not None
         assert actor.opted_out is True
         assert actor.opted_out_at is not None
-        # every record now carries a Delete activity referencing a Tombstone
+        # every record is tombstoned; the ones that had been published to AP
+        # carry a Delete activity referencing a Tombstone (archive-only rows
+        # were never federated, so there is nothing to retract for them)
         rows = list(session.scalars(select(Record).where(Record.did == DID)))
-        assert rows and all(r.op == "delete" and r.ap_activity_json for r in rows)
+        assert rows and all(r.op == "delete" for r in rows)
+        published = [r for r in rows if r.ap_object_json]
+        assert published and all(r.ap_activity_json for r in published)
 
 
 def test_opted_out_did_is_skipped_by_pipeline(settings, fixture_path):
