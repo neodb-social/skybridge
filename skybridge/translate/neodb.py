@@ -479,9 +479,23 @@ def wrap_activity(note: dict, *, handle: str, op: str, prior_object_id: str | No
         activity_type = "Update" if op == "update" else "Create"
         obj = note
 
+    if op == "update":
+        # Every Update needs its own id: peers dedup activities by id (takahe
+        # keys PostInteraction on the announce id), so a reused id makes them
+        # drop the edit — or crash on concurrent duplicates. Mastodon-style
+        # #updates/{µs}, stamped from the Note's own `updated` time.
+        updated = (note or {}).get("updated")
+        stamp = datetime.fromisoformat(updated) if updated else datetime.now(UTC)
+        if stamp.tzinfo is None:
+            # Never local time: the id must not depend on the server's tz.
+            stamp = stamp.replace(tzinfo=UTC)
+        activity_id = f"{object_id}#updates/{int(stamp.timestamp() * 1_000_000)}"
+    else:
+        activity_id = f"{object_id}#{op}"
+
     return {
         "@context": AP_CONTEXT,
-        "id": f"{object_id}#{op}",
+        "id": activity_id,
         "type": activity_type,
         "actor": actor,
         "published": (note or {}).get("published") or datetime.now(UTC).isoformat(),
