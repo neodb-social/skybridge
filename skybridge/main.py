@@ -19,7 +19,7 @@ from urllib.parse import unquote
 from fastapi import FastAPI, Form, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 
 from skybridge import optout, telemetry
 from skybridge.activitypub import nodeinfo, objects, webfinger
@@ -136,13 +136,32 @@ async def get_user(ident: str, request: Request) -> Response:
         if actor is not None and actor.opted_out:
             return JSONResponse({"error": "gone"}, status_code=410)
         doc = person_actor(actor) if actor else None
-    if doc is None:
+        profile: dict[str, Any] | None = None
+        if actor is not None:
+            post_count = session.scalar(
+                select(func.count())
+                .select_from(Record)
+                .where(
+                    Record.did == actor.did,
+                    Record.deleted_at.is_(None),
+                    Record.ap_object_json.isnot(None),
+                )
+            )
+            profile = {
+                "name": actor.display_name or actor.handle,
+                "handle": actor.handle,
+                "did": actor.did,
+                "avatar": actor.avatar,
+                "post_count": post_count or 0,
+            }
+    if doc is None or profile is None:
         return JSONResponse({"error": "not found"}, status_code=404)
     if _wants_ap(request):
         return ap_response(doc)
-    return HTMLResponse(
-        f"<h1>{doc['name']}</h1><p>{doc['summary']}</p>"
-        f"<p>ActivityPub actor: <code>{doc['id']}</code></p>"
+    return _TEMPLATES.TemplateResponse(
+        request,
+        "profile.html",
+        {**profile, "actor_id": doc["id"], "settings": get_settings()},
     )
 
 
@@ -219,8 +238,20 @@ async def get_catalog(work_type: str, work_id: str, request: Request) -> Respons
         return JSONResponse({"error": "not found"}, status_code=404)
     if _wants_ap(request):
         return ap_response(doc)
-    attrs = "".join(f"<li>{a['name']}: {a['value']}</li>" for a in doc.get("attachment", []))
-    return HTMLResponse(f"<h1>{doc['name']}</h1><p>type: {doc['category']}</p><ul>{attrs}</ul>")
+    identifiers = [(k, doc[key]) for k, key in (("IMDb", "imdb"), ("ISBN", "isbn")) if doc.get(key)]
+    return _TEMPLATES.TemplateResponse(
+        request,
+        "work.html",
+        {
+            "title": doc["name"],
+            "category": doc["category"],
+            "poster": doc.get("cover_image_url"),
+            "url": doc["id"],
+            "links": [e["url"] for e in doc.get("external_resources", [])],
+            "identifiers": identifiers,
+            "settings": get_settings(),
+        },
+    )
 
 
 # --------------------------------------------------------------------------- #

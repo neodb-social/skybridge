@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}{{ name }} (@{{ handle }}) · Skybridge{% endblock %}
+{% block head %}
+<meta property="og:type" content="profile" />
+<meta property="og:site_name" content="Skybridge" />
+<meta property="og:title" content="{{ name }} (@{{ handle }})" />
+<meta property="og:description" content="Bridged from Atmosphere · follow @{{ handle }}@{{ settings.domain }} on the Fediverse" />
+<meta property="og:url" content="{{ actor_id }}" />
+{% if avatar %}
+<meta property="og:image" content="{{ avatar }}" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:image" content="{{ avatar }}" />
+{% endif %}
+{% endblock %}
+{% block content %}
+<div class="hero">
+  {% if avatar %}
+  <img class="avatar" src="{{ avatar }}" alt="Avatar of {{ name }}" />
+  {% else %}
+  <div class="avatar-fallback" aria-hidden="true">{{ name[:1] | upper }}</div>
+  {% endif %}
+  <div>
+    <h2>{{ name }}</h2>
+    <p class="muted">@{{ handle }}@{{ settings.domain }}</p>
+    <p>
+      Bridged from Atmosphere. Original account:
+      <a href="https://bsky.app/profile/{{ did }}" rel="me">{{ handle }}</a>
+    </p>
+    <p class="muted">{{ post_count }} bridged post(s)</p>
+  </div>
+</div>
+<p class="muted">ActivityPub actor: <code>{{ actor_id }}</code></p>
+{% endblock %}
