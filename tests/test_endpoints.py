@@ -209,6 +209,47 @@ def test_dashboard_and_archive_html(client):
     assert client.get("/catalog").status_code == 200
 
 
+def test_profile_html_page_with_avatar_and_opengraph(client, settings):
+    handle = _a_bridged_handle()
+    avatar_url = "https://cdn.example/avatar.jpg"
+    with session_scope() as session:
+        actor = session.scalar(select(BridgedActor).where(BridgedActor.handle == handle))
+        assert actor is not None
+        actor.avatar = avatar_url
+    r = client.get(f"/users/{handle}")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/html")
+    page = r.text
+    assert handle in page
+    # avatar rendered on the page and advertised to link-preview scrapers
+    assert f'<img class="avatar" src="{avatar_url}"' in page
+    assert f'<meta property="og:image" content="{avatar_url}" />' in page
+    assert f'<meta property="og:url" content="{settings.actor_id(handle)}" />' in page
+
+
+def test_profile_html_page_without_avatar_omits_og_image(client):
+    handle = _a_bridged_handle()
+    r = client.get(f"/users/{handle}")
+    assert r.status_code == 200
+    assert "og:image" not in r.text
+    assert 'class="avatar-fallback"' in r.text
+
+
+def test_work_html_page_with_poster_and_opengraph(client, settings):
+    doc = client.get("/catalog/movie/imdbId-tt6710474", headers=AP).json()
+    poster = doc["cover_image_url"]
+    r = client.get("/catalog/movie/imdbId-tt6710474")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/html")
+    page = r.text
+    assert "Everything Everywhere All at Once" in page
+    assert f'<img class="poster" src="{poster}"' in page
+    assert f'<meta property="og:image" content="{poster}" />' in page
+    url = settings.catalog_id("movie", "imdbId-tt6710474")
+    assert f'<meta property="og:url" content="{url}" />' in page
+    assert "https://www.imdb.com/title/tt6710474" in page
+
+
 def test_dashboard_shows_jetstream_endpoint_only_when_ingesting(client, settings):
     # no ingest task (or a finished one) -> not shown
     assert settings.jetstream_url not in client.get("/").text

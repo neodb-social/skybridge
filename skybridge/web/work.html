@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} · Skybridge{% endblock %}
+{% block head %}
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="Skybridge" />
+<meta property="og:title" content="{{ title }}" />
+<meta property="og:description" content="{{ category | capitalize }} in the Skybridge catalog" />
+<meta property="og:url" content="{{ url }}" />
+{% if poster %}
+<meta property="og:image" content="{{ poster }}" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:image" content="{{ poster }}" />
+{% endif %}
+{% endblock %}
+{% block content %}
+<div class="hero">
+  {% if poster %}
+  <img class="poster" src="{{ poster }}" alt="Cover of {{ title }}" />
+  {% else %}
+  <div class="poster-fallback" aria-hidden="true">{{ category }}</div>
+  {% endif %}
+  <div>
+    <h2>{{ title }}</h2>
+    <p><span class="pill">{{ category }}</span></p>
+    {% if identifiers %}
+    <p class="muted">
+      {% for name, value in identifiers %}{{ name }}: <code>{{ value }}</code>{% if not loop.last %} · {% endif %}{% endfor %}
+    </p>
+    {% endif %}
+    {% if links %}
+    <ul>
+      {% for link in links %}
+      <li><a href="{{ link }}" rel="nofollow">{{ link }}</a></li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

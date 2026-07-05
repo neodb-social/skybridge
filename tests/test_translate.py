@@ -123,8 +123,10 @@ def test_list_item_status_mark(settings):
     statuses = [r for r in note["relatedWith"] if r["type"] == "Status"]
     assert statuses and statuses[0]["status"] == "complete"
     assert statuses[0]["withRegardTo"] == ref.url
-    # poster surfaced as an attachment
-    assert note["attachment"][0]["url"] == LIST_ITEM["posterUrl"]
+    # the content links the work's catalog page; the poster rides on the
+    # catalog-item tag, never as a direct media attachment
+    assert f'<a href="{ref.url}">Elden Ring</a>' in note["content"]
+    assert "attachment" not in note
     # listItem notes never carry a name (only a "to <list>" content line)
     assert "name" not in note
 
@@ -339,9 +341,17 @@ def test_review_becomes_rating_and_comment(settings):
     # review text is an untitled Comment on the mark — never a Review/Article
     comments = [r for r in note["relatedWith"] if r["type"] == "Comment"]
     assert comments and comments[0]["withRegardTo"] == ref.url
-    assert comments[0]["content"] == note["content"]
+    # the Comment carries just the review text; the Note content leads with a
+    # linked "Rated <work> n/10" line so plain Mastodon viewers see the work
+    assert comments[0]["content"] == "<p>Mind-bending and heartfelt.</p>"
+    assert note["content"].startswith(f'<p>Rated <a href="{ref.url}">')
+    assert note["content"].endswith("<p>Mind-bending and heartfelt.</p>")
     assert comments[0]["id"] != rating["id"]  # facet ids are unique
     assert not any(r["type"] == "Review" for r in note["relatedWith"])
+    # a titled Note would render as an Article; the work title stays in
+    # content/tag only, and the poster is never a direct attachment
+    assert "name" not in note
+    assert "attachment" not in note
     # spoilers become a content warning
     assert note["sensitive"] is True
     assert "Spoilers" in note["summary"]

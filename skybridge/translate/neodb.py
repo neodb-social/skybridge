@@ -263,6 +263,14 @@ def build_note(
     return note
 
 
+def _title_html(title: str, ref: works.WorkRef | None) -> str:
+    """The work's title for Note content: linked to our catalog page when a
+    work was minted, plain emphasis otherwise."""
+    if ref is not None:
+        return f'<a href="{html.escape(ref.url)}">{html.escape(title)}</a>'
+    return f"<strong>{html.escape(title)}</strong>"
+
+
 def _populate_review(
     note: dict, record: dict, ref: works.WorkRef | None, shelf_status: str | None = None
 ) -> None:
@@ -272,31 +280,23 @@ def _populate_review(
     if not isinstance(rating, int | float) or isinstance(rating, bool):
         rating = None
 
-    if text:
-        note["content"] = render_facets(text, record.get("facets"))
-    elif rating is not None:
-        note["content"] = (
-            f"<p>Rated <strong>{html.escape(title)}</strong> {rating:g}/{_RATING_BEST}</p>"
-        )
+    # A lead-in line keeps the work visible (and linked) on plain Mastodon
+    # renderers even when the review text never names it; no ``name`` field —
+    # a titled Note renders as an Article-like page (see module docstring).
+    if rating is not None:
+        lead = f"<p>Rated {_title_html(title, ref)} {rating:g}/{_RATING_BEST}</p>"
     else:
-        note["content"] = f"<p>Reviewed <strong>{html.escape(title)}</strong></p>"
-    if record.get("title"):
-        note["name"] = record["title"]
+        lead = f"<p>Reviewed {_title_html(title, ref)}</p>"
+    text_html = render_facets(text, record.get("facets")) if text else ""
+    note["content"] = lead + text_html
     if record.get("containsSpoilers"):
         # Mastodon renders ``summary`` as the content warning text.
         note["sensitive"] = True
         note["summary"] = f"Spoilers: {title}"
     for tag in record.get("tags") or []:
         note["tag"].append({"type": "Hashtag", "name": f"#{tag}"})
-    if record.get("posterUrl"):
-        note["attachment"] = [
-            {
-                "type": "Document",
-                "mediaType": "image/jpeg",
-                "url": record["posterUrl"],
-                "name": title,
-            }
-        ]
+    # The poster is deliberately NOT attached as media: peers should show it
+    # from the catalog-item tag (_work_tag) instead of a bare image post.
     if ref is not None:
         note["tag"].append(_work_tag(ref))
         note["tag"].append({"type": "Hashtag", "name": f"#{works.category_for(ref.work_type)}"})
@@ -313,9 +313,8 @@ def _populate_review(
             # popfeed review text is untitled (Letterboxd-style), so it maps
             # to a NeoDB Comment on the mark — never a titled Review (which
             # NeoDB renders as an Article-like page). We emit Notes only.
-            note["relatedWith"].append(
-                _related(note, "Comment", ref.url, {"content": note["content"]})
-            )
+            # The Comment carries just the review text, not the lead-in line.
+            note["relatedWith"].append(_related(note, "Comment", ref.url, {"content": text_html}))
         if shelf_status:
             note["relatedWith"].append(_related(note, "Status", ref.url, {"status": shelf_status}))
 
@@ -450,20 +449,12 @@ def _populate_list_item(note: dict, record: dict, ref: works.WorkRef | None) -> 
     label = _list_label(record.get("listUri"))
     if label:
         note["content"] = (
-            f"<p>Added <strong>{html.escape(title)}</strong> to "
-            f"<strong>{html.escape(label)}</strong></p>"
+            f"<p>Added {_title_html(title, ref)} to <strong>{html.escape(label)}</strong></p>"
         )
     else:
-        note["content"] = f"<p>Added <strong>{html.escape(title)}</strong> to a list</p>"
-    if record.get("posterUrl"):
-        note["attachment"] = [
-            {
-                "type": "Document",
-                "mediaType": "image/jpeg",
-                "url": record["posterUrl"],
-                "name": title,
-            }
-        ]
+        note["content"] = f"<p>Added {_title_html(title, ref)} to a list</p>"
+    # As with reviews, the poster rides on the catalog-item tag, not as a
+    # direct media attachment.
     if ref is not None:
         note["tag"].append(_work_tag(ref))
         note["tag"].append({"type": "Hashtag", "name": f"#{works.category_for(ref.work_type)}"})
