@@ -495,6 +495,9 @@ def wrap_activity(note: dict, *, handle: str, op: str, prior_object_id: str | No
         # #updates/{µs}, stamped from the Note's own `updated` time.
         updated = (note or {}).get("updated")
         stamp = datetime.fromisoformat(updated) if updated else datetime.now(UTC)
+        if stamp.tzinfo is None:
+            # Never local time: the id must not depend on the server's tz.
+            stamp = stamp.replace(tzinfo=UTC)
         activity_id = f"{object_id}#updates/{int(stamp.timestamp() * 1_000_000)}"
     else:
         activity_id = f"{object_id}#{op}"
