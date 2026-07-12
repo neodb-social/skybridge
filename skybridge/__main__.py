@@ -38,11 +38,15 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
 def _cmd_ingest(args: argparse.Namespace) -> int:
     from skybridge.activitypub.delivery import DeliveryWorker
+    from skybridge.activitypub.relays import reconcile_relays
     from skybridge.atproto.jetstream import run as jetstream_run
 
     init_db()
 
     async def _go() -> int:
+        # (Re)send Follows for configured relays; Accepts can only be received
+        # by a running `serve` process sharing this DB, not by this one-shot run.
+        await reconcile_relays()
         worker = DeliveryWorker()
         worker.start()
         try:

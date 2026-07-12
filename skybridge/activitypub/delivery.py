@@ -2,10 +2,11 @@
 
 Two delivery paths (see the pipeline):
 
-* **relay path** — the relay ``Application`` actor ``Announce``s every
-  translated activity to all accepted instance subscribers' inboxes.
 * **direct path** — each bridged author signs and delivers its own
   ``Create``/``Update``/``Delete`` to that author's followers' inboxes.
+* **relay path** — the same author-signed activity also goes to every
+  accepted relay inbox (external relays we subscribe to as a client; see
+  :mod:`skybridge.activitypub.relays`), with no ``Announce`` wrapper.
 
 Delivery is in-process and best-effort: failures are logged to the ``delivery``
 table and retried with exponential backoff, never blocking ingestion.
@@ -26,7 +27,7 @@ from skybridge.activitypub.actors import get_relay_keys
 from skybridge.config import get_settings
 from skybridge.crypto import sign_request
 from skybridge.db import session_scope
-from skybridge.models import BridgedActor, Delivery, Follow, Subscriber, utcnow
+from skybridge.models import BridgedActor, Delivery, Follow, Relay, utcnow
 
 log = logging.getLogger("skybridge.delivery")
 
@@ -160,12 +161,9 @@ def _dedup_inboxes(targets: list[tuple[str, str | None]]) -> list[str]:
     return out
 
 
-def relay_targets() -> list[str]:
+def relay_inboxes() -> list[str]:
     with session_scope() as session:
-        rows = session.execute(
-            select(Subscriber.inbox, Subscriber.shared_inbox).where(Subscriber.state == "accepted")
-        ).all()
-    return _dedup_inboxes([(r[0], r[1]) for r in rows])
+        return list(session.scalars(select(Relay.inbox).where(Relay.state == "accepted")))
 
 
 def follower_targets(local_did: str) -> list[str]:
@@ -178,19 +176,14 @@ def follower_targets(local_did: str) -> list[str]:
     return _dedup_inboxes([(r[0], r[1]) for r in rows])
 
 
-def announce(activity: dict[str, Any]) -> dict[str, Any]:
-    """Wrap an activity in an ``Announce`` by the relay actor (by reference)."""
-    settings = get_settings()
-    actor = settings.relay_actor_id
-    return {
-        "@context": "https://www.w3.org/ns/activitystreams",
-        "id": f"{activity.get('id', settings.relay_actor_id)}#announce",
-        "type": "Announce",
-        "actor": actor,
-        "to": ["https://www.w3.org/ns/activitystreams#Public"],
-        "cc": [f"{actor}/followers"],
-        "object": activity.get("id") or activity,
-    }
+def _author_key(did: str) -> tuple[str, str] | None:
+    """``(private_pem, key_id)`` for a bridged author, or ``None`` if unknown."""
+    with session_scope() as session:
+        actor_row = session.get(BridgedActor, did)
+        if actor_row is None:
+            return None
+        key_id = f"{get_settings().actor_id(actor_row.handle)}#main-key"
+        return actor_row.private_key_pem, key_id
 
 
 async def _deliver_direct(
@@ -204,14 +197,9 @@ async def _deliver_direct(
     count = 0
     follower_inboxes = follower_targets(did)
     if follower_inboxes:
-        with session_scope() as session:
-            actor_row = session.get(BridgedActor, did)
-            if actor_row is not None:
-                priv = actor_row.private_key_pem
-                key_id = f"{get_settings().actor_id(actor_row.handle)}#main-key"
-            else:
-                priv = key_id = None
-        if priv and key_id:
+        key = _author_key(did)
+        if key is not None:
+            priv, key_id = key
             for inbox in follower_inboxes:
                 await worker.enqueue(Task(record_uri, inbox, key_id, priv, activity))
                 count += 1
@@ -225,19 +213,20 @@ async def fanout(
     did: str,
     activity: dict[str, Any],
 ) -> int:
-    """Enqueue relay ``Announce`` + direct author delivery. Returns task count."""
-    settings = get_settings()
+    """Enqueue the author-signed activity to accepted relays + the author's
+    followers. Returns the number of delivery tasks enqueued.
+    """
     count = 0
 
-    # Relay path: Announce to accepted instance subscribers.
-    relay_inboxes = relay_targets()
-    if relay_inboxes:
-        relay_priv, _ = get_relay_keys()
-        relay_key = f"{settings.relay_actor_id}#main-key"
-        ann = announce(activity)
-        for inbox in relay_inboxes:
-            await worker.enqueue(Task(record_uri, inbox, relay_key, relay_priv, ann))
-            count += 1
+    # Relay path: the same author-signed activity, no Announce wrapper.
+    inboxes = relay_inboxes()
+    if inboxes:
+        key = _author_key(did)
+        if key is not None:
+            priv, key_id = key
+            for inbox in inboxes:
+                await worker.enqueue(Task(record_uri, inbox, key_id, priv, activity))
+                count += 1
 
     # Direct path: the bridged author delivers to its own followers.
     count += await _deliver_direct(worker, record_uri=record_uri, did=did, activity=activity)
@@ -253,8 +242,23 @@ async def fanout_actor_update(
 ) -> int:
     """Direct-deliver an actor ``Update`` to just that author's followers.
 
-    Profile updates are never relay-``Announce``d to instance subscribers
-    (that's the ``fanout`` relay path, for per-work content) — this is just a
+    Profile updates are never forwarded to configured relays (that's the
+    ``fanout`` relay path, for per-work content) — this is just a direct
     refresh of the actor document itself.
     """
     return await _deliver_direct(worker, record_uri=activity["id"], did=did, activity=activity)
+
+
+async def forward_to_relays(
+    worker: DeliveryWorker, *, record_uri: str, activity: dict[str, Any]
+) -> int:
+    """Enqueue a raw activity to every accepted relay, signed by the service actor."""
+    inboxes = relay_inboxes()
+    if not inboxes:
+        return 0
+    settings = get_settings()
+    priv, _ = get_relay_keys()
+    key_id = f"{settings.relay_actor_id}#main-key"
+    for inbox in inboxes:
+        await worker.enqueue(Task(record_uri, inbox, key_id, priv, activity))
+    return len(inboxes)

@@ -1,6 +1,6 @@
 {% extends "base.html" %} {% block content %}
 <p class="muted">{{ settings.relay_summary }}</p>
-<p>Relay url: <code>{{ settings.url("inbox") }}</code></p>
+<p>Service actor: <code>{{ settings.relay_actor_id }}</code></p>
 {% if jetstream_url %}
 <p>Jetstream endpoint: <code>{{ jetstream_url }}</code></p>
 {% endif %}
@@ -19,12 +19,16 @@
         <div class="l">works catalogued</div>
     </div>
     <div class="card">
-        <div class="n">{{ stats.subscribers_accepted }}</div>
-        <div class="l">connected instances</div>
+        <div class="n">{{ stats.relays_accepted }}</div>
+        <div class="l">relays connected</div>
     </div>
     <div class="card">
         <div class="n">{{ stats.follows }}</div>
         <div class="l">remote followers</div>
+    </div>
+    <div class="card">
+        <div class="n">{{ stats.likes }}</div>
+        <div class="l">likes received</div>
     </div>
 </div>
 

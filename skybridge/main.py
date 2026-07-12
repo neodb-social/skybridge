@@ -26,6 +26,7 @@ from skybridge.activitypub import nodeinfo, objects, webfinger
 from skybridge.activitypub.actors import RELAY_DID, get_relay_keys, person_actor, relay_actor
 from skybridge.activitypub.delivery import DeliveryWorker
 from skybridge.activitypub.inbox import handle_inbox
+from skybridge.activitypub.relays import reconcile_relays
 from skybridge.atproto import oauth
 from skybridge.config import get_settings
 from skybridge.db import init_db, session_scope
@@ -48,6 +49,9 @@ async def lifespan(app: FastAPI):
     worker.start()
     app.state.worker = worker
 
+    relay_task = asyncio.create_task(reconcile_relays(), name="relay-reconcile")
+    app.state.relay_task = relay_task
+
     ingest_task: asyncio.Task | None = None
     if os.environ.get("SKYBRIDGE_INGEST") == "1":
         from skybridge.atproto.jetstream import run as jetstream_run
@@ -59,6 +63,8 @@ async def lifespan(app: FastAPI):
     finally:
         if ingest_task is not None:
             ingest_task.cancel()
+        if not relay_task.done():
+            relay_task.cancel()
         await worker.stop()
 
 
@@ -122,7 +128,11 @@ async def get_relay_actor() -> Response:
 @app.post("/inbox")
 async def relay_inbox(request: Request) -> Response:
     activity = await request.json()
-    status = await handle_inbox(activity, target_actor_id=get_settings().relay_actor_id)
+    status = await handle_inbox(
+        activity,
+        target_actor_id=get_settings().relay_actor_id,
+        worker=getattr(app.state, "worker", None),
+    )
     return Response(status_code=status)
 
 
@@ -168,7 +178,11 @@ async def get_user(ident: str, request: Request) -> Response:
 @app.post("/users/{ident}/inbox")
 async def user_inbox(ident: str, request: Request) -> Response:
     activity = await request.json()
-    status = await handle_inbox(activity, target_actor_id=get_settings().actor_id(ident))
+    status = await handle_inbox(
+        activity,
+        target_actor_id=get_settings().actor_id(ident),
+        worker=getattr(app.state, "worker", None),
+    )
     return Response(status_code=status)
 
 

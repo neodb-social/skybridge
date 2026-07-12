@@ -56,20 +56,40 @@ class OptOut(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
-class Subscriber(Base):
-    """A peer Fediverse instance that followed our relay ``Application`` actor.
+class Relay(Base):
+    """An external Fediverse relay we subscribe to as a client (Mastodon-style).
 
-    Accepted subscribers receive an ``Announce`` of every translated activity.
+    We ``Follow`` the relay's ``as:Public`` and, once it ``Accept``s, deliver
+    every author-signed post plus forwarded ``Like`` to its inbox.
     """
 
-    __tablename__ = "subscriber"
+    __tablename__ = "relay"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    actor_id: Mapped[str] = mapped_column(String, unique=True)
-    inbox: Mapped[str] = mapped_column(String)
-    shared_inbox: Mapped[str | None] = mapped_column(String, default=None)
-    state: Mapped[str] = mapped_column(String, default="pending")  # pending|accepted
-    subscribed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    inbox: Mapped[str] = mapped_column(String, unique=True)
+    follow_activity_id: Mapped[str | None] = mapped_column(String, default=None)
+    # pending|accepted|rejected|unsubscribed (removed from SKYBRIDGE_RELAYS)
+    state: Mapped[str] = mapped_column(String, default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Like(Base):
+    """A ``Like`` received from a peer AP server for one of our local posts.
+
+    Stored for dedup and forwarded verbatim, signed by the service actor, to
+    every accepted :class:`Relay`.
+    """
+
+    __tablename__ = "like"
+    __table_args__ = (UniqueConstraint("actor_id", "object_id", name="uq_like"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    activity_id: Mapped[str] = mapped_column(String, unique=True)
+    actor_id: Mapped[str] = mapped_column(String, index=True)
+    object_id: Mapped[str] = mapped_column(String, index=True)  # local post URL
+    raw_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class Follow(Base):

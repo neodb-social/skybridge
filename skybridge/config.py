@@ -77,6 +77,9 @@ class Settings:
         "Skybridge mirrors activities from Atmosphere (e.g. popfeed) to "
         "the Fediverse in NeoDB-compatible format."
     )
+    # External Fediverse relay inboxes we subscribe to as a client (Mastodon-
+    # style); empty = pure normal-server mode. See SKYBRIDGE_RELAYS.
+    relays: tuple[str, ...] = ()
     # Delivery worker retry schedule (seconds).
     retry_backoff: tuple[int, ...] = (2, 4, 8, 16)
     user_agent: str = "skybridge/0.1 (+activitypub-relay)"
@@ -114,6 +117,11 @@ class Settings:
         return f"acct:{handle}@{self.domain}"
 
 
+def _parse_relays(raw: str) -> tuple[str, ...]:
+    """Parse ``SKYBRIDGE_RELAYS``: comma/whitespace-separated, deduped, ordered."""
+    return tuple(dict.fromkeys(raw.replace(",", " ").split()))
+
+
 # Override holder so tests / the CLI can install a custom settings snapshot.
 _OVERRIDE: Settings | None = None
 
@@ -132,6 +140,7 @@ def _from_env() -> Settings:
         jetstream_url=os.environ.get("SKYBRIDGE_JETSTREAM", DEFAULT_JETSTREAM),
         relay_key_pem=os.environ.get("SKYBRIDGE_RELAY_KEY") or None,
         relay_key_file=os.path.join(data_dir, "relay_key.pem"),
+        relays=_parse_relays(os.environ.get("SKYBRIDGE_RELAYS", "")),
         sentry_dsn=os.environ.get("SKYBRIDGE_SENTRY_DSN") or None,
     )
 

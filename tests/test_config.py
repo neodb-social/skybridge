@@ -32,6 +32,34 @@ def test_sentry_dsn_unset_is_none(monkeypatch):
     assert s.sentry_dsn is None
 
 
+def test_relays_unset_is_empty(monkeypatch):
+    monkeypatch.delenv("SKYBRIDGE_RELAYS", raising=False)
+    s = _from_env()
+    assert s.relays == ()
+
+
+def test_relays_parses_commas_and_whitespace(monkeypatch):
+    monkeypatch.setenv(
+        "SKYBRIDGE_RELAYS",
+        " https://a.example/inbox, https://b.example/inbox\thttps://c.example/inbox ",
+    )
+    s = _from_env()
+    assert s.relays == (
+        "https://a.example/inbox",
+        "https://b.example/inbox",
+        "https://c.example/inbox",
+    )
+
+
+def test_relays_dedupes_preserving_order(monkeypatch):
+    monkeypatch.setenv(
+        "SKYBRIDGE_RELAYS",
+        "https://a.example/inbox,https://b.example/inbox,https://a.example/inbox",
+    )
+    s = _from_env()
+    assert s.relays == ("https://a.example/inbox", "https://b.example/inbox")
+
+
 def test_init_db_fails_loudly_on_readonly_database(tmp_path, monkeypatch):
     import os
 

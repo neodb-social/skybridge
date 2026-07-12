@@ -1,9 +1,13 @@
-"""Integration: a real Follow handshake + signed Announce/Create delivery.
+"""Integration: relay-client subscription + signed direct delivery + Like forward.
 
-Stands up an in-process mock remote instance (its own actor + inbox) on a live
-uvicorn server, has it Follow the relay, then replays the fixture with delivery
-enabled and asserts the mock inbox receives activities whose HTTP signatures
-verify against the signer's published key.
+Stands up an in-process mock *external relay* (its own actor + an inbox that
+records POSTs) on a live uvicorn server, then runs the skybridge app (also
+live, via uvicorn so its lifespan actually executes) configured with
+``SKYBRIDGE_RELAYS`` pointing at the mock. Verifies the full relay-client
+handshake — outbound ``Follow``, inbound ``Accept`` — then that replayed
+fixture activities are delivered author-signed (never wrapped in
+``Announce``) and that an inbound ``Like`` on a delivered post is forwarded,
+both with HTTP signatures that verify against the signer's own published key.
 """
 
 from __future__ import annotations
@@ -20,10 +24,13 @@ import uvicorn
 from fastapi import FastAPI, Request
 from skybridge.activitypub.delivery import DeliveryWorker
 from skybridge.atproto.replay import replay_file
-from skybridge.crypto import generate_keypair, verify_request
+from skybridge.crypto import generate_keypair, parse_signature_header, verify_request
 from skybridge.db import session_scope
 from skybridge.main import app as relay_app
-from skybridge.models import Subscriber
+from skybridge.models import Relay
+from sqlalchemy import select
+
+AP = {"Accept": "application/activity+json"}
 
 
 def _free_port() -> int:
@@ -33,7 +40,7 @@ def _free_port() -> int:
 
 
 class MockInstance:
-    """A minimal remote AP instance: one actor + an inbox that records POSTs."""
+    """A minimal external relay: one actor + an inbox that records POSTs."""
 
     def __init__(self, port: int) -> None:
         self.port = port
@@ -83,12 +90,24 @@ def _serve(app, port: int) -> uvicorn.Server:
     return server
 
 
+def _wait_for(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return False
+
+
 @pytest.fixture
 def live(settings, fixture_path):
-    # Configure the relay to advertise its real (localhost) port so signatures
-    # cover the right host, and serve both apps.
-    relay_port = _free_port()
+    # Start the mock relay FIRST so it's up before the skybridge app's
+    # lifespan (which subscribes to it) runs.
     mock_port = _free_port()
+    mock = MockInstance(mock_port)
+    mock_server = _serve(mock.app, mock_port)
+
+    relay_port = _free_port()
     from skybridge.config import Settings, set_settings
 
     from tests.conftest import RELAY_KEY_PEM
@@ -99,16 +118,14 @@ def live(settings, fixture_path):
             scheme="http",
             db_path=":memory:",
             relay_key_pem=RELAY_KEY_PEM,
+            relays=(f"{mock.base}/inbox",),
         )
     )
     from skybridge.db import init_db
 
     init_db(reset=True)
 
-    mock = MockInstance(mock_port)
-    relay_server = _serve(relay_app, relay_port)
-    mock_server = _serve(mock.app, mock_port)
-    time.sleep(0.2)
+    relay_server = _serve(relay_app, relay_port)  # lifespan runs -> reconcile_relays fires
     try:
         yield relay_port, mock
     finally:
@@ -117,64 +134,82 @@ def live(settings, fixture_path):
         time.sleep(0.2)
 
 
-def test_follow_then_signed_delivery(live, fixture_path):
+def test_relay_subscription_then_signed_delivery_and_like_forward(live, fixture_path):
     relay_port, mock = live
     relay_base = f"http://127.0.0.1:{relay_port}"
 
-    # 1) The mock instance Follows our relay actor.
-    follow = {
+    # 1) On startup, skybridge Follows as:Public at the configured relay.
+    assert _wait_for(lambda: any(a.get("type") == "Follow" for a in mock.received))
+    follow = next(a for a in mock.received if a.get("type") == "Follow")
+    assert follow["actor"] == f"{relay_base}/actor"
+    assert follow["object"] == "https://www.w3.org/ns/activitystreams#Public"
+
+    # 2) The relay Accepts; the Relay row flips to accepted in the shared DB.
+    accept = {
         "@context": "https://www.w3.org/ns/activitystreams",
-        "id": f"{mock.base}/activities/1",
-        "type": "Follow",
+        "id": f"{mock.base}/activities/accept-1",
+        "type": "Accept",
         "actor": mock.actor_id,
-        "object": f"{relay_base}/actor",
+        "object": follow,
     }
-    resp = httpx.post(f"{relay_base}/inbox", json=follow, timeout=10)
+    resp = httpx.post(f"{relay_base}/inbox", json=accept, timeout=10)
     assert resp.status_code in (200, 202)
-
-    # The subscriber is now recorded + accepted.
     with session_scope() as session:
-        sub = session.query(Subscriber).filter_by(actor_id=mock.actor_id).one()
-        assert sub.state == "accepted"
+        row = session.scalar(select(Relay).where(Relay.inbox == f"{mock.base}/inbox"))
+        assert row is not None
+        assert row.state == "accepted"
 
-    # The relay should have delivered an Accept back to the mock inbox.
-    assert any(a.get("type") == "Accept" for a in mock.received)
-
-    # 2) Replay the fixture WITH delivery; the mock should receive Announces.
+    # 3) Replay the fixture WITH delivery; the relay should receive
+    #    author-signed Creates, never an Announce wrapper.
     async def _replay() -> None:
         worker = DeliveryWorker()
         worker.start()
         try:
             await replay_file(fixture_path, worker=worker, allow_network=False)
             await asyncio.sleep(0.5)  # let the queue drain
-            await worker.stop()
         finally:
-            pass
+            await worker.stop()
 
     asyncio.run(_replay())
     time.sleep(0.3)
 
-    announces = [a for a in mock.received if a.get("type") == "Announce"]
-    assert announces, "expected relay to Announce bridged activities"
+    creates = [a for a in mock.received if a.get("type") == "Create"]
+    assert creates, "expected author-signed Create activities at the relay"
+    assert not any(a.get("type") == "Announce" for a in mock.received)
 
-    # 3) Every delivered POST must carry a signature that verifies against the
-    #    signer's published key (the relay actor).
-    relay_actor = httpx.get(f"{relay_base}/actor", timeout=10).json()
-    relay_pub = relay_actor["publicKey"]["publicKeyPem"]
+    # Every signed delivery must verify against the signer's own published key
+    # (fetched from the live skybridge server at the signature's own keyId).
     verified = 0
     for hdrs in mock.headers:
-        if "signature" not in {k.lower() for k in hdrs}:
+        lower = {k.lower(): v for k, v in hdrs.items()}
+        if "signature" not in lower:
             continue
-        body = None  # we re-verify the covered (request-target)/host/date/digest set
-        # Reconstruct using the digest the sender sent (body integrity already
-        # implied by digest match at receipt time).
-        ok = verify_request(
-            public_pem=relay_pub,
-            method="POST",
-            path="/inbox",
-            headers=hdrs,
-            body=body,
-        )
-        if ok:
+        key_id = parse_signature_header(lower["signature"])["keyId"]
+        actor_doc = httpx.get(key_id.split("#")[0], headers=AP, timeout=10).json()
+        pub = actor_doc["publicKey"]["publicKeyPem"]
+        if verify_request(public_pem=pub, method="POST", path="/inbox", headers=hdrs, body=None):
             verified += 1
     assert verified >= 1, "at least one delivery signature should verify"
+
+    # 4) A remote actor Likes one of the delivered posts; the raw Like is
+    #    forwarded, signed by the service actor, to the accepted relay.
+    liked_object_id = creates[0]["object"]["id"]
+    like = {
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": f"{mock.base}/activities/like-1",
+        "type": "Like",
+        "actor": mock.actor_id,
+        "object": liked_object_id,
+    }
+    resp = httpx.post(f"{relay_base}/inbox", json=like, timeout=10)
+    assert resp.status_code in (200, 202)
+
+    assert _wait_for(lambda: any(a.get("type") == "Like" for a in mock.received))
+    idx = next(i for i, a in enumerate(mock.received) if a.get("type") == "Like")
+    assert mock.received[idx]["object"] == liked_object_id
+
+    relay_actor_doc = httpx.get(f"{relay_base}/actor", headers=AP, timeout=10).json()
+    relay_pub = relay_actor_doc["publicKey"]["publicKeyPem"]
+    assert verify_request(
+        public_pem=relay_pub, method="POST", path="/inbox", headers=mock.headers[idx], body=None
+    )

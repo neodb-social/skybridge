@@ -40,7 +40,7 @@ def document() -> dict:
             "nodeEnvironment": "production",
             "nodeName": get_settings().relay_name,
             "nodeDescription": get_settings().relay_summary,
-            "subscribers": stats["subscribers_accepted"],
+            "relays": stats["relays_accepted"],
             "worksCatalogued": stats["works"],
         },
     }

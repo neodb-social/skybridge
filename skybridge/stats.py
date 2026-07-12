@@ -7,8 +7,9 @@ from typing import Any
 from sqlalchemy import func, select
 
 from skybridge.activitypub.actors import RELAY_DID
+from skybridge.config import get_settings
 from skybridge.db import session_scope
-from skybridge.models import BridgedActor, Delivery, Follow, Record, Subscriber, Work
+from skybridge.models import BridgedActor, Delivery, Follow, Like, Record, Relay, Work
 
 
 def collect_stats() -> dict[str, Any]:
@@ -20,12 +21,12 @@ def collect_stats() -> dict[str, Any]:
         records_active = session.scalar(
             select(func.count()).select_from(Record).where(Record.deleted_at.is_(None))
         )
-        subs_accepted = session.scalar(
-            select(func.count()).select_from(Subscriber).where(Subscriber.state == "accepted")
+        relays_accepted = session.scalar(
+            select(func.count()).select_from(Relay).where(Relay.state == "accepted")
         )
-        subs_total = session.scalar(select(func.count()).select_from(Subscriber))
         follows = session.scalar(select(func.count()).select_from(Follow))
         works = session.scalar(select(func.count()).select_from(Work))
+        likes = session.scalar(select(func.count()).select_from(Like))
 
         by_collection = dict(
             session.execute(select(Record.collection, func.count()).group_by(Record.collection))
@@ -42,10 +43,11 @@ def collect_stats() -> dict[str, Any]:
             "bridged_actors": bridged or 0,
             "records_total": records_total or 0,
             "records_active": records_active or 0,
-            "subscribers_accepted": subs_accepted or 0,
-            "subscribers_total": subs_total or 0,
+            "relays_configured": len(get_settings().relays),
+            "relays_accepted": relays_accepted or 0,
             "follows": follows or 0,
             "works": works or 0,
+            "likes": likes or 0,
             "records_by_collection": by_collection,
             "deliveries_by_status": delivery_by_status,
         }

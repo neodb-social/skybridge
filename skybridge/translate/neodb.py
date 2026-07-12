@@ -481,7 +481,7 @@ def wrap_activity(note: dict, *, handle: str, op: str, prior_object_id: str | No
 
     if op == "update":
         # Every Update needs its own id: peers dedup activities by id (takahe
-        # keys PostInteraction on the announce id), so a reused id makes them
+        # keys PostInteraction on the activity id), so a reused id makes them
         # drop the edit — or crash on concurrent duplicates. Mastodon-style
         # #updates/{µs}, stamped from the Note's own `updated` time.
         updated = (note or {}).get("updated")
