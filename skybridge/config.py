@@ -84,7 +84,7 @@ class Settings:
     retry_backoff: tuple[int, ...] = (2, 4, 8, 16)
     # neodb-relay (https://github.com/neodb-social/neodb-relay) returns HTTP
     # 418 to any request whose User-Agent lacks "neodb/" — must stay tagged.
-    user_agent: str = "neodb/skybridge (+https://github.com/neodb-social/neodb-bridge)"
+    user_agent: str = "skybridge-neodb/0.1 (+activitypub-relay)"
     # Optional Sentry DSN: enables error tracking + a per-collection ingest
     # counter metric. Unset (the default) keeps telemetry fully off.
     sentry_dsn: str | None = None
