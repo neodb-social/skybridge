@@ -10,22 +10,18 @@ author-signed post and every inbound ``Like`` to it.
 
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 from typing import Any
-from urllib.parse import urlparse
 from uuid import uuid4
 
-import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from skybridge.activitypub.actors import get_relay_keys
-from skybridge.activitypub.delivery import post_signed
+from skybridge.activitypub.delivery import DeliveryWorker, Task
 from skybridge.config import get_settings
 from skybridge.db import session_scope
-from skybridge.models import Relay, utcnow
+from skybridge.models import Relay
 from skybridge.translate.neodb import PUBLIC
 
 log = logging.getLogger("skybridge.relays")
@@ -51,16 +47,17 @@ def build_undo_follow(follow_id: str) -> dict[str, Any]:
     }
 
 
-async def reconcile_relays() -> None:
+async def reconcile_relays(worker: DeliveryWorker) -> None:
     """Sync ``Relay`` rows with ``SKYBRIDGE_RELAYS``.
 
-    Sends (or resends) ``Follow`` for every configured relay not yet accepted,
-    and ``Undo(Follow)`` for any relay removed from config. Called at startup
-    and from the ``ingest`` CLI; best-effort — logs and swallows any failure
-    rather than crashing the caller.
+    Enqueues (or re-enqueues) ``Follow`` for every configured relay not yet
+    accepted, and ``Undo(Follow)`` for any relay removed from config, onto
+    ``worker`` (retry/backoff + ``Delivery`` audit rows come for free). Called
+    at startup and from the ``ingest`` CLI; best-effort — logs and swallows
+    any failure rather than crashing the caller.
     """
     try:
-        await _sync_relays()
+        await _sync_relays(worker)
     except Exception:
         log.exception("relay reconciliation failed")
 
@@ -83,7 +80,6 @@ def _plan_sync(session: Session) -> tuple[list[tuple[str, str]], list[tuple[str,
         if row.state != "pending" or row.follow_activity_id is None:
             row.follow_activity_id = settings.url(f"activities/{uuid4()}")
             row.state = "pending"
-            row.updated_at = utcnow()
         follow_id = row.follow_activity_id
         assert follow_id is not None  # just (re)set above, or was already non-None
         to_follow.append((inbox, follow_id))
@@ -94,43 +90,26 @@ def _plan_sync(session: Session) -> tuple[list[tuple[str, str]], list[tuple[str,
             continue
         if row.follow_activity_id is not None:
             to_undo.append((inbox, row.follow_activity_id))
+        # Clear the follow id so a late/replayed Accept for it can't match
+        # this row again and resurrect an unsubscribed relay.
+        row.follow_activity_id = None
         row.state = "unsubscribed"
-        row.updated_at = utcnow()
 
     return to_follow, to_undo
 
 
-async def _sync_relays() -> None:
+async def _sync_relays(worker: DeliveryWorker) -> None:
     with session_scope() as session:
         to_follow, to_undo = _plan_sync(session)
-    if not to_follow and not to_undo:
-        return
 
     priv, _ = get_relay_keys()
     key_id = f"{get_settings().relay_actor_id}#main-key"
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        tasks = [
-            post_signed(
-                client,
-                inbox=inbox,
-                key_id=key_id,
-                private_pem=priv,
-                body=json.dumps(build_follow(follow_id)).encode(),
-            )
-            for inbox, follow_id in to_follow
-        ] + [
-            post_signed(
-                client,
-                inbox=inbox,
-                key_id=key_id,
-                private_pem=priv,
-                body=json.dumps(build_undo_follow(follow_id)).encode(),
-            )
-            for inbox, follow_id in to_undo
-        ]
-        if tasks:
-            # Isolate a slow/bad relay from the others by sending concurrently.
-            await asyncio.gather(*tasks, return_exceptions=True)
+    for inbox, follow_id in to_follow:
+        await worker.enqueue(Task(follow_id, inbox, key_id, priv, build_follow(follow_id)))
+    for inbox, follow_id in to_undo:
+        await worker.enqueue(
+            Task(f"{follow_id}#undo", inbox, key_id, priv, build_undo_follow(follow_id))
+        )
 
 
 def _follow_id_of(activity: dict[str, Any]) -> str | None:
@@ -143,41 +122,21 @@ def _follow_id_of(activity: dict[str, Any]) -> str | None:
     return None
 
 
-def _host_fallback_match(session: Session, activity: dict[str, Any]) -> Relay | None:
-    """Match relays that strip the Follow id off their Accept/Reject ``object``.
-
-    Falls back to comparing the Accept/Reject actor's host against a pending
-    relay's inbox host, when the ``object`` is still the embedded Follow.
-    """
-    obj = activity.get("object")
-    if not (isinstance(obj, dict) and obj.get("type") == "Follow"):
-        return None
-    if obj.get("actor") != get_settings().relay_actor_id:
-        return None
-    responder = activity.get("actor")
-    if not isinstance(responder, str):
-        return None
-    host = urlparse(responder).netloc
-    if not host:
-        return None
-    for row in session.scalars(select(Relay).where(Relay.state == "pending")):
-        if urlparse(row.inbox).netloc == host:
-            return row
-    return None
-
-
 def _set_relay_state(activity: dict[str, Any], state: str) -> int:
+    """Match the Accept/Reject to a ``Relay`` row by exact follow id.
+
+    neodb-relay echoes our Follow id back in the Accept/Reject ``object``, so
+    an exact match is sufficient and avoids the spoofable host-based
+    fallback this used to fall back to.
+    """
     follow_id = _follow_id_of(activity)
     with session_scope() as session:
         row = None
         if follow_id is not None:
             row = session.scalar(select(Relay).where(Relay.follow_activity_id == follow_id))
         if row is None:
-            row = _host_fallback_match(session, activity)
-        if row is None:
             return 202  # unknown Follow: nothing to update
         row.state = state
-        row.updated_at = utcnow()
     return 202
 
 

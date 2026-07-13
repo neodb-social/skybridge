@@ -49,7 +49,7 @@ async def lifespan(app: FastAPI):
     worker.start()
     app.state.worker = worker
 
-    relay_task = asyncio.create_task(reconcile_relays(), name="relay-reconcile")
+    relay_task = asyncio.create_task(reconcile_relays(worker), name="relay-reconcile")
     app.state.relay_task = relay_task
 
     ingest_task: asyncio.Task | None = None

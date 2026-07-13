@@ -6,8 +6,9 @@ live, via uvicorn so its lifespan actually executes) configured with
 ``SKYBRIDGE_RELAYS`` pointing at the mock. Verifies the full relay-client
 handshake — outbound ``Follow``, inbound ``Accept`` — then that replayed
 fixture activities are delivered author-signed (never wrapped in
-``Announce``) and that an inbound ``Like`` on a delivered post is forwarded,
-both with HTTP signatures that verify against the signer's own published key.
+``Announce``) and that an inbound ``Like`` on a delivered post is forwarded
+wrapped in an ``Announce`` by the service actor, both with HTTP signatures
+that verify against the signer's own published key.
 """
 
 from __future__ import annotations
@@ -191,8 +192,10 @@ def test_relay_subscription_then_signed_delivery_and_like_forward(live, fixture_
             verified += 1
     assert verified >= 1, "at least one delivery signature should verify"
 
-    # 4) A remote actor Likes one of the delivered posts; the raw Like is
-    #    forwarded, signed by the service actor, to the accepted relay.
+    # 4) A remote actor Likes one of the delivered posts; the Like is
+    #    forwarded Announce-wrapped, signed by the service actor (neodb-relay
+    #    redistributes Create/Update/Delete/Move + Announce, but ignores Like
+    #    entirely, so the raw Like alone would go nowhere).
     liked_object_id = creates[0]["object"]["id"]
     like = {
         "@context": "https://www.w3.org/ns/activitystreams",
@@ -204,9 +207,12 @@ def test_relay_subscription_then_signed_delivery_and_like_forward(live, fixture_
     resp = httpx.post(f"{relay_base}/inbox", json=like, timeout=10)
     assert resp.status_code in (200, 202)
 
-    assert _wait_for(lambda: any(a.get("type") == "Like" for a in mock.received))
-    idx = next(i for i, a in enumerate(mock.received) if a.get("type") == "Like")
-    assert mock.received[idx]["object"] == liked_object_id
+    assert _wait_for(lambda: any(a.get("type") == "Announce" for a in mock.received))
+    idx = next(i for i, a in enumerate(mock.received) if a.get("type") == "Announce")
+    announce = mock.received[idx]
+    assert announce["actor"] == f"{relay_base}/actor"
+    assert announce["object"]["type"] == "Like"
+    assert announce["object"]["object"] == liked_object_id
 
     relay_actor_doc = httpx.get(f"{relay_base}/actor", headers=AP, timeout=10).json()
     relay_pub = relay_actor_doc["publicKey"]["publicKeyPem"]

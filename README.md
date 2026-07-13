@@ -8,10 +8,16 @@ Any AT Protocol user may opt out by themselves (verified via atproto OAuth).
 Skybridge is a normal ActivityPub server: any Fediverse (or NeoDB) account can
 follow a bridged user directly at `https://SKYBRIDGE_DOMAIN/users/{handle}`
 and receive their activities as regular followers. It additionally publishes
-every public post (and forwards Likes it receives) through external relays
-you configure with `SKYBRIDGE_RELAYS` — Mastodon-style relay subscription, so
-peers that already watch a shared relay see bridged content without following
-each author individually.
+every public post through external relays you configure with
+`SKYBRIDGE_RELAYS` — Mastodon-style relay subscription, so peers that already
+watch a shared relay see bridged content without following each author
+individually. Likes it receives are forwarded too, wrapped in an `Announce` by
+the service actor (best-effort: relays such as
+[neodb-relay](https://github.com/neodb-social/neodb-relay) currently
+redistribute posts, not raw `Like`s, so an un-wrapped forward would go
+nowhere). All outbound requests, including the relay subscription handshake,
+carry a `User-Agent` tagged `neodb/` — neodb-relay returns HTTP 418 to any
+request without it.
 
 > **Breaking change:** Skybridge used to also act as a relay server — peer
 > instances could `Follow` its `Application` actor (`/actor`) and receive an
@@ -185,6 +191,10 @@ Every push to `main` runs the checks and publishes multi-arch
   control of their account via **AT Protocol OAuth** against their own
   authorization server (PAR + PKCE + DPoP); no passwords ever touch the relay
   and tokens are discarded right after the identity check
+
+**Future hardening:** inbound HTTP signature verification is not implemented
+yet — activities delivered to `/inbox` and `/users/{handle}/inbox` are
+trusted at face value.
 
 ## Development
 

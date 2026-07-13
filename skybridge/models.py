@@ -71,24 +71,23 @@ class Relay(Base):
     # pending|accepted|rejected|unsubscribed (removed from SKYBRIDGE_RELAYS)
     state: Mapped[str] = mapped_column(String, default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class Like(Base):
     """A ``Like`` received from a peer AP server for one of our local posts.
 
-    Stored for dedup and forwarded verbatim, signed by the service actor, to
-    every accepted :class:`Relay`.
+    Stored for dedup and forwarded (Announce-wrapped), signed by the service
+    actor, to every accepted :class:`Relay`. No uniqueness on
+    ``(actor_id, object_id)``: a forged Like must never be able to shadow a
+    victim's genuine later Like on the same post.
     """
 
     __tablename__ = "like"
-    __table_args__ = (UniqueConstraint("actor_id", "object_id", name="uq_like"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     activity_id: Mapped[str] = mapped_column(String, unique=True)
     actor_id: Mapped[str] = mapped_column(String, index=True)
     object_id: Mapped[str] = mapped_column(String, index=True)  # local post URL
-    raw_json: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

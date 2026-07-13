@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from dataclasses import replace
 
-import pytest
 from skybridge.activitypub import relays
+from skybridge.activitypub.delivery import DeliveryWorker
 from skybridge.config import set_settings
 from skybridge.db import session_scope
 from skybridge.models import Relay
@@ -17,17 +16,12 @@ from sqlalchemy import select
 RELAY_INBOX = "https://relay.example/inbox"
 
 
-@pytest.fixture
-def capture_posts(monkeypatch):
-    """Capture (inbox, activity, key_id) for every ``post_signed`` call."""
-    calls: list[tuple[str, dict, str]] = []
-
-    async def fake_post_signed(client, *, inbox, key_id, private_pem, body):
-        calls.append((inbox, json.loads(body), key_id))
-        return True, 202
-
-    monkeypatch.setattr(relays, "post_signed", fake_post_signed)
-    return calls
+def _drain(worker: DeliveryWorker) -> list:
+    """Pop every currently-queued Task off ``worker`` (never started)."""
+    tasks = []
+    while not worker.queue.empty():
+        tasks.append(worker.queue.get_nowait())
+    return tasks
 
 
 def _relay_state(inbox: str) -> str:
@@ -37,58 +31,72 @@ def _relay_state(inbox: str) -> str:
         return row.state
 
 
-def test_reconcile_creates_pending_row_and_sends_follow(settings, capture_posts):
-    set_settings(replace(settings, relays=(RELAY_INBOX,)))
-    asyncio.run(relays.reconcile_relays())
+def _relay_row(inbox: str) -> Relay:
+    with session_scope() as session:
+        row = session.scalar(select(Relay).where(Relay.inbox == inbox))
+        assert row is not None
+        return row
 
-    assert len(capture_posts) == 1
-    inbox, activity, key_id = capture_posts[0]
-    assert inbox == RELAY_INBOX
-    assert activity["type"] == "Follow"
-    assert activity["actor"] == settings.relay_actor_id
-    assert activity["object"] == PUBLIC
-    assert key_id == f"{settings.relay_actor_id}#main-key"
+
+def test_reconcile_creates_pending_row_and_sends_follow(settings):
+    set_settings(replace(settings, relays=(RELAY_INBOX,)))
+    worker = DeliveryWorker()  # never started: inspect the queue directly
+    asyncio.run(relays.reconcile_relays(worker))
+
+    tasks = _drain(worker)
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task.target_inbox == RELAY_INBOX
+    assert task.key_id == f"{settings.relay_actor_id}#main-key"
+    assert task.activity["type"] == "Follow"
+    assert task.activity["actor"] == settings.relay_actor_id
+    assert task.activity["object"] == PUBLIC
 
     assert _relay_state(RELAY_INBOX) == "pending"
-    with session_scope() as session:
-        row = session.scalar(select(Relay).where(Relay.inbox == RELAY_INBOX))
-        assert row is not None
-        assert row.follow_activity_id == activity["id"]
+    row = _relay_row(RELAY_INBOX)
+    assert row.follow_activity_id == task.activity["id"]
 
 
-def test_reconcile_resends_same_follow_id_while_pending(settings, capture_posts):
+def test_reconcile_resends_same_follow_id_while_pending(settings):
     set_settings(replace(settings, relays=(RELAY_INBOX,)))
-    asyncio.run(relays.reconcile_relays())
-    first_id = capture_posts[0][1]["id"]
+    worker = DeliveryWorker()
+    asyncio.run(relays.reconcile_relays(worker))
+    first_id = _drain(worker)[0].activity["id"]
 
-    asyncio.run(relays.reconcile_relays())
+    asyncio.run(relays.reconcile_relays(worker))
 
-    assert len(capture_posts) == 2
-    assert capture_posts[1][1]["type"] == "Follow"
-    assert capture_posts[1][1]["id"] == first_id
+    tasks = _drain(worker)
+    assert len(tasks) == 1
+    assert tasks[0].activity["type"] == "Follow"
+    assert tasks[0].activity["id"] == first_id
 
 
-def test_reconcile_undoes_relay_removed_from_config(settings, capture_posts):
+def test_reconcile_undoes_relay_removed_from_config(settings):
     set_settings(replace(settings, relays=(RELAY_INBOX,)))
-    asyncio.run(relays.reconcile_relays())
-    follow_id = capture_posts[0][1]["id"]
+    worker = DeliveryWorker()
+    asyncio.run(relays.reconcile_relays(worker))
+    follow_id = _drain(worker)[0].activity["id"]
 
     set_settings(replace(settings, relays=()))
-    asyncio.run(relays.reconcile_relays())
+    asyncio.run(relays.reconcile_relays(worker))
 
-    assert len(capture_posts) == 2
-    inbox, activity, _ = capture_posts[1]
-    assert inbox == RELAY_INBOX
-    assert activity["type"] == "Undo"
-    assert activity["object"]["id"] == follow_id
+    tasks = _drain(worker)
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task.target_inbox == RELAY_INBOX
+    assert task.activity["type"] == "Undo"
+    assert task.activity["object"]["id"] == follow_id
 
-    assert _relay_state(RELAY_INBOX) == "unsubscribed"
+    row = _relay_row(RELAY_INBOX)
+    assert row.state == "unsubscribed"
+    assert row.follow_activity_id is None
 
 
-def test_reconcile_empty_config_and_no_rows_is_noop(settings, capture_posts):
+def test_reconcile_empty_config_and_no_rows_is_noop(settings):
     set_settings(replace(settings, relays=()))
-    asyncio.run(relays.reconcile_relays())
-    assert capture_posts == []
+    worker = DeliveryWorker()
+    asyncio.run(relays.reconcile_relays(worker))
+    assert _drain(worker) == []
 
 
 def test_handle_accept_with_id_string_object(settings):
@@ -133,26 +141,24 @@ def test_handle_accept_unknown_id_is_noop(settings):
     assert _relay_state(RELAY_INBOX) == "pending"
 
 
-def test_handle_accept_falls_back_to_actor_host_when_id_stripped(settings):
-    with session_scope() as session:
-        session.add(
-            Relay(
-                inbox=RELAY_INBOX,
-                follow_activity_id=settings.url("activities/stripped"),
-                state="pending",
-            )
-        )
+def test_handle_accept_after_unsubscribe_does_not_resurrect(settings):
+    """A late/replayed Accept for a cleared follow id must not flip back to accepted."""
+    set_settings(replace(settings, relays=(RELAY_INBOX,)))
+    worker = DeliveryWorker()
+    asyncio.run(relays.reconcile_relays(worker))
+    follow_id = _drain(worker)[0].activity["id"]
 
-    accept = {
-        "type": "Accept",
-        "actor": "https://relay.example/actor",
-        # The relay echoed the Follow back without its "id".
-        "object": {"type": "Follow", "actor": settings.relay_actor_id, "object": PUBLIC},
-    }
-    status = relays.handle_accept(accept)
+    set_settings(replace(settings, relays=()))
+    asyncio.run(relays.reconcile_relays(worker))
+    _drain(worker)
+    assert _relay_row(RELAY_INBOX).follow_activity_id is None
+
+    status = relays.handle_accept(
+        {"type": "Accept", "actor": "https://relay.example/actor", "object": follow_id}
+    )
 
     assert status == 202
-    assert _relay_state(RELAY_INBOX) == "accepted"
+    assert _relay_state(RELAY_INBOX) == "unsubscribed"
 
 
 def test_handle_reject_sets_rejected(settings):

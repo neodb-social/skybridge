@@ -2,11 +2,13 @@
 
 * A **remote user** Follows a bridged ``Person`` actor → we store a
   :class:`Follow` and reply ``Accept``; thereafter that author's activities are
-  delivered to the follower's inbox.
-* A Follow of the service actor (or ``as:Public``) gets a polite ``Reject``:
-  this server doesn't relay for other instances — see
-  :mod:`skybridge.activitypub.relays` for the client-role subscription we
-  maintain to *external* relays instead.
+  delivered to the follower's inbox. Works whether the Follow lands on that
+  user's own inbox or the shared ``/inbox`` (Person actors advertise
+  ``sharedInbox=/inbox``).
+* A Follow of the service actor / ``as:Public`` (anything not resolving to a
+  bridged Person) gets a polite ``Reject``: this server doesn't relay for
+  other instances — see :mod:`skybridge.activitypub.relays` for the
+  client-role subscription we maintain to *external* relays instead.
 * ``Accept``/``Reject`` of one of our own relay subscriptions is dispatched to
   :mod:`skybridge.activitypub.relays`.
 * ``Like`` (and its ``Undo``) on one of our local posts is stored in
@@ -29,9 +31,8 @@ from sqlalchemy import delete, select
 
 from skybridge.activitypub import objects, relays
 from skybridge.activitypub.actors import RELAY_DID, get_relay_keys
-from skybridge.activitypub.delivery import DeliveryWorker, Task, forward_to_relays
+from skybridge.activitypub.delivery import DeliveryWorker, Task, forward_to_relays, post_signed
 from skybridge.config import get_settings
-from skybridge.crypto import sign_request
 from skybridge.db import session_scope
 from skybridge.models import BridgedActor, Follow, Like, Record
 
@@ -68,6 +69,32 @@ def _target_username(target_actor_id: str | None) -> str | None:
     if target_actor_id.startswith(prefix):
         return target_actor_id[len(prefix) :].split("/")[0]
     return None
+
+
+def _person_handle_from_object(obj: Any) -> str | None:
+    """Extract a local ``/users/<handle>`` handle from an activity ``object``.
+
+    ``obj`` may be a bare actor-id string or a dict carrying an ``"id"``;
+    returns ``None`` when it isn't a local per-user actor URL.
+    """
+    if isinstance(obj, dict):
+        obj = obj.get("id")
+    if not isinstance(obj, str):
+        return None
+    prefix = get_settings().url("users/")
+    if not obj.startswith(prefix):
+        return None
+    return obj[len(prefix) :].split("/")[0] or None
+
+
+def _bridged_author(handle: str | None) -> BridgedActor | None:
+    """Look up a non-relay bridged author by handle, or ``None``."""
+    if not handle:
+        return None
+    with session_scope() as session:
+        return session.scalar(
+            select(BridgedActor).where(BridgedActor.handle == handle, BridgedActor.did != RELAY_DID)
+        )
 
 
 def _local_post_record(object_id: str) -> Record | None:
@@ -128,6 +155,14 @@ async def _handle_follow(
     username = _target_username(target_actor_id)
     if username and username != get_settings().relay_username:
         return await _follow_person(username, actor_id, inbox, shared, activity, worker)
+
+    # Delivered to the shared inbox: a Follow of a bridged Person still routes
+    # there (Person actors advertise sharedInbox=/inbox). Reject only when the
+    # object doesn't resolve to one (service actor / as:Public / anything else).
+    obj_handle = _person_handle_from_object(activity.get("object"))
+    author = _bridged_author(obj_handle)
+    if author is not None and not author.opted_out:
+        return await _follow_person(author.handle, actor_id, inbox, shared, activity, worker)
 
     # A Follow of the service actor / as:Public: we're a normal server now,
     # not a relay for other instances — politely decline.
@@ -197,8 +232,18 @@ async def _handle_undo(
     actor_id = activity.get("actor")
     if not isinstance(actor_id, str):
         return 400
-    if isinstance(obj, dict) and obj.get("type") == "Follow":
-        return _handle_undo_follow(obj, actor_id, target_actor_id)
+
+    username = _target_username(target_actor_id)
+    if username == get_settings().relay_username:
+        username = None
+    # A bare-string object only counts as Undo(Follow) when it arrived at a
+    # per-user inbox for a real bridged user (there's no embedded Follow to
+    # otherwise identify it by); everywhere else a bare string is Undo(Like).
+    is_bridged_target = username is not None and _bridged_author(username) is not None
+    if (isinstance(obj, dict) and obj.get("type") == "Follow") or (
+        is_bridged_target and isinstance(obj, str)
+    ):
+        return _handle_undo_follow(obj, actor_id, username)
     if isinstance(obj, dict) and obj.get("type") == "Like":
         return await _handle_undo_like(obj.get("id"), actor_id, activity, worker)
     if isinstance(obj, str):
@@ -206,18 +251,26 @@ async def _handle_undo(
     return 202
 
 
-def _handle_undo_follow(follow: dict[str, Any], actor_id: str, target_actor_id: str | None) -> int:
-    username = _target_username(target_actor_id)
-    if username and username != get_settings().relay_username:
+def _handle_undo_follow(obj: Any, actor_id: str, username: str | None) -> int:
+    """Delete a stored ``Follow`` row for an Undo(Follow).
+
+    ``username`` is the target bridged user when the Undo arrived at that
+    user's own inbox; at the shared inbox it's ``None`` and the target is
+    instead resolved from the embedded Follow's own ``object`` (``obj`` is a
+    bare Follow-id string in the per-user-inbox case, with nothing further to
+    inspect).
+    """
+    if username is None and isinstance(obj, dict):
+        username = _person_handle_from_object(obj.get("object"))
+    author = _bridged_author(username)
+    if author is not None:
         with session_scope() as session:
-            author = session.scalar(select(BridgedActor).where(BridgedActor.handle == username))
-            if author is not None:
-                session.execute(
-                    delete(Follow).where(
-                        Follow.local_did == author.did,
-                        Follow.follower_actor_id == actor_id,
-                    )
+            session.execute(
+                delete(Follow).where(
+                    Follow.local_did == author.did,
+                    Follow.follower_actor_id == actor_id,
                 )
+            )
     # An Undo(Follow) aimed at the service actor (formerly a relay subscriber
     # unsubscribing) is now a no-op: we no longer track service-actor followers.
     return 202
@@ -247,24 +300,26 @@ async def _handle_like(activity: dict[str, Any], worker: DeliveryWorker | None) 
         return 400
     if not isinstance(object_id, str):
         return 400
-    if _local_post_record(object_id) is None:
+    record = _local_post_record(object_id)
+    if record is None:
         return 202  # not a live local post: no-op
 
+    # Canonicalize to the Note's own id: a Like may address the post via a
+    # handle- or did-keyed URL alias, which would otherwise double-count.
+    assert record.ap_object_json is not None  # guaranteed by _local_post_record
+    canonical_id = json.loads(record.ap_object_json).get("id") or object_id
+
     with session_scope() as session:
-        dup = session.scalar(
-            select(Like).where(
-                (Like.activity_id == like_id)
-                | ((Like.actor_id == actor_id) & (Like.object_id == object_id))
-            )
-        )
+        # Dedup on activity_id only: a forged Like must never be able to
+        # shadow a victim's genuine later Like on the same post.
+        dup = session.scalar(select(Like).where(Like.activity_id == like_id))
         if dup is not None:
             return 202
         session.add(
             Like(
                 activity_id=like_id,
                 actor_id=actor_id,
-                object_id=object_id,
-                raw_json=json.dumps(activity),
+                object_id=canonical_id,
             )
         )
 
@@ -301,18 +356,11 @@ async def _send_follow_response(
             Task(response["id"], inbox, f"{signer_actor}#main-key", private_pem, response)
         )
         return
-    body = json.dumps(response).encode()
-    headers = sign_request(
-        private_pem=private_pem,
-        key_id=f"{signer_actor}#main-key",
-        method="POST",
-        url=inbox,
-        body=body,
-    )
-    headers["Accept"] = "application/activity+json"
-    headers["User-Agent"] = settings.user_agent
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(inbox, content=body, headers=headers)
-    except httpx.HTTPError as exc:
-        log.warning("failed to deliver %s to %s: %s", kind, inbox, exc)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        await post_signed(
+            client,
+            inbox=inbox,
+            key_id=f"{signer_actor}#main-key",
+            private_pem=private_pem,
+            body=json.dumps(response).encode(),
+        )

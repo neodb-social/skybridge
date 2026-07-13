@@ -82,7 +82,9 @@ class Settings:
     relays: tuple[str, ...] = ()
     # Delivery worker retry schedule (seconds).
     retry_backoff: tuple[int, ...] = (2, 4, 8, 16)
-    user_agent: str = "skybridge/0.1 (+activitypub-relay)"
+    # neodb-relay (https://github.com/neodb-social/neodb-relay) returns HTTP
+    # 418 to any request whose User-Agent lacks "neodb/" — must stay tagged.
+    user_agent: str = "neodb/skybridge (+https://github.com/neodb-social/neodb-bridge)"
     # Optional Sentry DSN: enables error tracking + a per-collection ingest
     # counter metric. Unset (the default) keeps telemetry fully off.
     sentry_dsn: str | None = None

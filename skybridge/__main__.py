@@ -44,12 +44,12 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
     init_db()
 
     async def _go() -> int:
-        # (Re)send Follows for configured relays; Accepts can only be received
-        # by a running `serve` process sharing this DB, not by this one-shot run.
-        await reconcile_relays()
         worker = DeliveryWorker()
         worker.start()
         try:
+            # (Re)send Follows for configured relays; Accepts can only be received
+            # by a running `serve` process sharing this DB, not by this one-shot run.
+            await reconcile_relays(worker)
             return await jetstream_run(worker, stop_after=args.limit)
         finally:
             await worker.stop()

@@ -1,13 +1,15 @@
-"""Inbound Like storage/dedup/forwarding, its Undo, and the relay-Follow Reject."""
+"""Inbound Like storage/dedup/forwarding, its Undo, and Follow routing."""
 
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 
 import pytest
 from skybridge.activitypub import inbox
 from skybridge.activitypub.delivery import DeliveryWorker
 from skybridge.atproto.replay import replay_file
+from skybridge.config import set_settings
 from skybridge.db import session_scope
 from skybridge.models import BridgedActor, Follow, Like, Record, Relay
 from skybridge.pipeline import process_event
@@ -60,6 +62,21 @@ def test_like_valid_creates_one_row(settings, local_post):
     assert rows[0].actor_id == REMOTE_ACTOR
 
 
+def test_like_object_id_canonicalized_to_note_id(settings, local_post):
+    """A Like addressing the did-keyed alias of a post still lands on the
+    Note's own (handle-keyed) id, so it can't double-count against a Like
+    addressing the handle-keyed URL directly."""
+    handle, did, rkey = local_post
+    canonical_id = settings.post_id(handle, rkey)
+    alias_object_id = settings.post_id(did, rkey)
+    like = _like(REMOTE_ACTOR, alias_object_id, f"{REMOTE_ACTOR}/likes/1")
+    status = asyncio.run(inbox.handle_inbox(like))
+    assert status == 202
+    rows = _likes()
+    assert len(rows) == 1
+    assert rows[0].object_id == canonical_id
+
+
 def test_like_duplicate_activity_id_is_single_row(settings, local_post):
     handle, _did, rkey = local_post
     object_id = settings.post_id(handle, rkey)
@@ -69,12 +86,15 @@ def test_like_duplicate_activity_id_is_single_row(settings, local_post):
     assert len(_likes()) == 1
 
 
-def test_like_same_actor_and_object_new_id_is_single_row(settings, local_post):
+def test_like_same_actor_and_object_new_id_is_both_stored(settings, local_post):
+    """A second Like with a new activity_id is stored, not swallowed: dedup is
+    on activity_id alone now, so a forged Like can't shadow a victim's later
+    genuine Like on the same post (see models.Like)."""
     handle, _did, rkey = local_post
     object_id = settings.post_id(handle, rkey)
     asyncio.run(inbox.handle_inbox(_like(REMOTE_ACTOR, object_id, f"{REMOTE_ACTOR}/likes/1")))
     asyncio.run(inbox.handle_inbox(_like(REMOTE_ACTOR, object_id, f"{REMOTE_ACTOR}/likes/2")))
-    assert len(_likes()) == 1
+    assert len(_likes()) == 2
 
 
 def test_like_on_unknown_object_not_stored(settings, local_post):
@@ -151,8 +171,11 @@ def test_undo_unknown_like_is_noop(settings):
 def test_like_forwarded_to_accepted_relay(settings, local_post):
     handle, _did, rkey = local_post
     object_id = settings.post_id(handle, rkey)
+    relay_inbox = "https://relay.example/inbox"
+    # relay_inboxes() intersects with configured relays; the row alone isn't enough.
+    set_settings(replace(settings, relays=(relay_inbox,)))
     with session_scope() as session:
-        session.add(Relay(inbox="https://relay.example/inbox", state="accepted"))
+        session.add(Relay(inbox=relay_inbox, state="accepted"))
 
     like = _like(REMOTE_ACTOR, object_id, f"{REMOTE_ACTOR}/likes/1")
     worker = DeliveryWorker()  # never started: inspect the queue directly
@@ -160,9 +183,13 @@ def test_like_forwarded_to_accepted_relay(settings, local_post):
 
     assert worker.queue.qsize() == 1
     task = worker.queue.get_nowait()
-    assert task.target_inbox == "https://relay.example/inbox"
+    assert task.target_inbox == relay_inbox
     assert task.key_id == f"{settings.relay_actor_id}#main-key"
-    assert task.activity == like
+    # Forwarded as an Announce by the service actor, embedding the raw Like
+    # (neodb-relay redistributes Announce, not Like, which it ignores).
+    assert task.activity["type"] == "Announce"
+    assert task.activity["actor"] == settings.relay_actor_id
+    assert task.activity["object"] == like
 
 
 def test_follow_of_service_actor_now_rejects(settings, monkeypatch):
@@ -195,3 +222,66 @@ def test_follow_of_service_actor_now_rejects(settings, monkeypatch):
     with session_scope() as session:
         assert session.scalar(select(Relay)) is None
         assert session.scalar(select(Follow)) is None
+
+
+def test_follow_of_bridged_person_via_shared_inbox_accepts(settings, local_post, monkeypatch):
+    """A Follow of a bridged Person, delivered to the shared /inbox (Person
+    actors advertise sharedInbox=/inbox), still routes to _follow_person."""
+    handle, did, _rkey = local_post
+    stub_actor = {"id": REMOTE_ACTOR, "inbox": f"{REMOTE_ACTOR.rsplit('/', 1)[0]}/inbox"}
+    captured: dict = {}
+
+    async def fake_fetch_actor(actor_id):
+        return stub_actor
+
+    async def fake_send_follow_response(
+        *, kind, signer_actor, private_pem, follow, inbox, worker=None
+    ):
+        captured["kind"] = kind
+
+    monkeypatch.setattr(inbox, "fetch_actor", fake_fetch_actor)
+    monkeypatch.setattr(inbox, "_send_follow_response", fake_send_follow_response)
+
+    follow = {
+        "id": f"{REMOTE_ACTOR}/activities/1",
+        "type": "Follow",
+        "actor": REMOTE_ACTOR,
+        "object": settings.actor_id(handle),
+    }
+    status = asyncio.run(inbox.handle_inbox(follow, target_actor_id=settings.relay_actor_id))
+
+    assert status == 202
+    assert captured["kind"] == "Accept"
+    with session_scope() as session:
+        row = session.scalar(
+            select(Follow).where(Follow.local_did == did, Follow.follower_actor_id == REMOTE_ACTOR)
+        )
+        assert row is not None
+
+
+def test_undo_follow_bare_string_at_per_user_inbox_deletes_row(settings, local_post):
+    """The inner Follow object may be a bare id string with nothing to embed
+    an object in; a per-user inbox target is enough to identify it."""
+    handle, did, _rkey = local_post
+    with session_scope() as session:
+        session.add(
+            Follow(
+                local_did=did,
+                follower_actor_id=REMOTE_ACTOR,
+                follower_inbox=f"{REMOTE_ACTOR}/inbox",
+            )
+        )
+
+    undo = {
+        "type": "Undo",
+        "actor": REMOTE_ACTOR,
+        "object": f"{REMOTE_ACTOR}/follows/1",
+    }
+    status = asyncio.run(inbox.handle_inbox(undo, target_actor_id=settings.actor_id(handle)))
+
+    assert status == 202
+    with session_scope() as session:
+        row = session.scalar(
+            select(Follow).where(Follow.local_did == did, Follow.follower_actor_id == REMOTE_ACTOR)
+        )
+        assert row is None

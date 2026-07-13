@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -162,8 +163,15 @@ def _dedup_inboxes(targets: list[tuple[str, str | None]]) -> list[str]:
 
 
 def relay_inboxes() -> list[str]:
+    """Accepted relay inboxes, intersected with the currently configured set.
+
+    Defense-in-depth: a stale or resurrected ``accepted`` row can't receive
+    traffic once its inbox is no longer in ``SKYBRIDGE_RELAYS``.
+    """
+    configured = set(get_settings().relays)
     with session_scope() as session:
-        return list(session.scalars(select(Relay.inbox).where(Relay.state == "accepted")))
+        accepted = session.scalars(select(Relay.inbox).where(Relay.state == "accepted"))
+        return [inbox for inbox in accepted if inbox in configured]
 
 
 def follower_targets(local_did: str) -> list[str]:
@@ -262,13 +270,30 @@ async def fanout_actor_update(
 async def forward_to_relays(
     worker: DeliveryWorker, *, record_uri: str, activity: dict[str, Any]
 ) -> int:
-    """Enqueue a raw activity to every accepted relay, signed by the service actor."""
+    """Wrap ``activity`` in an ``Announce`` by the service actor and enqueue it
+    to every accepted relay, signed by the service actor.
+
+    neodb-relay only redistributes ``Create``/``Update``/``Delete``/``Move``
+    and ``Announce`` addressed to ``as:Public`` (it ignores ``Like``
+    entirely), so a forwarded ``Like`` is embedded as the ``Announce``'s
+    ``object`` rather than sent raw. This also fixes a signer/actor mismatch:
+    the ``Announce`` actor is the service actor that signs it, whereas the raw
+    activity's own actor is the remote peer that authored it.
+    """
     inboxes = relay_inboxes()
     if not inboxes:
         return 0
     settings = get_settings()
     priv, _ = get_relay_keys()
     key_id = f"{settings.relay_actor_id}#main-key"
+    announce = {
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": f"{settings.relay_actor_id}/activities/{uuid.uuid4()}",
+        "type": "Announce",
+        "actor": settings.relay_actor_id,
+        "to": ["https://www.w3.org/ns/activitystreams#Public"],
+        "object": activity,
+    }
     for inbox in inboxes:
-        await worker.enqueue(Task(record_uri, inbox, key_id, priv, activity))
+        await worker.enqueue(Task(record_uri, inbox, key_id, priv, announce))
     return len(inboxes)
