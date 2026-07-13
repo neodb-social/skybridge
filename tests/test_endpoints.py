@@ -203,11 +203,14 @@ def test_neodb_marker_redirects_to_local_path(client):
 
 
 def test_neodb_marker_guards_against_protocol_relative_open_redirect(client):
-    r = client.get("/~neodb~//evil.com/x", follow_redirects=False)
-    assert r.status_code == 302
-    location = r.headers["location"]
-    assert location.startswith("/")
-    assert not location.startswith("//")
+    # Browsers normalize "\" to "/" when resolving Location, so a leading
+    # backslash is as dangerous as a slash here.
+    for bad in ("//evil.com/x", "/\\evil.com/x", "\\evil.com/x", "/\\/evil.com/x"):
+        r = client.get(f"/~neodb~/{bad}", follow_redirects=False)
+        assert r.status_code == 302
+        location = r.headers["location"]
+        assert location.startswith("/")
+        assert not location.startswith(("//", "/\\")), bad
 
 
 def test_stats_json(client):
