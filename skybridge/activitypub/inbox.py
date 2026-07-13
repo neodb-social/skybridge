@@ -29,7 +29,7 @@ from sqlalchemy import delete, select
 
 from skybridge.activitypub import objects, relays
 from skybridge.activitypub.actors import RELAY_DID, get_relay_keys
-from skybridge.activitypub.delivery import DeliveryWorker, forward_to_relays
+from skybridge.activitypub.delivery import DeliveryWorker, Task, forward_to_relays
 from skybridge.config import get_settings
 from skybridge.crypto import sign_request
 from skybridge.db import session_scope
@@ -95,11 +95,12 @@ async def handle_inbox(
     ``target_actor_id`` is the actor whose inbox received it (``None`` for the
     shared inbox); it disambiguates a per-user Follow from one aimed at the
     service actor. ``worker``, when supplied, lets Like/Undo(Like) forward to
-    configured relays.
+    configured relays, and lets the Follow Accept/Reject be enqueued instead
+    of sent inline.
     """
     kind = activity.get("type")
     if kind == "Follow":
-        return await _handle_follow(activity, target_actor_id)
+        return await _handle_follow(activity, target_actor_id, worker)
     if kind == "Undo":
         return await _handle_undo(activity, target_actor_id, worker)
     if kind == "Accept":
@@ -112,7 +113,9 @@ async def handle_inbox(
     return 202
 
 
-async def _handle_follow(activity: dict[str, Any], target_actor_id: str | None) -> int:
+async def _handle_follow(
+    activity: dict[str, Any], target_actor_id: str | None, worker: DeliveryWorker | None
+) -> int:
     actor_id = activity.get("actor")
     if not isinstance(actor_id, str):
         return 400
@@ -124,7 +127,7 @@ async def _handle_follow(activity: dict[str, Any], target_actor_id: str | None) 
 
     username = _target_username(target_actor_id)
     if username and username != get_settings().relay_username:
-        return await _follow_person(username, actor_id, inbox, shared, activity)
+        return await _follow_person(username, actor_id, inbox, shared, activity, worker)
 
     # A Follow of the service actor / as:Public: we're a normal server now,
     # not a relay for other instances — politely decline.
@@ -135,12 +138,18 @@ async def _handle_follow(activity: dict[str, Any], target_actor_id: str | None) 
         private_pem=priv,
         follow=activity,
         inbox=inbox,
+        worker=worker,
     )
     return 202
 
 
 async def _follow_person(
-    username: str, actor_id: str, inbox: str, shared: str | None, activity: dict[str, Any]
+    username: str,
+    actor_id: str,
+    inbox: str,
+    shared: str | None,
+    activity: dict[str, Any],
+    worker: DeliveryWorker | None,
 ) -> int:
     with session_scope() as session:
         author = session.scalar(
@@ -171,7 +180,12 @@ async def _follow_person(
         signer_id = get_settings().actor_id(author.handle)
         priv = author.private_key_pem
     await _send_follow_response(
-        kind="Accept", signer_actor=signer_id, private_pem=priv, follow=activity, inbox=inbox
+        kind="Accept",
+        signer_actor=signer_id,
+        private_pem=priv,
+        follow=activity,
+        inbox=inbox,
+        worker=worker,
     )
     return 202
 
@@ -260,8 +274,20 @@ async def _handle_like(activity: dict[str, Any], worker: DeliveryWorker | None) 
 
 
 async def _send_follow_response(
-    *, kind: str, signer_actor: str, private_pem: str, follow: dict[str, Any], inbox: str
+    *,
+    kind: str,
+    signer_actor: str,
+    private_pem: str,
+    follow: dict[str, Any],
+    inbox: str,
+    worker: DeliveryWorker | None = None,
 ) -> None:
+    """Send an Accept/Reject for a Follow.
+
+    Enqueued on the ``DeliveryWorker`` when one is available so a slow remote
+    inbox can't stall the request that triggered it; falls back to an inline
+    signed POST when no worker is running.
+    """
     settings = get_settings()
     response = {
         "@context": "https://www.w3.org/ns/activitystreams",
@@ -270,6 +296,11 @@ async def _send_follow_response(
         "actor": signer_actor,
         "object": follow,
     }
+    if worker is not None:
+        await worker.enqueue(
+            Task(response["id"], inbox, f"{signer_actor}#main-key", private_pem, response)
+        )
+        return
     body = json.dumps(response).encode()
     headers = sign_request(
         private_pem=private_pem,

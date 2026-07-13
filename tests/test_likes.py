@@ -172,7 +172,9 @@ def test_follow_of_service_actor_now_rejects(settings, monkeypatch):
     async def fake_fetch_actor(actor_id):
         return stub_actor
 
-    async def fake_send_follow_response(*, kind, signer_actor, private_pem, follow, inbox):
+    async def fake_send_follow_response(
+        *, kind, signer_actor, private_pem, follow, inbox, worker=None
+    ):
         captured["kind"] = kind
         captured["signer_actor"] = signer_actor
 

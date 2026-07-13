@@ -192,12 +192,18 @@ async def _deliver_direct(
     record_uri: str,
     did: str,
     activity: dict[str, Any],
+    key: tuple[str, str] | None = None,
 ) -> int:
-    """Direct path: the bridged author delivers ``activity`` to its own followers."""
+    """Direct path: the bridged author delivers ``activity`` to its own followers.
+
+    ``key`` is the ``(private_pem, key_id)`` pair for ``did``, when the caller
+    already resolved it (e.g. :func:`fanout`); otherwise it's looked up here.
+    """
     count = 0
     follower_inboxes = follower_targets(did)
     if follower_inboxes:
-        key = _author_key(did)
+        if key is None:
+            key = _author_key(did)
         if key is not None:
             priv, key_id = key
             for inbox in follower_inboxes:
@@ -216,20 +222,24 @@ async def fanout(
     """Enqueue the author-signed activity to accepted relays + the author's
     followers. Returns the number of delivery tasks enqueued.
     """
+    # Resolved once up front and threaded through both paths below, so an
+    # unknown author is a single query and skips both paths gracefully.
+    key = _author_key(did)
+    if key is None:
+        return 0
+    priv, key_id = key
+
     count = 0
 
     # Relay path: the same author-signed activity, no Announce wrapper.
-    inboxes = relay_inboxes()
-    if inboxes:
-        key = _author_key(did)
-        if key is not None:
-            priv, key_id = key
-            for inbox in inboxes:
-                await worker.enqueue(Task(record_uri, inbox, key_id, priv, activity))
-                count += 1
+    for inbox in relay_inboxes():
+        await worker.enqueue(Task(record_uri, inbox, key_id, priv, activity))
+        count += 1
 
     # Direct path: the bridged author delivers to its own followers.
-    count += await _deliver_direct(worker, record_uri=record_uri, did=did, activity=activity)
+    count += await _deliver_direct(
+        worker, record_uri=record_uri, did=did, activity=activity, key=key
+    )
 
     return count
 

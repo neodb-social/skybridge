@@ -11,7 +11,7 @@ import asyncio
 import json
 import logging
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
@@ -65,6 +65,8 @@ async def lifespan(app: FastAPI):
             ingest_task.cancel()
         if not relay_task.done():
             relay_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await relay_task
         await worker.stop()
 
 

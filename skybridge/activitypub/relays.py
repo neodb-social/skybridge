@@ -10,6 +10,7 @@ author-signed post and every inbound ``Like`` to it.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -108,12 +109,28 @@ async def _sync_relays() -> None:
     priv, _ = get_relay_keys()
     key_id = f"{get_settings().relay_actor_id}#main-key"
     async with httpx.AsyncClient(timeout=15.0) as client:
-        for inbox, follow_id in to_follow:
-            body = json.dumps(build_follow(follow_id)).encode()
-            await post_signed(client, inbox=inbox, key_id=key_id, private_pem=priv, body=body)
-        for inbox, follow_id in to_undo:
-            body = json.dumps(build_undo_follow(follow_id)).encode()
-            await post_signed(client, inbox=inbox, key_id=key_id, private_pem=priv, body=body)
+        tasks = [
+            post_signed(
+                client,
+                inbox=inbox,
+                key_id=key_id,
+                private_pem=priv,
+                body=json.dumps(build_follow(follow_id)).encode(),
+            )
+            for inbox, follow_id in to_follow
+        ] + [
+            post_signed(
+                client,
+                inbox=inbox,
+                key_id=key_id,
+                private_pem=priv,
+                body=json.dumps(build_undo_follow(follow_id)).encode(),
+            )
+            for inbox, follow_id in to_undo
+        ]
+        if tasks:
+            # Isolate a slow/bad relay from the others by sending concurrently.
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _follow_id_of(activity: dict[str, Any]) -> str | None:
