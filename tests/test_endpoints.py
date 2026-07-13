@@ -196,6 +196,20 @@ def test_catalog_object_is_neodb_item(client, settings):
     assert doc["cover_image_url"].startswith("https://")
 
 
+def test_neodb_marker_redirects_to_local_path(client):
+    r = client.get("/~neodb~/catalog/movie/tmdbId-1", follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"] == "/catalog/movie/tmdbId-1"
+
+
+def test_neodb_marker_guards_against_protocol_relative_open_redirect(client):
+    r = client.get("/~neodb~//evil.com/x", follow_redirects=False)
+    assert r.status_code == 302
+    location = r.headers["location"]
+    assert location.startswith("/")
+    assert not location.startswith("//")
+
+
 def test_stats_json(client):
     r = client.get("/stats")
     assert r.status_code == 200

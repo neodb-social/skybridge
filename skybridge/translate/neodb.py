@@ -11,6 +11,9 @@ marks while generic Mastodon servers still render the base ``Note``):
   declared in the JSON-LD context for compatibility but are not emitted.)
 * The ``Note`` is wrapped in ``Create`` / ``Update`` / ``Delete`` (the latter
   referencing a ``Tombstone``).
+* The work link in Note ``content`` carries NeoDB's ``/~neodb~/`` URL marker
+  so peer instances localize it for their readers; ``tag`` hrefs stay
+  unmarked.
 """
 
 from __future__ import annotations
@@ -263,11 +266,25 @@ def build_note(
     return note
 
 
+def _marker_url(url: str) -> str:
+    """Insert NeoDB's ``~neodb~`` marker after the origin of *url*.
+
+    NeoDB peers rewrite ``href="https://domain/~neodb~/path"`` in incoming
+    post content to their local search resolver, so their readers land on
+    their own instance's copy of the work. Everyone else resolves the link
+    via our ``/~neodb~/{path}`` redirect route (see main.py).
+    """
+    origin, sep, path = url.partition("://")[2].partition("/")
+    scheme = url.split("://", 1)[0]
+    return f"{scheme}://{origin}/~neodb~{sep}{path}"
+
+
 def _title_html(title: str, ref: works.WorkRef | None) -> str:
-    """The work's title for Note content: linked to our catalog page when a
-    work was minted, plain emphasis otherwise."""
+    """The work's title for Note content: linked to our catalog page (with
+    NeoDB's ``~neodb~`` marker so peers localize the link) when a work was
+    minted, plain emphasis otherwise."""
     if ref is not None:
-        return f'<a href="{html.escape(ref.url)}">{html.escape(title)}</a>'
+        return f'<a href="{html.escape(_marker_url(ref.url))}">{html.escape(title)}</a>'
     return f"<strong>{html.escape(title)}</strong>"
 
 
