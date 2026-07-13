@@ -274,21 +274,18 @@ def test_review_edit_updates_anchored_note(settings):
 
 
 def test_update_activity_ids_are_unique(settings):
-    from skybridge.activitypub.delivery import announce
-
     r1 = _run(_ev("social.popfeed.feed.review", "rv1", _REVIEW_REC))
     r2 = _run(_ev("social.popfeed.feed.listItem", "it1", _ITEM_REC))
     edited = {**_REVIEW_REC, "text": "so good", "rating": 10}
     r3 = _run(_ev("social.popfeed.feed.review", "rv1", edited, op="update"))
     # Peers dedup activities by id (takahe keys PostInteraction on the
-    # announce id), so every Update — and its Announce — must carry a fresh
-    # id or later edits are dropped / crash the receiver.
+    # activity id), so every Update must carry a fresh id or later edits are
+    # dropped / crash the receiver.
     assert len({r1.activity["id"], r2.activity["id"], r3.activity["id"]}) == 3
     object_id = r1.activity["object"]["id"]
     assert r1.activity["id"] == f"{object_id}#create"
     for act in (r2.activity, r3.activity):
         assert act["id"].startswith(f"{object_id}#updates/")
-    assert announce(r2.activity)["id"] != announce(r3.activity)["id"]
 
 
 def test_partner_delete_rederives_note(settings):

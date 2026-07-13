@@ -5,7 +5,25 @@ as NeoDB-compatible ActivityPub activities.
 
 Any AT Protocol user may opt out by themselves (verified via atproto OAuth).
 
-Any NeoDB server may subscribe to the relay service (`https://SKYBRIDGE_DOMAIN/actor`) to receive the activities.
+Skybridge is a normal ActivityPub server: any Fediverse (or NeoDB) account can
+follow a bridged user directly at `https://SKYBRIDGE_DOMAIN/users/{handle}`
+and receive their activities as regular followers. It additionally publishes
+every public post through external relays you configure with
+`SKYBRIDGE_RELAYS` — Mastodon-style relay subscription, so peers that already
+watch a shared relay see bridged content without following each author
+individually. Likes it receives are forwarded too, wrapped in an `Announce` by
+the service actor (best-effort: relays such as
+[neodb-relay](https://github.com/neodb-social/neodb-relay) currently
+redistribute posts, not raw `Like`s, so an un-wrapped forward would go
+nowhere). All outbound requests, including the relay subscription handshake,
+carry a `User-Agent` tagged `neodb/` — neodb-relay returns HTTP 418 to any
+request without it.
+
+> **Breaking change:** Skybridge used to also act as a relay server — peer
+> instances could `Follow` its `Application` actor (`/actor`) and receive an
+> `Announce` of every activity. That role is gone: such Follows now get a
+> polite `Reject`. If you previously subscribed this way, follow the bridged
+> users you care about directly instead.
 
 ## How it works
 
@@ -19,7 +37,8 @@ Jetstream (atproto firehose)  ─┐
                                │   └─────────────────┬───────────────────┘
                                ▼                     ▼
                       persist to SQLite        enqueue delivery
-                      (archive + dedup)              └─ relay: Announce → subscribers
+                      (archive + dedup)              └─ fanout: author-signed activity →
+                                                          configured relays + followers
                                                         (signed HTTP, retry/backoff)
 ```
 
@@ -92,9 +111,10 @@ Known but not bridged:
 | `SKYBRIDGE_DATA` | `./data` | Folder for all mutable state (`skybridge.db`, `relay_key.pem`); under compose it is the host folder bind-mounted to the container's `/data` |
 | `SKYBRIDGE_PORT` | `8000` | Host port docker compose publishes the server on (compose-only) |
 | `SKYBRIDGE_JETSTREAM` | public jetstream2 us-east | Jetstream WebSocket endpoint |
-| `SKYBRIDGE_RELAY_KEY` | **required** | Relay actor private key (PEM); alternatively place a PEM at `$SKYBRIDGE_DATA/relay_key.pem` |
+| `SKYBRIDGE_RELAY_KEY` | **required** | Service actor private key (PEM); alternatively place a PEM at `$SKYBRIDGE_DATA/relay_key.pem` |
+| `SKYBRIDGE_RELAYS` | unset | Comma/space-separated relay inbox URLs to publish through (Mastodon-style); empty = pure normal-server mode |
 
-The relay actor signs outbound activities with an RSA key that **you must
+The service actor signs outbound activities with an RSA key that **you must
 provide** — either as `SKYBRIDGE_RELAY_KEY` in `.env` (compose supports
 quoted multi-line values) or as a PEM file at `$SKYBRIDGE_DATA/relay_key.pem`.
 Startup fails if neither is present. To generate one:
@@ -104,7 +124,7 @@ printf 'SKYBRIDGE_RELAY_KEY="%s"\n' \
   "$(openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048)" >> .env
 ```
 
-Keep the key safe and back it up — losing it changes the relay's ActivityPub
+Keep the key safe and back it up — losing it changes the server's ActivityPub
 identity, and peers that cached the old public key will reject signatures
 until they re-fetch the actor.
 | `SKYBRIDGE_INGEST` | unset | set to `1` to start live ingestion inside `serve` |
@@ -156,8 +176,12 @@ Every push to `main` runs the checks and publishes multi-arch
 ### Endpoints
 
 - Discovery: `/.well-known/webfinger`, `/.well-known/nodeinfo`, `/nodeinfo/2.1`
-- Relay actor: `GET /actor`, shared inbox `POST /inbox`, `POST /actor/inbox`
-- Bridged actors: `GET /users/{handle}` (+ `/inbox` `/outbox` `/followers`)
+- Service actor: `GET /actor`, shared inbox `POST /inbox`, `POST /actor/inbox`
+  — follow bridged users directly instead; a Follow of the service actor
+  now gets a `Reject` (see relays above for the Mastodon-style alternative)
+- Bridged actors: `GET /users/{handle}` (+ `/inbox` `/outbox` `/followers`) —
+  inbound `Like`/`Undo(Like)` on a local post is stored and forwarded to
+  configured relays
 - Objects: `GET /users/{handle}/posts/{rkey}` (Note / Tombstone),
   `GET /catalog/{type}/{id}` (catalog work)
 - UI / stats: `GET /` (dashboard), `GET /archive`, `GET /archive/{at_uri}`
@@ -167,6 +191,10 @@ Every push to `main` runs the checks and publishes multi-arch
   control of their account via **AT Protocol OAuth** against their own
   authorization server (PAR + PKCE + DPoP); no passwords ever touch the relay
   and tokens are discarded right after the identity check
+
+**Future hardening:** inbound HTTP signature verification is not implemented
+yet — activities delivered to `/inbox` and `/users/{handle}/inbox` are
+trusted at face value.
 
 ## Development
 
