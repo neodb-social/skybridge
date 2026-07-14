@@ -270,6 +270,19 @@ async def get_catalog(work_type: str, work_id: str, request: Request) -> Respons
     )
 
 
+@app.get("/~neodb~/{path:path}")
+async def neodb_marker_redirect(path: str, request: Request) -> Response:
+    # Outgoing Note content links carry the /~neodb~/ marker so NeoDB peers
+    # rewrite them to their own instance (see translate/neodb.py); every
+    # other reader lands here and gets the plain local page. lstrip guards
+    # against a protocol-relative ("//host/...") open redirect; backslashes
+    # count too, since browsers normalize "\" to "/" when resolving Location.
+    target = "/" + path.lstrip("/\\")
+    if request.url.query:
+        target += "?" + request.url.query
+    return RedirectResponse(target, status_code=302)
+
+
 # --------------------------------------------------------------------------- #
 # Opt-out (AT Protocol user self-service)
 # --------------------------------------------------------------------------- #

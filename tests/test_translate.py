@@ -123,9 +123,10 @@ def test_list_item_status_mark(settings):
     statuses = [r for r in note["relatedWith"] if r["type"] == "Status"]
     assert statuses and statuses[0]["status"] == "complete"
     assert statuses[0]["withRegardTo"] == ref.url
-    # the content links the work's catalog page; the poster rides on the
-    # catalog-item tag, never as a direct media attachment
-    assert f'<a href="{ref.url}">Elden Ring</a>' in note["content"]
+    # the content links the work's catalog page (carrying the ~neodb~ marker
+    # so peer instances localize it); the poster rides on the catalog-item
+    # tag, never as a direct media attachment
+    assert f'<a href="{neodb._marker_url(ref.url)}">Elden Ring</a>' in note["content"]
     assert "attachment" not in note
     # listItem notes never carry a name (only a "to <list>" content line)
     assert "name" not in note
@@ -344,7 +345,9 @@ def test_review_becomes_rating_and_comment(settings):
     # the Comment carries just the review text; the Note content leads with a
     # linked "Rated <work> n/10" line so plain Mastodon viewers see the work
     assert comments[0]["content"] == "<p>Mind-bending and heartfelt.</p>"
-    assert note["content"].startswith(f'<p>Rated <a href="{ref.url}">')
+    # the lead-in link carries the ~neodb~ marker (peer localization); the
+    # Comment's own content (asserted above) does not, since it isn't a link
+    assert note["content"].startswith(f'<p>Rated <a href="{neodb._marker_url(ref.url)}">')
     assert note["content"].endswith("<p>Mind-bending and heartfelt.</p>")
     assert comments[0]["id"] != rating["id"]  # facet ids are unique
     assert not any(r["type"] == "Review" for r in note["relatedWith"])
@@ -364,6 +367,32 @@ def test_review_becomes_rating_and_comment(settings):
     assert {"type": "Hashtag", "name": "#a24"} in note["tag"]
     assert {"type": "Hashtag", "name": "#movie"} in note["tag"]
     assert activity["type"] == "Create"
+
+
+def test_review_content_link_carries_neodb_marker_but_tag_href_does_not(settings):
+    # NeoDB peers rewrite href="https://domain/~neodb~/path" in incoming post
+    # content so their readers land on their own instance's copy of the work
+    # (see translate/neodb.py:_marker_url); the catalog-item tag href must
+    # stay a plain dereferenceable URL since NeoDB's inbound handler resolves
+    # the mark directly from it.
+    ref = works.work_ref(REVIEW)
+    assert ref is not None
+    note, _ = neodb.translate(
+        did="did:plc:abc",
+        handle="alice.test",
+        collection="social.popfeed.feed.review",
+        rkey="rv1",
+        record=REVIEW,
+        operation="create",
+        time_us=None,
+        ref=ref,
+    )
+    assert note is not None
+    assert "/~neodb~/catalog/" in note["content"]
+    work_tags = [t for t in note["tag"] if t["type"] == "Movie"]
+    assert len(work_tags) == 1
+    assert "~neodb~" not in work_tags[0]["href"]
+    assert work_tags[0]["href"] == ref.url
 
 
 def test_rating_only_review_has_no_review_object(settings):

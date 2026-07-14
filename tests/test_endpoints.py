@@ -196,6 +196,23 @@ def test_catalog_object_is_neodb_item(client, settings):
     assert doc["cover_image_url"].startswith("https://")
 
 
+def test_neodb_marker_redirects_to_local_path(client):
+    r = client.get("/~neodb~/catalog/movie/tmdbId-1", follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"] == "/catalog/movie/tmdbId-1"
+
+
+def test_neodb_marker_guards_against_protocol_relative_open_redirect(client):
+    # Browsers normalize "\" to "/" when resolving Location, so a leading
+    # backslash is as dangerous as a slash here.
+    for bad in ("//evil.com/x", "/\\evil.com/x", "\\evil.com/x", "/\\/evil.com/x"):
+        r = client.get(f"/~neodb~/{bad}", follow_redirects=False)
+        assert r.status_code == 302
+        location = r.headers["location"]
+        assert location.startswith("/")
+        assert not location.startswith(("//", "/\\")), bad
+
+
 def test_stats_json(client):
     r = client.get("/stats")
     assert r.status_code == 200
