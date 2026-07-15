@@ -9,7 +9,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 from skybridge import optout, sessions
-from skybridge.atproto import oauth
+from skybridge.atproto import backfill, oauth
 from skybridge.atproto.replay import replay_file
 from skybridge.db import session_scope
 from skybridge.main import app
@@ -257,6 +257,63 @@ def test_status_not_shown_without_login(client):
     assert r.status_code == 200
     assert DID not in r.text
     assert "active record" not in r.text
+
+
+def test_import_action_starts_backfill(client, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(
+        backfill, "start_import", lambda did, worker=None: calls.append(did) or True
+    )
+    csrf = _sign_in(client)
+    r = client.post("/optout/import", data={"csrf": csrf})
+    assert r.status_code == 200
+    assert "Importing recent activity" in r.text
+    assert calls == [DID]
+
+
+def test_import_action_already_running(client, monkeypatch):
+    monkeypatch.setattr(backfill, "start_import", lambda did, worker=None: False)
+    csrf = _sign_in(client)
+    r = client.post("/optout/import", data={"csrf": csrf})
+    assert r.status_code == 200
+    assert "already in progress" in r.text
+
+
+def test_import_action_refused_when_opted_out(client, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(
+        backfill, "start_import", lambda did, worker=None: calls.append(did) or True
+    )
+    csrf = _sign_in(client)
+    asyncio.run(optout.opt_out(DID))
+    r = client.post("/optout/import", data={"csrf": csrf})
+    assert r.status_code == 200
+    assert "import is disabled" in r.text
+    assert calls == []  # server-side guard: never even attempted
+
+
+def test_import_action_requires_session_and_csrf(client, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(
+        backfill, "start_import", lambda did, worker=None: calls.append(did) or True
+    )
+    r = client.post("/optout/import", data={"csrf": "x"})  # never signed in
+    assert r.status_code == 401
+    _sign_in(client)
+    r = client.post("/optout/import", data={"csrf": "wrong"})  # bad CSRF echo
+    assert r.status_code == 401
+    assert calls == []
+
+
+def test_import_button_disabled_only_when_opted_out(client):
+    # Signed-in account view for a bridged (not opted out) account: enabled.
+    csrf = _sign_in(client)
+    page = client.get("/optout")
+    assert '<button type="submit">Import recent activity</button>' in page.text
+    # After opting out the same view renders the button disabled.
+    client.post("/optout/opt-out", data={"csrf": csrf})
+    page = client.get("/optout")
+    assert '<button type="submit" disabled>Import recent activity</button>' in page.text
 
 
 def test_opted_out_actor_is_gone(client):

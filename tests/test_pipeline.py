@@ -576,3 +576,18 @@ def test_ingest_metric_not_ticked_for_opted_out_did(settings, monkeypatch):
     result = _run(_ev("social.popfeed.feed.review", "rv1", _REVIEW_REC, did=opted_out_did))
     assert result is None
     assert calls == []
+
+
+def test_reimport_after_optout_optin_recreates_pair_note(settings):
+    # Publish a paired Note, opt out (peers get Deletes), opt back in, then
+    # replay the pair as an import would: peers deleted the old object, so
+    # only a fresh Create — never an Update — can resurrect the content.
+    first = _run(_ev("social.popfeed.feed.review", "rv1", _REVIEW_REC))
+    _run(_ev("social.popfeed.feed.listItem", "it1", _ITEM_REC))
+    assert first.activity["type"] == "Create"
+
+    asyncio.run(optout.opt_out(_MERGE_DID))
+    optout.opt_in(_MERGE_DID)
+
+    replayed = _run(_ev("social.popfeed.feed.review", "rv1", _REVIEW_REC))
+    assert replayed.activity["type"] == "Create"

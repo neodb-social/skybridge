@@ -28,7 +28,7 @@ from skybridge.activitypub.actors import RELAY_DID, get_relay_keys, person_actor
 from skybridge.activitypub.delivery import DeliveryWorker
 from skybridge.activitypub.inbox import handle_inbox
 from skybridge.activitypub.relays import reconcile_relays
-from skybridge.atproto import oauth
+from skybridge.atproto import backfill, oauth
 from skybridge.config import get_settings
 from skybridge.db import init_db, session_scope
 from skybridge.models import BridgedActor, Record, Work
@@ -68,6 +68,9 @@ async def lifespan(app: FastAPI):
             relay_task.cancel()
             with suppress(asyncio.CancelledError):
                 await relay_task
+        # Imports must stop enqueueing before worker.stop() awaits the queue
+        # drain, or a long replay stalls shutdown / feeds a dead queue.
+        await backfill.cancel_all_imports()
         await worker.stop()
 
 
@@ -399,6 +402,23 @@ async def optout_action_opt_in(request: Request, csrf: str = Form("")) -> Respon
         if was_out
         else f"{session.handle} was not opted out."
     )
+    return _optout_page(request, session=session, message=msg)
+
+
+@app.post("/optout/import", response_class=HTMLResponse)
+async def optout_action_import(request: Request, csrf: str = Form("")) -> Response:
+    """Kick off a background import of the account's recent activity."""
+    session = _action_session(request, csrf)
+    if session is None:
+        return _optout_error(request, True, _SESSION_EXPIRED, "session_expired", 401)
+    if optout.is_opted_out(session.did):
+        # Server-side guard behind the disabled button: never re-publish an
+        # opted-out account's records.
+        msg = f"{session.handle} is opted out; import is disabled."
+    elif backfill.start_import(session.did, worker=getattr(app.state, "worker", None)):
+        msg = f"Importing recent activity for {session.handle} in the background."
+    else:
+        msg = f"An import for {session.handle} is already in progress."
     return _optout_page(request, session=session, message=msg)
 
 

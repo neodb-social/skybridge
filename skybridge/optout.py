@@ -70,6 +70,14 @@ async def opt_out(did: str, *, worker: DeliveryWorker | None = None) -> int:
     If a delivery ``worker`` is supplied, ``Delete`` activities are fanned out
     to subscribers and the actor's followers.
     """
+    # Stop any in-flight import first: a half-done replay suspended inside
+    # delivery could otherwise enqueue a Create AFTER the purge's Delete for
+    # the same record, leaving the opted-out content live on remote peers.
+    # (Late import: backfill imports this module for its opt-out guard.)
+    from skybridge.atproto import backfill
+
+    await backfill.cancel_import(did)
+
     settings = get_settings()
     pending: list[tuple[str, dict]] = []
 

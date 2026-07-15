@@ -85,6 +85,11 @@ class Settings:
     # neodb-relay (https://github.com/neodb-social/neodb-relay) returns HTTP
     # 418 to any request whose User-Agent lacks "neodb/" — must stay tagged.
     user_agent: str = "skybridge-neodb/0.1 (+activitypub-relay)"
+    # "Import recent activity" (user-triggered backfill): fetch at most
+    # `backfill_limit` records total from the account's PDS and re-publish
+    # only those created within the last `backfill_days` days.
+    backfill_limit: int = 1000
+    backfill_days: int = 7
     # Optional Sentry DSN: enables error tracking + a per-collection ingest
     # counter metric. Unset (the default) keeps telemetry fully off.
     sentry_dsn: str | None = None
@@ -144,6 +149,8 @@ def _from_env() -> Settings:
         relay_key_file=os.path.join(data_dir, "relay_key.pem"),
         relays=_parse_relays(os.environ.get("SKYBRIDGE_RELAYS", "")),
         sentry_dsn=os.environ.get("SKYBRIDGE_SENTRY_DSN") or None,
+        backfill_limit=int(os.environ.get("SKYBRIDGE_BACKFILL_LIMIT", "1000")),
+        backfill_days=int(os.environ.get("SKYBRIDGE_BACKFILL_DAYS", "7")),
     )
 
 

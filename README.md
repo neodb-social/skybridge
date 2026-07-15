@@ -115,6 +115,8 @@ Keep the key safe and back it up — losing it changes the server's ActivityPub
 identity, and peers that cached the old public key will reject signatures
 until they re-fetch the actor.
 | `SKYBRIDGE_INGEST` | unset | set to `1` to start live ingestion inside `serve` |
+| `SKYBRIDGE_BACKFILL_LIMIT` | `1000` | max records fetched per user-triggered "Import recent activity" run (total; reviews and shelf items are budgeted before archive-only lists) |
+| `SKYBRIDGE_BACKFILL_DAYS` | `7` | only records written within the last N days (by TID rkey, falling back to `createdAt`) are re-published by an import |
 | `SKYBRIDGE_LOG` | `INFO` | log level |
 | `SKYBRIDGE_SENTRY_DSN` | unset | optional; enables Sentry error reporting and a `atproto.record_ingested` counter metric with `collection`/`operation` attributes |
 
@@ -138,7 +140,9 @@ SKYBRIDGE_DOMAIN=bridge.example.social uv run python -m skybridge serve --port 8
 # Stream live popfeed activity from Jetstream (Ctrl-C to stop; --limit N to bound).
 SKYBRIDGE_DOMAIN=bridge.example.social uv run python -m skybridge ingest
 
-# Seed from a single DID's existing popfeed records.
+# Seed from a single DID's existing popfeed records (--days N to only replay
+# recent ones, --limit to cap the fetch). Signed-in users can trigger the same
+# thing from /optout via the "Import recent activity" button.
 uv run python -m skybridge backfill did:plc:i6k6scfcdaup4e2va33nkprb
 
 # Replay a captured JSONL fixture through the full pipeline (offline).
@@ -176,11 +180,15 @@ Every push to `main` runs the checks and publishes multi-arch
 - Opt-out: `GET /optout` (sign-in form; the account view once signed in),
   `POST /optout` (starts the sign-in), `GET /oauth/client-metadata.json`,
   `GET /oauth/callback` (opens the session), then `POST /optout/opt-out`,
-  `POST /optout/opt-in`, `POST /optout/signout` from the account view —
-  users prove control of their account via **AT Protocol OAuth** against
-  their own authorization server (PAR + PKCE + DPoP); no passwords ever
-  touch the relay, tokens are discarded right after the identity check, and
-  the signed-in session is a short-lived in-memory cookie
+  `POST /optout/opt-in`, `POST /optout/import`, `POST /optout/signout` from
+  the account view — users prove control of their account via **AT Protocol
+  OAuth** against their own authorization server (PAR + PKCE + DPoP); no
+  passwords ever touch the relay, tokens are discarded right after the
+  identity check, and the signed-in session is a short-lived in-memory
+  cookie. "Import recent activity" backfills the account's existing records
+  (capped at `SKYBRIDGE_BACKFILL_LIMIT`, re-publishing only the last
+  `SKYBRIDGE_BACKFILL_DAYS` days) in the background, one import per account
+  at a time, disabled while opted out
 
 ## Development
 

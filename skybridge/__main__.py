@@ -82,17 +82,21 @@ def _cmd_replay(args: argparse.Namespace) -> int:
 
 
 def _cmd_backfill(args: argparse.Namespace) -> int:
+    from datetime import UTC, datetime, timedelta
+
     from skybridge.activitypub.delivery import DeliveryWorker
     from skybridge.atproto.backfill import backfill_did
 
     init_db()
+    # `is not None`: --days 0 means the narrowest window, not "no window".
+    since = datetime.now(UTC) - timedelta(days=args.days) if args.days is not None else None
 
     async def _go() -> int:
         worker = DeliveryWorker() if args.deliver else None
         if worker:
             worker.start()
         try:
-            results = await backfill_did(args.did, worker=worker, limit=args.limit)
+            results = await backfill_did(args.did, worker=worker, limit=args.limit, since=since)
             return len(results)
         finally:
             if worker:
@@ -125,7 +129,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_backfill = sub.add_parser("backfill", help="seed from a DID's existing records")
     p_backfill.add_argument("did")
-    p_backfill.add_argument("--limit", type=int, default=100)
+    p_backfill.add_argument(
+        "--limit", type=int, default=1000, help="max records fetched (total across collections)"
+    )
+    p_backfill.add_argument(
+        "--days", type=int, default=None, help="only replay records created in the last N days"
+    )
     p_backfill.add_argument("--deliver", action="store_true")
     p_backfill.set_defaults(func=_cmd_backfill)
     return parser
