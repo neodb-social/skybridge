@@ -25,7 +25,12 @@ import uvicorn
 from fastapi import FastAPI, Request
 from skybridge.activitypub.delivery import DeliveryWorker
 from skybridge.atproto.replay import replay_file
-from skybridge.crypto import generate_keypair, parse_signature_header, verify_request
+from skybridge.crypto import (
+    generate_keypair,
+    parse_signature_header,
+    verify_ld_signature,
+    verify_request,
+)
 from skybridge.db import session_scope
 from skybridge.main import app as relay_app
 from skybridge.models import Relay
@@ -177,6 +182,19 @@ def test_relay_subscription_then_signed_delivery_and_like_forward(live, fixture_
     creates = [a for a in mock.received if a.get("type") == "Create"]
     assert creates, "expected author-signed Create activities at the relay"
     assert not any(a.get("type") == "Announce" for a in mock.received)
+
+    # Every relayed Create must carry an author LD signature: the relay
+    # re-signs its onward HTTP delivery with its own key, and NeoDB inboxes
+    # 401 relayed activities that lack one. Verify against the author's key
+    # as published by the live server at the signature's own creator URL.
+    for create in creates:
+        sig = create.get("signature")
+        assert sig is not None, "relayed Create missing LD signature"
+        assert sig["type"] == "RsaSignature2017"
+        creator_actor = sig["creator"].split("#")[0]
+        assert creator_actor == create["actor"]
+        actor_doc = httpx.get(creator_actor, headers=AP, timeout=10).json()
+        assert verify_ld_signature(create, public_pem=actor_doc["publicKey"]["publicKeyPem"])
 
     # Every signed delivery must verify against the signer's own published key
     # (fetched from the live skybridge server at the signature's own keyId).

@@ -1,4 +1,4 @@
-"""RSA keypairs and HTTP Signatures (draft-cavage) for ActivityPub delivery.
+"""RSA keypairs, HTTP Signatures (draft-cavage), and LD signatures for delivery.
 
 Mastodon / Takahe (and therefore NeoDB) speak the "draft-cavage" HTTP
 Signatures scheme with RSA-SHA256:
@@ -7,6 +7,12 @@ Signatures scheme with RSA-SHA256:
 * GET  signs ``(request-target) host date``
 * ``keyId`` is ``<actor-id>#main-key`` and resolves to the actor's
   ``publicKey.publicKeyPem``.
+
+Activities published through relays additionally need a Mastodon-style
+``RsaSignature2017`` JSON-LD signature: the relay re-signs the HTTP delivery
+with its *own* key, and NeoDB's inbox rejects any delivery whose HTTP signer
+differs from ``activity.actor`` unless the document carries an LD signature
+whose ``creator`` resolves to that actor (401 "Relay requires LD signature").
 """
 
 from __future__ import annotations
@@ -15,11 +21,18 @@ import base64
 import hashlib
 from datetime import UTC, datetime
 from email.utils import format_datetime, parsedate_to_datetime
-from urllib.parse import urlparse
+from functools import lru_cache
+from typing import Any
+from urllib.parse import urldefrag, urlparse
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPublicKey
+from pyld import jsonld
+
+from skybridge.ld_contexts import SCHEMAS
+
+LD_IDENTITY_CONTEXT = "https://w3id.org/identity/v1"
 
 
 def generate_keypair() -> tuple[str, str]:
@@ -54,12 +67,16 @@ def derive_public_pem(private_pem: str) -> str:
     )
 
 
+# PEM parsing costs far more than a sign/verify, and delivery re-signs with
+# the same author key once per target inbox — cache the parsed keys.
+@lru_cache(maxsize=256)
 def load_private_key(pem: str) -> RSAPrivateKey:
     key = serialization.load_pem_private_key(pem.encode(), password=None)
     assert isinstance(key, RSAPrivateKey)
     return key
 
 
+@lru_cache(maxsize=256)
 def load_public_key(pem: str) -> RSAPublicKey:
     key = serialization.load_pem_public_key(pem.encode())
     assert isinstance(key, RSAPublicKey)
@@ -126,6 +143,102 @@ def sign_request(
         f'keyId="{key_id}",algorithm="rsa-sha256",headers="{headers_list}",signature="{sig_b64}"'
     )
     return out_headers
+
+
+def _ld_document_loader(url: str, options: dict | None = None) -> dict:
+    """Resolve JSON-LD context URLs from the vendored cache, never the network.
+
+    Mirrors takahe's ``builtin_document_loader`` (including the empty-context
+    fallback for unknown URLs) so our URDNA2015 normalization is identical to
+    the one receivers run when verifying.
+    """
+    pieces = urlparse(url)
+    if pieces.hostname is None:
+        return SCHEMAS["unknown"]
+    key = pieces.hostname + pieces.path.rstrip("/")
+    if key in SCHEMAS:
+        return SCHEMAS[key]
+    wildcard = "*" + pieces.path.rstrip("/")
+    return SCHEMAS.get(wildcard, SCHEMAS["unknown"])
+
+
+def _ld_normalized_hash(document: dict[str, Any]) -> bytes:
+    """Hex SHA-256 (as ASCII bytes) of the URDNA2015 form, Mastodon-style.
+
+    Reference: https://socialhub.activitypub.rocks/t/making-sense-of-rsasignature2017/347
+    """
+    norm = jsonld.normalize(
+        document,
+        {
+            "algorithm": "URDNA2015",
+            "format": "application/n-quads",
+            "documentLoader": _ld_document_loader,
+        },
+    )
+    return hashlib.sha256(norm.encode("utf8")).hexdigest().encode("ascii")
+
+
+def _ld_signature_hash(document: dict[str, Any], *, creator: str, created: str) -> bytes:
+    """The signed input: options-document hash + document hash, concatenated.
+
+    Shared by signing and verification so the two can never drift; the
+    ``document`` must not contain a ``signature`` member.
+    """
+    options = {"@context": LD_IDENTITY_CONTEXT, "creator": creator, "created": created}
+    return _ld_normalized_hash(options) + _ld_normalized_hash(document)
+
+
+def create_ld_signature(
+    document: dict[str, Any], *, private_pem: str, key_id: str
+) -> dict[str, str]:
+    """Mastodon-compatible ``RsaSignature2017`` block for ``document``.
+
+    ``key_id`` must belong to ``document["actor"]`` (receivers reject the
+    signature when ``creator``'s defragged URL differs from the actor).
+    Attach the result as ``document["signature"]``.
+    """
+    document = {k: v for k, v in document.items() if k != "signature"}
+    creator = key_id
+    created = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    final_hash = _ld_signature_hash(document, creator=creator, created=created)
+    key = load_private_key(private_pem)
+    signature = key.sign(final_hash, padding.PKCS1v15(), hashes.SHA256())
+    return {
+        "@context": LD_IDENTITY_CONTEXT,
+        "creator": creator,
+        "created": created,
+        "signatureValue": base64.b64encode(signature).decode("ascii"),
+        "type": "RsaSignature2017",
+    }
+
+
+def verify_ld_signature(document: dict[str, Any], *, public_pem: str) -> bool:
+    """Verify a ``document`` carrying an ``RsaSignature2017`` ``signature``.
+
+    Returns ``True`` only when the signature block is well-formed, its
+    ``creator`` defrags to ``document["actor"]``, and the RSA signature
+    matches — the same checks NeoDB's takahe inbox runs on relayed
+    activities. Never raises: any malformed shape is just ``False``.
+    """
+    try:
+        document = document.copy()
+        signature = document.pop("signature")
+        if signature["type"].lower() != "rsasignature2017":
+            return False
+        if urldefrag(signature["creator"]).url != document.get("actor"):
+            return False
+        final_hash = _ld_signature_hash(
+            document, creator=signature["creator"], created=signature["created"]
+        )
+        load_public_key(public_pem).verify(
+            base64.b64decode(signature["signatureValue"]),
+            final_hash,
+            padding.PKCS1v15(),
+            hashes.SHA256(),
+        )
+        return True
+    except Exception:
+        return False
 
 
 def parse_signature_header(value: str) -> dict[str, str]:
