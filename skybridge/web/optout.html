@@ -48,6 +48,10 @@
   <form method="get" action="/optout" style="display:inline">
     <button type="submit">Check status</button>
   </form>
+  <form method="post" action="/optout/import" style="display:inline">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit"{% if status.opted_out %} disabled{% endif %}>Import recent activity</button>
+  </form>
   {% if status.opted_out %}
   <form method="post" action="/optout/opt-in" style="display:inline">
     <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -67,6 +71,11 @@
   Opting out stops mirroring your activity and asks remote servers to delete
   what was already federated; opting back in bridges future activity again
   (previously deleted posts stay deleted).
+</p>
+<p class="muted">
+  "Import recent activity" fetches your existing records (up to
+  {{ settings.backfill_limit }}) and re-publishes those from the last
+  {{ settings.backfill_days }} day(s) in the background.
 </p>
 
 {% else %}
