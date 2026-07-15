@@ -242,6 +242,8 @@ def test_optout_form_renders(client):
     assert r.status_code == 200
     assert "sign in" in r.text.lower()
     assert "app password" not in r.text.lower()
+    # the signed-out page must advertise that importing exists at all
+    assert "import recent activity" in r.text.lower()
 
 
 def test_client_metadata_endpoint(client, settings):

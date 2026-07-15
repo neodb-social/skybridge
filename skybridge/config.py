@@ -129,6 +129,21 @@ def _parse_relays(raw: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(raw.replace(",", " ").split()))
 
 
+def _env_int(name: str, default: int, minimum: int) -> int:
+    """An integer env var, validated loudly: a malformed or out-of-range
+    value must fail at startup, not surface later as a silent no-op."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from None
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {value}")
+    return value
+
+
 # Override holder so tests / the CLI can install a custom settings snapshot.
 _OVERRIDE: Settings | None = None
 
@@ -149,8 +164,8 @@ def _from_env() -> Settings:
         relay_key_file=os.path.join(data_dir, "relay_key.pem"),
         relays=_parse_relays(os.environ.get("SKYBRIDGE_RELAYS", "")),
         sentry_dsn=os.environ.get("SKYBRIDGE_SENTRY_DSN") or None,
-        backfill_limit=int(os.environ.get("SKYBRIDGE_BACKFILL_LIMIT", "1000")),
-        backfill_days=int(os.environ.get("SKYBRIDGE_BACKFILL_DAYS", "7")),
+        backfill_limit=_env_int("SKYBRIDGE_BACKFILL_LIMIT", 1000, minimum=1),
+        backfill_days=_env_int("SKYBRIDGE_BACKFILL_DAYS", 7, minimum=0),
     )
 
 

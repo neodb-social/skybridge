@@ -11,6 +11,10 @@ The window and replay order are keyed on each record's *write time* (its TID
 rkey, falling back to ``createdAt``/``addedAt`` for non-TID rkeys): an import
 replays what live ingestion would have bridged in that period, in the same
 order, so review/listItem pairs anchor their combined Note identically.
+Archive-only collections (feed.list) are exempt from the window and replay
+first: they never federate, and having them archived before their listItems
+translate lets ``_list_label`` resolve locally instead of fetching over the
+network mid-replay.
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ from skybridge import optout
 from skybridge.activitypub.delivery import DeliveryWorker
 from skybridge.atproto import identity
 from skybridge.config import get_settings
-from skybridge.pipeline import Processed, process_event
+from skybridge.pipeline import ARCHIVE_ONLY_COLLECTIONS, Processed, process_event
 
 log = logging.getLogger("skybridge.backfill")
 
@@ -45,6 +49,10 @@ _FETCH_PRIORITY = (
 # since the UNIX epoch + 10-bit clock id (https://atproto.com/specs/tid).
 _TID_CHARS = "234567abcdefghijklmnopqrstuvwxyz"
 
+# How often the replay loop re-checks the opt-out flag: process_event guards
+# every record anyway, so this only bounds the wasted no-op tail.
+_OPTOUT_CHECK_EVERY = 25
+
 
 def _content_collections() -> tuple[str, ...]:
     """Collections worth importing, in fetch-priority order: everything we
@@ -56,8 +64,13 @@ def _content_collections() -> tuple[str, ...]:
 
 
 def _tid_datetime(rkey: str) -> datetime | None:
-    """Decode a TID rkey into the record's write time (None for non-TID rkeys)."""
-    if len(rkey) != 13:
+    """Decode a TID rkey into the record's write time (None for non-TID rkeys).
+
+    The first char must encode a zero top bit (the spec restricts it to
+    ``234567abcdefghij``); without that check, a crafted 13-char rkey of
+    charset letters decodes to a far-future time and bypasses any age window.
+    """
+    if len(rkey) != 13 or rkey[0] not in _TID_CHARS[:16]:
         return None
     value = 0
     for char in rkey:
@@ -98,6 +111,23 @@ def _record_time(rec: dict[str, Any]) -> datetime | None:
     return _tid_datetime(_rkey(rec)) or _created_at(rec.get("value") or {})
 
 
+def _commit_event(
+    did: str, collection: str, rkey: str, record: dict[str, Any], cid: str | None = None
+) -> dict[str, Any]:
+    """A Jetstream-shaped synthetic ``create`` commit for process_event."""
+    return {
+        "did": did,
+        "kind": "commit",
+        "commit": {
+            "operation": "create",
+            "collection": collection,
+            "rkey": rkey,
+            "record": record,
+            "cid": cid,
+        },
+    }
+
+
 def _list_records(
     pds: str, did: str, collection: str, limit: int, since: datetime | None
 ) -> list[dict[str, Any]]:
@@ -136,19 +166,35 @@ def _list_records(
 
 def _fetch_records(
     pds: str, did: str, *, limit: int, since: datetime | None
-) -> list[tuple[str, dict[str, Any]]]:
-    """(collection, listRecords entry) pairs, at most ``limit`` in total,
-    budgeted in :data:`_FETCH_PRIORITY` order.
+) -> list[tuple[datetime | None, str, dict[str, Any]]]:
+    """(write time, collection, listRecords entry) triples, window-filtered,
+    at most ``limit`` in total, budgeted in :data:`_FETCH_PRIORITY` order.
 
-    Blocking urllib I/O — call via ``asyncio.to_thread``.
+    Only records that survive the window count against the budget, so a
+    collection whose history straddles the window cannot starve later
+    collections (each collection's raw fetch is still capped at the
+    remaining budget, and the TID early-stop bounds the overshoot to about
+    one page). Archive-only collections are exempt from the window — they
+    never federate, and archiving them is what keeps listItem translation
+    off the network during replay. Blocking urllib I/O — call via
+    ``asyncio.to_thread``.
     """
-    fetched: list[tuple[str, dict[str, Any]]] = []
+    fetched: list[tuple[datetime | None, str, dict[str, Any]]] = []
     for collection in _content_collections():
         room = limit - len(fetched)
         if room <= 0:
             break
-        for rec in _list_records(pds, did, collection, room, since):
-            fetched.append((collection, rec))
+        window = None if collection in ARCHIVE_ONLY_COLLECTIONS else since
+        unknown_age = 0
+        for rec in _list_records(pds, did, collection, room, window):
+            when = _record_time(rec)
+            if window is not None and (when is None or when < window):
+                if when is None:
+                    unknown_age += 1
+                continue
+            fetched.append((when, collection, rec))
+        if unknown_age:
+            log.info("%s: skipped %d record(s) of unknown age for %s", collection, unknown_age, did)
     return fetched
 
 
@@ -156,81 +202,76 @@ async def backfill_did(
     did: str,
     *,
     worker: DeliveryWorker | None = None,
-    limit: int = 1000,
+    limit: int | None = None,
     since: datetime | None = None,
 ) -> list[Processed]:
     """Pull a DID's popfeed records and run them through the pipeline.
 
-    Fetches at most ``limit`` records total (newest first, reviews and shelf
-    items budgeted before archive-only lists). With ``since`` set, only
-    records written at/after it are replayed (write time = TID rkey, falling
-    back to ``createdAt``/``addedAt``; unknown-age records are skipped);
-    without it everything fetched replays. Replay is oldest-first by write
-    time — the same order live ingestion would have processed them — and
-    finishes by refreshing the actor's identity from their popfeed profile
-    record, which ``ensure_actor`` alone never does for existing actors.
+    Fetches at most ``limit`` records total (``None`` = the configured
+    ``backfill_limit``), newest first, reviews and shelf items budgeted
+    before archive-only lists. With ``since`` set, only records written
+    at/after it are replayed (write time = TID rkey, falling back to
+    ``createdAt``/``addedAt``; unknown-age records are skipped); without it
+    everything fetched replays. Lists replay first (see module docstring),
+    then everything else oldest-first by write time — the order live
+    ingestion would have used — and the run finishes by refreshing the
+    actor's identity from their popfeed profile record, which
+    ``ensure_actor`` alone never does for existing actors.
     """
+    if optout.is_opted_out(did):
+        log.info("skipping import for %s: opted out", did)
+        return []
+    if limit is None:
+        limit = get_settings().backfill_limit
     pds = await asyncio.to_thread(identity.resolve_pds, did)
     if pds is None:
         log.warning("could not resolve PDS for %s", did)
         return []
     fetched = await asyncio.to_thread(_fetch_records, pds, did, limit=limit, since=since)
+    if not fetched:
+        # Nothing to replay: don't mint an actor row (or fetch profiles) for
+        # a repo with no importable popfeed presence.
+        log.info("nothing to import for %s", did)
+        return []
     # Mint/refresh the bridged actor once up front (network resolution
     # included) instead of on the first replayed event.
     await asyncio.to_thread(identity.ensure_actor, did)
 
     epoch = datetime.fromtimestamp(0, tz=UTC)
-    events: list[tuple[datetime, str, dict[str, Any]]] = []
-    for collection, rec in fetched:
-        when = _record_time(rec)
-        if since is not None and (when is None or when < since):
-            continue
-        events.append((when or epoch, collection, rec))
-    events.sort(key=lambda e: e[0])
+    fetched.sort(key=lambda e: (e[1] not in ARCHIVE_ONLY_COLLECTIONS, e[0] or epoch))
 
     results: list[Processed] = []
-    for _, collection, rec in events:
-        # An opt-out completed mid-import wins: stop re-publishing at once.
-        # (opt_out also cancels the import task; this covers direct callers.)
-        if optout.is_opted_out(did):
+    for i, (_, collection, rec) in enumerate(fetched):
+        # An opt-out completed mid-import wins. opt_out cancels the import
+        # task and process_event re-checks per record; this periodic check
+        # just cuts the no-op tail short for direct (CLI) callers.
+        if i % _OPTOUT_CHECK_EVERY == 0 and optout.is_opted_out(did):
             log.info("import aborted for %s: opted out", did)
-            break
+            return results
         # Yield so a long replay burst cannot starve concurrent requests:
         # process_event's DB and translate work is synchronous on the loop.
         await asyncio.sleep(0)
-        event = {
-            "did": did,
-            "kind": "commit",
-            "commit": {
-                "operation": "create",
-                "collection": collection,
-                "rkey": _rkey(rec),
-                "record": rec.get("value", {}),
-                "cid": rec.get("cid"),
-            },
-        }
-        processed = await process_event(event, worker=worker)
+        processed = await process_event(
+            _commit_event(did, collection, _rkey(rec), rec.get("value", {}), rec.get("cid")),
+            worker=worker,
+        )
         if processed is not None:
             results.append(processed)
 
     # Refresh display name/avatar from the popfeed profile record and emit
     # Update(Person): ensure_actor resolves the network only for NEW actors,
     # so an existing actor's stale identity would otherwise never update.
-    profile = await asyncio.to_thread(identity._profile_record, pds, did, _PROFILE_COLLECTION)
-    if profile and not optout.is_opted_out(did):
-        await process_event(
-            {
-                "did": did,
-                "kind": "commit",
-                "commit": {
-                    "operation": "create",
-                    "collection": _PROFILE_COLLECTION,
-                    "rkey": "self",
-                    "record": profile,
-                },
-            },
-            worker=worker,
-        )
+    # The network round trips run off-loop; the process_event that emits the
+    # Update stays offline (allow_network=False) so nothing blocks the loop.
+    if not optout.is_opted_out(did):
+        profile = await asyncio.to_thread(identity._profile_record, pds, did, _PROFILE_COLLECTION)
+        if profile:
+            await asyncio.to_thread(identity.refresh_actor, did, profile)
+            await process_event(
+                _commit_event(did, _PROFILE_COLLECTION, "self", profile),
+                worker=worker,
+                allow_network=False,
+            )
 
     log.info("backfilled %d record(s) for %s", len(results), did)
     return results
@@ -283,6 +324,13 @@ async def cancel_import(did: str) -> bool:
     task.cancel()
     with suppress(asyncio.CancelledError):
         await task
+    current = asyncio.current_task()
+    if current is not None and current.cancelling():
+        # The suppress above cannot tell the import's cancellation from OUR
+        # OWN, delivered while we waited (e.g. uvicorn cancelling an opt-out
+        # request during shutdown) — propagate it instead of letting the
+        # caller carry on.
+        raise asyncio.CancelledError
     return True
 
 

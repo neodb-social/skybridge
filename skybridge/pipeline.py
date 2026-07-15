@@ -460,17 +460,17 @@ def _persist(
             session.add(row)
         row.cid = cid
         row.source_json = json.dumps(source)
-        if not preserve_ap:
+        # preserve_ap keeps the stored AP forms — except when reviving a
+        # tombstoned row (e.g. re-import after opt-out -> opt-in): its Note
+        # was already retracted from peers, so keeping it would make
+        # _sync_pair emit an Update for an object remote servers deleted
+        # (and ignore). Clearing re-anchors the pair and publishes a fresh
+        # Create instead. (preserve_ap callers pass note/activity as None.)
+        # Known limit: the Create reuses the same rkey-derived object id the
+        # Delete named, and peers that cache tombstones may still reject it.
+        if not preserve_ap or row.deleted_at is not None:
             row.ap_object_json = json.dumps(note) if note is not None else None
             row.ap_activity_json = json.dumps(activity) if activity is not None else None
-        elif row.deleted_at is not None:
-            # Reviving a tombstoned row (e.g. re-import after opt-out ->
-            # opt-in): its stored Note was already retracted from peers, so
-            # keeping it would make _sync_pair emit an Update for an object
-            # remote servers deleted (and ignore). Clear it so the pair
-            # re-anchors and publishes a fresh Create instead.
-            row.ap_object_json = None
-            row.ap_activity_json = None
         row.op = operation
         row.work_key = work_key
         row.deleted_at = None

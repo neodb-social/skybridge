@@ -10,6 +10,8 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from skybridge import optout
 from skybridge.atproto import backfill, identity
+from skybridge.db import session_scope
+from skybridge.models import BridgedActor
 from skybridge.pipeline import Processed
 
 DID = "did:plc:backfilltestuser00000000"
@@ -101,6 +103,9 @@ def test_tid_datetime_roundtrip_and_rejects_garbage(settings):
     assert backfill._tid_datetime("self") is None
     assert backfill._tid_datetime("") is None
     assert backfill._tid_datetime("1" * 13) is None  # '1' not in the charset
+    # 13 charset chars with the top bit set would decode to year 2645 and
+    # bypass any age window — must be rejected, not treated as a write time.
+    assert backfill._tid_datetime("mycustomthing") is None
 
 
 # --- window + ordering ------------------------------------------------------
@@ -209,6 +214,48 @@ def test_backdated_timestamps_do_not_stop_pagination(settings, pds, replayed):
     assert wanted["uri"].endswith(replayed[0]["commit"]["rkey"])  # oldest write first
 
 
+def test_stale_records_do_not_consume_the_budget(settings, pds, replayed):
+    # 120 reviews all far older than the window must not starve in-window
+    # shelf items: only records that survive the window count against limit.
+    pds[REVIEWS] = [_rec(REVIEWS, _tid(100 + i), {"createdAt": {}}) for i in range(120)]
+    pds[ITEMS] = [_rec(ITEMS, _tid(2), {"addedAt": _iso(2)})]
+    since = datetime.now(UTC) - timedelta(days=7)
+    results = asyncio.run(backfill.backfill_did(DID, limit=100, since=since))
+    assert len(results) == 1
+    assert [e["commit"]["collection"] for e in replayed] == [ITEMS]
+
+
+def test_lists_are_unwindowed_and_replay_first(settings, pds, replayed):
+    # feed.list is archive-only: exempt from the window (labels for items
+    # added to old lists) and replayed before items, so listItem translation
+    # finds the list archived locally instead of fetching mid-replay.
+    pds[LISTS] = [_rec(LISTS, _tid(300), {"name": "old shelf", "createdAt": _iso(300)})]
+    pds[ITEMS] = [_rec(ITEMS, _tid(1), {"addedAt": _iso(1)})]
+    since = datetime.now(UTC) - timedelta(days=7)
+    results = asyncio.run(backfill.backfill_did(DID, since=since))
+    assert len(results) == 2
+    assert [e["commit"]["collection"] for e in replayed] == [LISTS, ITEMS]
+
+
+def test_limit_defaults_to_settings(settings, pds, replayed):
+    from dataclasses import replace
+
+    from skybridge.config import set_settings
+
+    set_settings(replace(settings, backfill_limit=2))
+    pds[REVIEWS] = [_rec(REVIEWS, f"r{i}", {"createdAt": _iso(i + 1)}) for i in range(5)]
+    results = asyncio.run(backfill.backfill_did(DID))
+    assert len(results) == 2  # limit=None fell back to SKYBRIDGE_BACKFILL_LIMIT
+
+
+def test_empty_repo_mints_no_actor(settings, pds, replayed):
+    results = asyncio.run(backfill.backfill_did(DID))
+    assert results == []
+    assert replayed == []
+    with session_scope() as session:
+        assert session.get(BridgedActor, DID) is None  # nothing bridged, no actor row
+
+
 def test_unresolvable_pds_yields_nothing(settings, monkeypatch, replayed):
     monkeypatch.setattr(identity, "_http_json", lambda url, timeout=8.0: None)
     assert asyncio.run(backfill.backfill_did(DID)) == []
@@ -218,17 +265,32 @@ def test_unresolvable_pds_yields_nothing(settings, monkeypatch, replayed):
 # --- profile refresh --------------------------------------------------------
 
 
-def test_import_refreshes_profile(settings, pds, replayed):
+def test_import_refreshes_profile(settings, pds, monkeypatch):
     pds[REVIEWS] = [_rec(REVIEWS, _tid(1), {"createdAt": _iso(1)})]
     pds["profile"] = {"displayName": "Fresh Name"}
+    events: list[tuple[dict[str, Any], bool]] = []
+
+    async def fake_process(event, *, worker=None, allow_network=True):
+        events.append((event, allow_network))
+        return Processed(event["did"], "create", event["commit"]["collection"], {})
+
+    monkeypatch.setattr(backfill, "process_event", fake_process)
     results = asyncio.run(backfill.backfill_did(DID))
-    profile_events = [
-        e for e in replayed if e["commit"]["collection"] == backfill._PROFILE_COLLECTION
+
+    profile = [
+        (e, net) for e, net in events if e["commit"]["collection"] == backfill._PROFILE_COLLECTION
     ]
-    assert len(profile_events) == 1
-    assert profile_events[0]["commit"]["record"] == {"displayName": "Fresh Name"}
-    assert profile_events[0]["commit"]["rkey"] == "self"
+    assert len(profile) == 1
+    event, allow_network = profile[0]
+    assert event["commit"]["record"] == {"displayName": "Fresh Name"}
+    assert event["commit"]["rkey"] == "self"
+    # The network refresh already ran off-loop (to_thread refresh_actor);
+    # the Update-emitting process_event must stay off the network.
+    assert allow_network is False
     assert len(results) == 1  # the profile replay is not counted as a record
+    with session_scope() as session:
+        actor = session.get(BridgedActor, DID)
+        assert actor is not None and actor.display_name == "Fresh Name"
 
 
 # --- the per-DID import guard -----------------------------------------------
@@ -370,13 +432,42 @@ def test_replay_aborts_for_opted_out_did(settings, pds, replayed):
     assert replayed == []  # nothing re-published, profile refresh included
 
 
+def test_cancel_import_propagates_callers_cancellation(settings, monkeypatch):
+    # If the CALLER (e.g. an opt-out request during shutdown) is cancelled
+    # while cancel_import waits on the dying import, that cancellation must
+    # propagate — the suppress() is only for the import task's own demise.
+    async def hang(did, **kwargs):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.05)  # linger so the waiter gets cancelled meanwhile
+            raise
+
+    monkeypatch.setattr(backfill, "backfill_did", hang)
+
+    async def go() -> bool:
+        assert backfill.start_import(DID) is True
+        await asyncio.sleep(0)  # let the import task start
+        me = asyncio.current_task()
+        assert me is not None
+        asyncio.get_running_loop().call_later(0.01, me.cancel)
+        try:
+            await backfill.cancel_import(DID)
+        except asyncio.CancelledError:
+            me.uncancel()
+            return True
+        return False
+
+    assert asyncio.run(go()) is True
+
+
 # --- CLI --------------------------------------------------------------------
 
 
 def test_cli_days_zero_still_windows(settings, monkeypatch, capsys):
     captured: dict[str, Any] = {}
 
-    async def fake_backfill(did, *, worker=None, limit=1000, since=None):
+    async def fake_backfill(did, *, worker=None, limit=None, since=None):
         captured["since"] = since
         return []
 
