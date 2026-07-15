@@ -26,7 +26,7 @@ from sqlalchemy import select
 
 from skybridge.activitypub.actors import get_relay_keys
 from skybridge.config import get_settings
-from skybridge.crypto import sign_request
+from skybridge.crypto import create_ld_signature, sign_request
 from skybridge.db import session_scope
 from skybridge.models import BridgedActor, Delivery, Follow, Relay, utcnow
 
@@ -239,10 +239,28 @@ async def fanout(
 
     count = 0
 
-    # Relay path: the same author-signed activity, no Announce wrapper.
-    for inbox in relay_inboxes():
-        await worker.enqueue(Task(record_uri, inbox, key_id, priv, activity))
-        count += 1
+    # Relay path: the same author-signed activity, no Announce wrapper. The
+    # relay re-signs its onward HTTP delivery with its own key, so recipients
+    # can only authenticate the author through an embedded LD signature —
+    # NeoDB's inbox 401s relayed activities without one. Signed on a copy so
+    # the direct path and the caller's dict keep the exact unsigned form they
+    # had before this feature; an unsigned relay delivery is a guaranteed
+    # rejection, so a signing failure skips the relay path rather than burn
+    # the whole retry schedule on it. Signing is CPU-bound (URDNA2015
+    # normalization), hence the thread.
+    inboxes = relay_inboxes()
+    if inboxes:
+        try:
+            signature = await asyncio.to_thread(
+                create_ld_signature, activity, private_pem=priv, key_id=key_id
+            )
+        except Exception:
+            log.exception("LD signing failed for %s; skipping relay path", record_uri)
+        else:
+            signed = {**activity, "signature": signature}
+            for inbox in inboxes:
+                await worker.enqueue(Task(record_uri, inbox, key_id, priv, signed))
+                count += 1
 
     # Direct path: the bridged author delivers to its own followers.
     count += await _deliver_direct(

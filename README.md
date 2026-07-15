@@ -19,6 +19,15 @@ nowhere). All outbound requests, including the relay subscription handshake,
 carry a `User-Agent` tagged `neodb/` — neodb-relay returns HTTP 418 to any
 request without it.
 
+Relay-bound activities are additionally signed with a Mastodon-style
+`RsaSignature2017` JSON-LD signature by the author. The relay re-signs its
+onward HTTP delivery with its *own* key, so receiving instances can only
+authenticate the true author through the embedded LD signature — NeoDB's
+inbox rejects relayed activities without one (`401 Relay requires LD
+signature`). JSON-LD contexts used for URDNA2015 normalization are vendored
+from NeoDB's takahe fork (`skybridge/ld_contexts.py`) so both sides normalize
+identically without network fetches.
+
 > **Breaking change:** Skybridge used to also act as a relay server — peer
 > instances could `Follow` its `Application` actor (`/actor`) and receive an
 > `Announce` of every activity. That role is gone: such Follows now get a
