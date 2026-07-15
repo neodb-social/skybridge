@@ -331,3 +331,21 @@ def test_opted_out_actor_is_gone(client):
     assert r.status_code == 410
     wf = client.get("/.well-known/webfinger", params={"resource": f"acct:{handle}@bridge.test"})
     assert wf.status_code == 404
+
+
+def test_signed_in_view_lists_up_to_200_recent_records(settings):
+    with session_scope() as session:
+        for i in range(210):
+            session.add(
+                Record(
+                    at_uri=f"at://{DID}/social.popfeed.feed.review/r{i}",
+                    did=DID,
+                    collection="social.popfeed.feed.review",
+                    rkey=f"r{i}",
+                    source_json="{}",
+                    op="create",
+                )
+            )
+    st = optout.lookup_status(DID)
+    assert st.record_count == 210
+    assert len(st.recent_rows) == 200  # the account view shows the recent 200

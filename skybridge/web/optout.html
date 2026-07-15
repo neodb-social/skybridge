@@ -31,13 +31,15 @@
     {% endif %}
   </p>
   {% if status.recent %}
+  <p class="muted">{{ status.recent | length }} most recent record(s) (up to 200).</p>
   <table>
-    <tr><th>When</th><th>Type</th><th>Record</th></tr>
+    <tr><th>When</th><th>Type</th><th>Title</th><th></th></tr>
     {% for r in status.recent %}
     <tr>
       <td class="muted">{{ r.updated_at.strftime("%Y-%m-%d %H:%M") }}</td>
       <td><span class="pill">{{ r.op }}</span> {{ r.collection.split(".")[-1] }}</td>
-      <td><a href="/archive/{{ r.at_uri | urlencode }}">{{ r.title or r.rkey }}</a></td>
+      <td>{{ r.title or r.rkey }}</td>
+      <td><a href="/archive/{{ r.at_uri | urlencode }}">view</a></td>
     </tr>
     {% endfor %}
   </table>
