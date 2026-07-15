@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import time
 
 import pytest
 from fastapi.testclient import TestClient
-from skybridge import optout
+from skybridge import optout, sessions
 from skybridge.atproto import oauth
 from skybridge.atproto.replay import replay_file
 from skybridge.db import session_scope
@@ -86,24 +88,46 @@ def test_opt_in_clears_optout(settings, fixture_path):
 def client(settings, fixture_path, monkeypatch) -> TestClient:
     asyncio.run(replay_file(fixture_path, allow_network=False))
     # Complete the OAuth flow offline: any callback verifies as the fixture
-    # author, with the requested action smuggled through the state param.
+    # author. Actions run afterwards, inside the signed-in session.
     monkeypatch.setattr(
         oauth,
         "finish_flow",
-        lambda state, code, iss: oauth.FlowResult(did=DID, handle="author.test", action=state),
+        lambda state, code, iss: oauth.FlowResult(did=DID, handle="author.test"),
     )
-    return TestClient(app)
+    sessions._SESSIONS.clear()  # no leakage between tests
+    # https base URL: the session cookie is Secure (settings.scheme is https)
+    return TestClient(app, base_url="https://bridge.test")
+
+
+def _csrf(html: str) -> str:
+    m = re.search(r'name="csrf" value="([^"]+)"', html)
+    assert m, "csrf token not found in page"
+    return m.group(1)
+
+
+def _sign_in(client: TestClient) -> str:
+    """Complete the stubbed OAuth callback; returns the account view's CSRF."""
+    r = client.get(
+        "/oauth/callback",
+        params={"state": "s", "code": "c", "iss": "x"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    assert r.headers["location"] == "/optout"
+    page = client.get("/optout")
+    assert page.status_code == 200
+    return _csrf(page.text)
 
 
 def test_optout_submit_starts_oauth_redirect(client, monkeypatch):
     monkeypatch.setattr(
         oauth,
         "start_flow",
-        lambda identifier, action: oauth.FlowStart("https://as.example/authorize?req=1", "st1"),
+        lambda identifier: oauth.FlowStart("https://as.example/authorize?req=1", "st1"),
     )
     r = client.post(
         "/optout",
-        data={"identifier": "author.test", "action": "opt-out"},
+        data={"identifier": "author.test"},
         headers={"accept": "text/html"},
         follow_redirects=False,
     )
@@ -112,7 +136,7 @@ def test_optout_submit_starts_oauth_redirect(client, monkeypatch):
     # JSON callers get the URL instead of a redirect
     r = client.post(
         "/optout",
-        data={"identifier": "author.test", "action": "opt-out"},
+        data={"identifier": "author.test"},
         headers={"accept": "application/json"},
     )
     assert r.status_code == 200
@@ -120,24 +144,82 @@ def test_optout_submit_starts_oauth_redirect(client, monkeypatch):
 
 
 def test_optout_submit_rejects_unresolvable_account(client, monkeypatch):
-    monkeypatch.setattr(oauth, "start_flow", lambda identifier, action: None)
+    monkeypatch.setattr(oauth, "start_flow", lambda identifier: None)
     r = client.post(
         "/optout",
-        data={"identifier": "nobody.test", "action": "opt-out"},
+        data={"identifier": "nobody.test"},
         headers={"accept": "application/json"},
     )
     assert r.status_code == 400
     assert r.json()["error"] == "oauth_start_failed"
 
 
-def test_oauth_callback_executes_optout(client):
+def test_oauth_callback_opens_session_without_changes(client):
+    before = _active_records(DID)
+    assert before > 0
+    _sign_in(client)
+    page = client.get("/optout")
+    assert "Signed in as" in page.text
+    assert DID in page.text  # the signed-in account's status card
+    assert "active record" in page.text
+    # signing in is purely informational: nothing purged, no opt-out recorded
+    assert _active_records(DID) == before
+    assert not optout.is_opted_out(DID)
+
+
+def test_opt_out_and_back_in_via_session(client):
     assert _active_records(DID) > 0
-    r = client.get("/oauth/callback", params={"state": "opt-out", "code": "c", "iss": "x"})
+    csrf = _sign_in(client)
+
+    r = client.post("/optout/opt-out", data={"csrf": csrf})
     assert r.status_code == 200
     assert "record(s) deleted" in r.text  # action message
     assert "opted out" in r.text  # status card reflects the new state
     assert _active_records(DID) == 0
     assert optout.is_opted_out(DID)
+
+    r = client.post("/optout/opt-in", data={"csrf": csrf})
+    assert r.status_code == 200
+    assert "opted back in" in r.text
+    assert not optout.is_opted_out(DID)
+
+
+def test_actions_require_login(client):
+    for path in ("/optout/opt-out", "/optout/opt-in"):
+        r = client.post(path, data={"csrf": "whatever"})
+        assert r.status_code == 401
+    assert _active_records(DID) > 0  # nothing purged
+    assert not optout.is_opted_out(DID)
+
+
+def test_actions_require_csrf(client):
+    _sign_in(client)
+    r = client.post("/optout/opt-out", data={"csrf": "wrong"})
+    assert r.status_code == 401
+    r = client.post("/optout/opt-out")  # missing entirely
+    assert r.status_code == 401
+    assert _active_records(DID) > 0
+    assert not optout.is_opted_out(DID)
+
+
+def test_signout_ends_session(client):
+    csrf = _sign_in(client)
+    r = client.post("/optout/signout", follow_redirects=False)
+    assert r.status_code == 303
+    page = client.get("/optout")
+    assert "Signed in as" not in page.text  # back to the sign-in form
+    r = client.post("/optout/opt-out", data={"csrf": csrf})
+    assert r.status_code == 401
+    assert not optout.is_opted_out(DID)
+
+
+def test_session_expires(client, monkeypatch):
+    csrf = _sign_in(client)
+    real_time = time.time
+    monkeypatch.setattr(sessions.time, "time", lambda: real_time() + sessions.SESSION_TTL + 1)
+    r = client.post("/optout/opt-out", data={"csrf": csrf})
+    assert r.status_code == 401
+    assert not optout.is_opted_out(DID)
 
 
 def test_oauth_callback_with_unknown_flow_rejected(settings, fixture_path):
@@ -168,17 +250,6 @@ def test_client_metadata_endpoint(client, settings):
     assert r.json()["client_id"] == settings.url("oauth/client-metadata.json")
 
 
-def test_optout_endpoint_rejects_unknown_action(client):
-    r = client.post(
-        "/optout",
-        data={"identifier": "author.test", "action": "purge-everything"},
-        headers={"accept": "application/json"},
-    )
-    assert r.status_code == 400
-    assert _active_records(DID) > 0  # nothing deleted
-    assert not optout.is_opted_out(DID)
-
-
 def test_status_not_shown_without_login(client):
     # The old unauthenticated ?q= lookup is gone: no way to enumerate what we
     # hold about an account without signing in as it.
@@ -188,18 +259,6 @@ def test_status_not_shown_without_login(client):
     assert "active record" not in r.text
 
 
-def test_status_action_via_oauth_shows_card_without_changes(client):
-    before = _active_records(DID)
-    assert before > 0
-    r = client.get("/oauth/callback", params={"state": "status", "code": "c", "iss": "x"})
-    assert r.status_code == 200
-    assert "Signed in as author.test" in r.text
-    assert "active record" in r.text  # the status card
-    # purely informational: nothing purged, no opt-out recorded
-    assert _active_records(DID) == before
-    assert not optout.is_opted_out(DID)
-
-
 def test_opted_out_actor_is_gone(client):
     handle = "author.test"
     with session_scope() as session:
@@ -207,7 +266,8 @@ def test_opted_out_actor_is_gone(client):
         actor = session.get(BridgedActor, DID)
         assert actor is not None
         actor.handle = handle
-    client.get("/oauth/callback", params={"state": "opt-out", "code": "c", "iss": "x"})
+    csrf = _sign_in(client)
+    client.post("/optout/opt-out", data={"csrf": csrf})
     r = client.get(f"/users/{handle}", headers={"accept": "application/activity+json"})
     assert r.status_code == 410
     wf = client.get("/.well-known/webfinger", params={"resource": f"acct:{handle}@bridge.test"})

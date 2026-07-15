@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, or_, select
 
-from skybridge import optout, telemetry
+from skybridge import optout, sessions, telemetry
 from skybridge.activitypub import nodeinfo, objects, webfinger
 from skybridge.activitypub.actors import RELAY_DID, get_relay_keys, person_actor, relay_actor
 from skybridge.activitypub.delivery import DeliveryWorker
@@ -296,51 +297,62 @@ def _status_ctx(did: str, fallback_handle: str | None = None) -> dict[str, Any]:
         "opted_out": st.opted_out,
         "record_count": st.record_count,
         "recent": _record_rows(st.recent_rows),
-        "unresolved": False,
     }
+
+
+def _optout_page(
+    request: Request,
+    *,
+    session: sessions.Session | None = None,
+    message: str | None = None,
+    q: str = "",
+    status_code: int = 200,
+) -> Response:
+    """Render the self-service page: sign-in form, or the account view."""
+    return _TEMPLATES.TemplateResponse(
+        request,
+        "optout.html",
+        {
+            "message": message,
+            "q": q,
+            "signed_in": session is not None,
+            "status": _status_ctx(session.did, session.handle) if session else None,
+            "csrf": session.csrf if session else None,
+            "settings": get_settings(),
+        },
+        status_code=status_code,
+    )
+
+
+def _current_session(request: Request) -> sessions.Session | None:
+    return sessions.get(request.cookies.get(sessions.COOKIE_NAME))
 
 
 @app.get("/optout", response_class=HTMLResponse)
 async def optout_form(request: Request) -> Response:
-    # Status is only shown after the account holder signs in (OAuth callback):
-    # an open lookup would let anyone enumerate what we hold about a user.
-    return _TEMPLATES.TemplateResponse(
-        request,
-        "optout.html",
-        {"message": None, "q": "", "status": None, "settings": get_settings()},
-    )
+    # Status is only shown to the signed-in account holder: an open lookup
+    # would let anyone enumerate what we hold about a user.
+    return _optout_page(request, session=_current_session(request))
 
 
 def _optout_error(
     request: Request, wants_html: bool, msg: str, code: str, status: int, q: str = ""
 ) -> Response:
     if wants_html:
-        return _TEMPLATES.TemplateResponse(
-            request,
-            "optout.html",
-            {"message": msg, "q": q, "status": None, "settings": get_settings()},
-            status_code=status,
-        )
+        return _optout_page(request, message=msg, q=q, status_code=status)
     return JSONResponse({"ok": False, "error": code}, status_code=status)
 
 
 @app.post("/optout")
-async def optout_submit(
-    request: Request,
-    identifier: str = Form(...),
-    action: str = Form("opt-out"),
-) -> Response:
-    """Start the atproto OAuth flow that authorizes the opt-out (or opt-in).
+async def optout_submit(request: Request, identifier: str = Form(...)) -> Response:
+    """Start the atproto OAuth sign-in that gates the self-service actions.
 
     The user proves control of the account by logging in on their OWN
-    authorization server (no passwords ever touch this relay); the action
-    executes in the OAuth callback.
+    authorization server (no passwords ever touch this relay); the callback
+    opens a short-lived session and the account view offers the actions.
     """
     wants_html = "text/html" in request.headers.get("accept", "")
-    if action not in ("status", "opt-out", "opt-in"):
-        # Never let a malformed action fall through to the destructive default.
-        return _optout_error(request, wants_html, "Unknown action.", "invalid_action", 400)
-    flow = await asyncio.to_thread(oauth.start_flow, identifier, action)
+    flow = await asyncio.to_thread(oauth.start_flow, identifier)
     if flow is None:
         return _optout_error(
             request,
@@ -353,6 +365,60 @@ async def optout_submit(
     if wants_html:
         return RedirectResponse(flow.authorize_url, status_code=303)
     return JSONResponse({"ok": True, "authorize_url": flow.authorize_url, "state": flow.state})
+
+
+def _action_session(request: Request, csrf: str) -> sessions.Session | None:
+    """The caller's session, iff the form echoed its CSRF token."""
+    session = _current_session(request)
+    if session is None or not csrf or not secrets.compare_digest(csrf, session.csrf):
+        return None
+    return session
+
+
+_SESSION_EXPIRED = "Your sign-in has expired — please sign in again."
+
+
+@app.post("/optout/opt-out", response_class=HTMLResponse)
+async def optout_action_opt_out(request: Request, csrf: str = Form("")) -> Response:
+    session = _action_session(request, csrf)
+    if session is None:
+        return _optout_error(request, True, _SESSION_EXPIRED, "session_expired", 401)
+    purged = await optout.opt_out(session.did, worker=getattr(app.state, "worker", None))
+    msg = f"{session.handle} opted out; {purged} bridged record(s) deleted."
+    return _optout_page(request, session=session, message=msg)
+
+
+@app.post("/optout/opt-in", response_class=HTMLResponse)
+async def optout_action_opt_in(request: Request, csrf: str = Form("")) -> Response:
+    session = _action_session(request, csrf)
+    if session is None:
+        return _optout_error(request, True, _SESSION_EXPIRED, "session_expired", 401)
+    was_out = optout.opt_in(session.did)
+    msg = (
+        f"{session.handle} is opted back in; future activity will bridge again."
+        if was_out
+        else f"{session.handle} was not opted out."
+    )
+    return _optout_page(request, session=session, message=msg)
+
+
+def _session_cookie_attrs() -> dict[str, Any]:
+    # delete_cookie must repeat the attributes set_cookie used, or browsers
+    # may treat it as a different cookie and keep the original.
+    return {
+        "path": "/",
+        "httponly": True,
+        "samesite": "lax",
+        "secure": get_settings().scheme == "https",
+    }
+
+
+@app.post("/optout/signout")
+async def optout_signout(request: Request) -> Response:
+    sessions.drop(request.cookies.get(sessions.COOKIE_NAME))
+    resp = RedirectResponse("/optout", status_code=303)
+    resp.delete_cookie(sessions.COOKIE_NAME, **_session_cookie_attrs())
+    return resp
 
 
 @app.get("/oauth/client-metadata.json")
@@ -369,7 +435,7 @@ async def oauth_callback(
     error: str = "",
     error_description: str = "",
 ) -> Response:
-    """Finish the OAuth flow and execute the action it was started for."""
+    """Finish the OAuth sign-in and open the self-service session."""
     if error:
         msg = error_description or f"Sign-in was not completed ({error})."
         return _optout_error(request, True, msg, error, 400)
@@ -382,30 +448,15 @@ async def oauth_callback(
             "oauth_failed",
             400,
         )
-
-    worker = getattr(app.state, "worker", None)
-    if result.action == "status":
-        msg = f"Signed in as {result.handle}."
-    elif result.action == "opt-in":
-        was_out = optout.opt_in(result.did)
-        msg = (
-            f"{result.handle} is opted back in; future activity will bridge again."
-            if was_out
-            else f"{result.handle} was not opted out."
-        )
-    else:
-        purged = await optout.opt_out(result.did, worker=worker)
-        msg = f"{result.handle} opted out; {purged} bridged record(s) deleted."
-    return _TEMPLATES.TemplateResponse(
-        request,
-        "optout.html",
-        {
-            "message": msg,
-            "q": result.handle,
-            "status": _status_ctx(result.did, result.handle),
-            "settings": get_settings(),
-        },
+    token = sessions.create(result.did, result.handle)
+    resp = RedirectResponse("/optout", status_code=303)
+    resp.set_cookie(
+        sessions.COOKIE_NAME,
+        token,
+        max_age=int(sessions.SESSION_TTL),
+        **_session_cookie_attrs(),
     )
+    return resp
 
 
 # --------------------------------------------------------------------------- #
