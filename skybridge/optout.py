@@ -40,7 +40,7 @@ class BridgeStatus:
     recent_rows: list[Record]
 
 
-def lookup_status(did: str) -> BridgeStatus:
+def lookup_status(did: str, *, recent_limit: int = 200) -> BridgeStatus:
     """Look up a DID's bridging status (DB only, no network)."""
     with session_scope() as session:
         actor = session.get(BridgedActor, did)
@@ -53,7 +53,9 @@ def lookup_status(did: str) -> BridgeStatus:
             )
             or 0
         )
-        recent = list(session.scalars(active.order_by(Record.updated_at.desc()).limit(10)))
+        recent = list(
+            session.scalars(active.order_by(Record.updated_at.desc()).limit(recent_limit))
+        )
         return BridgeStatus(
             did=did,
             handle=actor.handle if actor is not None else None,
