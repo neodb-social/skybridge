@@ -5,34 +5,12 @@ as NeoDB-compatible ActivityPub activities.
 
 Any AT Protocol user may opt out by themselves (verified via atproto OAuth).
 
-Skybridge is a normal ActivityPub server: any Fediverse (or NeoDB) account can
+Skybridge is an ActivityPub server: any Fediverse (or NeoDB) account can
 follow a bridged user directly at `https://SKYBRIDGE_DOMAIN/users/{handle}`
 and receive their activities as regular followers. It additionally publishes
-every public post through external relays you configure with
-`SKYBRIDGE_RELAYS` — Mastodon-style relay subscription, so peers that already
-watch a shared relay see bridged content without following each author
-individually. Likes it receives are forwarded too, wrapped in an `Announce` by
-the service actor (best-effort: relays such as
-[neodb-relay](https://github.com/neodb-social/neodb-relay) currently
-redistribute posts, not raw `Like`s, so an un-wrapped forward would go
-nowhere). All outbound requests, including the relay subscription handshake,
-carry a `User-Agent` tagged `neodb/` — neodb-relay returns HTTP 418 to any
-request without it.
-
-Relay-bound activities are additionally signed with a Mastodon-style
-`RsaSignature2017` JSON-LD signature by the author. The relay re-signs its
-onward HTTP delivery with its *own* key, so receiving instances can only
-authenticate the true author through the embedded LD signature — NeoDB's
-inbox rejects relayed activities without one (`401 Relay requires LD
-signature`). JSON-LD contexts used for URDNA2015 normalization are vendored
-from NeoDB's takahe fork (`skybridge/ld_contexts.py`) so both sides normalize
-identically without network fetches.
-
-> **Breaking change:** Skybridge used to also act as a relay server — peer
-> instances could `Follow` its `Application` actor (`/actor`) and receive an
-> `Announce` of every activity. That role is gone: such Follows now get a
-> polite `Reject`. If you previously subscribed this way, follow the bridged
-> users you care about directly instead.
+every public post through external relays admin configures with
+`SKYBRIDGE_RELAYS`, so peers connected to same relay see bridged content without 
+following individually.
 
 ## How it works
 
@@ -195,15 +173,14 @@ Every push to `main` runs the checks and publishes multi-arch
   `GET /catalog/{type}/{id}` (catalog work)
 - UI / stats: `GET /` (dashboard), `GET /archive`, `GET /archive/{at_uri}`
   (original record vs. translated AP side-by-side), `GET /catalog`, `GET /stats`
-- Opt-out: `GET /optout` (status form), `POST /optout` (starts the sign-in),
-  `GET /oauth/client-metadata.json`, `GET /oauth/callback` — users prove
-  control of their account via **AT Protocol OAuth** against their own
-  authorization server (PAR + PKCE + DPoP); no passwords ever touch the relay
-  and tokens are discarded right after the identity check
-
-**Future hardening:** inbound HTTP signature verification is not implemented
-yet — activities delivered to `/inbox` and `/users/{handle}/inbox` are
-trusted at face value.
+- Opt-out: `GET /optout` (sign-in form; the account view once signed in),
+  `POST /optout` (starts the sign-in), `GET /oauth/client-metadata.json`,
+  `GET /oauth/callback` (opens the session), then `POST /optout/opt-out`,
+  `POST /optout/opt-in`, `POST /optout/signout` from the account view —
+  users prove control of their account via **AT Protocol OAuth** against
+  their own authorization server (PAR + PKCE + DPoP); no passwords ever
+  touch the relay, tokens are discarded right after the identity check, and
+  the signed-in session is a short-lived in-memory cookie
 
 ## Development
 

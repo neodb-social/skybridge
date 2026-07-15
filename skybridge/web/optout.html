@@ -10,10 +10,14 @@
   activity and ask remote servers to delete what was already federated.
 </p>
 
-{% if status %}
+{% if message %}
+<p class="card"><strong>{{ message }}</strong></p>
+{% endif %}
+
+{% if signed_in %}
 <div class="card">
   <p>
-    <strong>{{ status.handle }}</strong>
+    Signed in as <strong>{{ status.handle }}</strong>
     {% if status.did %} <code>{{ status.did }}</code>{% endif %}
   </p>
   <p>
@@ -24,7 +28,6 @@
     <a href="/users/{{ status.handle }}">bridged profile</a>
     {% else %}
     <span class="pill">not bridged</span> No bridged records.
-    {% if status.unresolved %}<span class="muted">(handle could not be resolved)</span>{% endif %}
     {% endif %}
   </p>
   {% if status.recent %}
@@ -40,13 +43,34 @@
   </table>
   {% endif %}
 </div>
-{% endif %}
 
-{% if message %}
-<p class="card"><strong>{{ message }}</strong></p>
-{% endif %}
+<div>
+  <form method="get" action="/optout" style="display:inline">
+    <button type="submit">Check status</button>
+  </form>
+  {% if status.opted_out %}
+  <form method="post" action="/optout/opt-in" style="display:inline">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit">Opt back in</button>
+  </form>
+  {% else %}
+  <form method="post" action="/optout/opt-out" style="display:inline">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit">Opt out &amp; delete</button>
+  </form>
+  {% endif %}
+  <form method="post" action="/optout/signout" style="display:inline">
+    <button type="submit">Sign out</button>
+  </form>
+</div>
+<p class="muted">
+  Opting out stops mirroring your activity and asks remote servers to delete
+  what was already federated; opting back in bridges future activity again
+  (previously deleted posts stay deleted).
+</p>
 
-<h3>Check status, opt out, or opt back in</h3>
+{% else %}
+<h3>Sign in to check status, opt out, or opt back in</h3>
 <form method="post" action="/optout">
   <p>
     <label>Handle or DID<br>
@@ -56,14 +80,13 @@
   </p>
   <p class="muted">
     You'll be redirected to <strong>your own AT Protocol server</strong> to
-    sign in (OAuth). No password ever touches this relay, and nothing is
-    stored — we only verify that you control the account, then perform the
-    action you chose.
+    sign in (OAuth). No password ever touches this relay — we only verify
+    that you control the account, then keep a short-lived signed-in session
+    so you can manage bridging for it.
   </p>
   <p>
-    <button type="submit" name="action" value="status">Check status</button>
-    <button type="submit" name="action" value="opt-out">Opt out &amp; delete</button>
-    <button type="submit" name="action" value="opt-in">Opt back in</button>
+    <button type="submit">Sign in</button>
   </p>
 </form>
+{% endif %}
 {% endblock %}

@@ -68,7 +68,7 @@ def oauth_env(settings, monkeypatch):
 
 
 def test_full_flow_roundtrip(oauth_env, settings):
-    flow = oauth.start_flow("alice.example.com", "opt-out")
+    flow = oauth.start_flow("alice.example.com")
     assert flow is not None
     assert flow.authorize_url.startswith(f"{ISSUER}/authorize?")
     query = {k: v[0] for k, v in parse_qs(urlsplit(flow.authorize_url).query).items()}
@@ -77,7 +77,7 @@ def test_full_flow_roundtrip(oauth_env, settings):
 
     result = oauth.finish_flow(flow.state, "code123", ISSUER)
     assert result is not None
-    assert (result.did, result.handle, result.action) == (DID, "alice.example.com", "opt-out")
+    assert (result.did, result.handle) == (DID, "alice.example.com")
     # the code exchange carried the PKCE verifier + our client_id
     assert oauth_env["token_data"]["code"] == "code123"
     assert oauth_env["token_data"]["client_id"] == query["client_id"]
@@ -85,14 +85,14 @@ def test_full_flow_roundtrip(oauth_env, settings):
 
 
 def test_flow_state_is_single_use(oauth_env):
-    flow = oauth.start_flow("alice.example.com", "opt-out")
+    flow = oauth.start_flow("alice.example.com")
     assert flow is not None
     assert oauth.finish_flow(flow.state, "c", ISSUER) is not None
     assert oauth.finish_flow(flow.state, "c", ISSUER) is None  # replay rejected
 
 
 def test_issuer_mismatch_rejected(oauth_env):
-    flow = oauth.start_flow("alice.example.com", "opt-out")
+    flow = oauth.start_flow("alice.example.com")
     assert flow is not None
     assert oauth.finish_flow(flow.state, "c", "https://evil.example.com") is None
     # the flow is consumed even on failure
@@ -100,7 +100,7 @@ def test_issuer_mismatch_rejected(oauth_env):
 
 
 def test_token_sub_must_match_started_did(oauth_env):
-    flow = oauth.start_flow("alice.example.com", "opt-out")
+    flow = oauth.start_flow("alice.example.com")
     assert flow is not None
     oauth_env["sub"] = "did:plc:someoneelse000000000000"
     assert oauth.finish_flow(flow.state, "c", ISSUER) is None

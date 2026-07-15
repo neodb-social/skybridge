@@ -204,7 +204,6 @@ def resolve_auth_server(pds: str) -> AuthServer | None:
 class PendingFlow:
     did: str
     handle: str
-    action: str
     issuer: str
     token_endpoint: str
     code_verifier: str
@@ -244,10 +243,9 @@ class FlowStart:
 class FlowResult:
     did: str
     handle: str
-    action: str
 
 
-def start_flow(identifier: str, action: str) -> FlowStart | None:
+def start_flow(identifier: str) -> FlowStart | None:
     """Resolve the identifier, push the authorization request, and return the
     URL to send the user to. ``None`` on any failure."""
     ident = identifier.strip().lstrip("@")
@@ -300,7 +298,6 @@ def start_flow(identifier: str, action: str) -> FlowStart | None:
         PendingFlow(
             did=did,
             handle=ident,
-            action=action,
             issuer=server.issuer,
             token_endpoint=server.token_endpoint,
             code_verifier=code_verifier,
@@ -348,4 +345,4 @@ def finish_flow(state: str, code: str, iss: str | None) -> FlowResult | None:
     if sub != flow.did:
         log.warning("token sub %r does not match started DID %r", sub, flow.did)
         return None
-    return FlowResult(did=flow.did, handle=flow.handle, action=flow.action)
+    return FlowResult(did=flow.did, handle=flow.handle)
