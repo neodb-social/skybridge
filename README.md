@@ -141,8 +141,10 @@ SKYBRIDGE_DOMAIN=bridge.example.social uv run python -m skybridge serve --port 8
 SKYBRIDGE_DOMAIN=bridge.example.social uv run python -m skybridge ingest
 
 # Seed from a single DID's existing popfeed records (--days N to only replay
-# recent ones, --limit to cap the fetch). Signed-in users can trigger the same
-# thing from /optout via the "Import recent activity" button.
+# recent ones, --limit to cap the fetch; default SKYBRIDGE_BACKFILL_LIMIT).
+# Signed-in users can trigger the same thing from /optout via the "Import
+# recent activity" button. Avoid running with --deliver while users may be
+# opting out live: opt-out can only cancel imports inside the server process.
 uv run python -m skybridge backfill did:plc:i6k6scfcdaup4e2va33nkprb
 
 # Replay a captured JSONL fixture through the full pipeline (offline).
@@ -188,7 +190,9 @@ Every push to `main` runs the checks and publishes multi-arch
   cookie. "Import recent activity" backfills the account's existing records
   (capped at `SKYBRIDGE_BACKFILL_LIMIT`, re-publishing only the last
   `SKYBRIDGE_BACKFILL_DAYS` days) in the background, one import per account
-  at a time, disabled while opted out
+  at a time, disabled while opted out. Known limit: content re-imported
+  after an opt-out -> opt-in round trip is re-published under its original
+  object ids, which peers that cache tombstones may reject
 
 ## Development
 

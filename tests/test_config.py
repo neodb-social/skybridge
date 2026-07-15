@@ -79,3 +79,26 @@ def test_init_db_fails_loudly_on_readonly_database(tmp_path, monkeypatch):
         os.chmod(db_file.parent, 0o755)
         os.chmod(db_file, 0o644)
         set_settings(None)
+
+
+def test_backfill_env_settings(monkeypatch):
+    monkeypatch.setenv("SKYBRIDGE_BACKFILL_LIMIT", "250")
+    monkeypatch.setenv("SKYBRIDGE_BACKFILL_DAYS", "0")
+    s = _from_env()
+    assert s.backfill_limit == 250
+    assert s.backfill_days == 0  # 0 = narrowest window, valid
+
+
+def test_backfill_env_validation_fails_loudly(monkeypatch):
+    import pytest
+
+    monkeypatch.setenv("SKYBRIDGE_BACKFILL_LIMIT", "1k")
+    with pytest.raises(ValueError, match="SKYBRIDGE_BACKFILL_LIMIT"):
+        _from_env()
+    monkeypatch.setenv("SKYBRIDGE_BACKFILL_LIMIT", "0")
+    with pytest.raises(ValueError, match="SKYBRIDGE_BACKFILL_LIMIT"):
+        _from_env()
+    monkeypatch.setenv("SKYBRIDGE_BACKFILL_LIMIT", "1000")
+    monkeypatch.setenv("SKYBRIDGE_BACKFILL_DAYS", "-1")
+    with pytest.raises(ValueError, match="SKYBRIDGE_BACKFILL_DAYS"):
+        _from_env()

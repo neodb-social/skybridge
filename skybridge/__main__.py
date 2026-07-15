@@ -130,10 +130,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_backfill = sub.add_parser("backfill", help="seed from a DID's existing records")
     p_backfill.add_argument("did")
     p_backfill.add_argument(
-        "--limit", type=int, default=1000, help="max records fetched (total across collections)"
+        "--limit",
+        type=int,
+        default=None,
+        help="max records fetched, total across collections (default: SKYBRIDGE_BACKFILL_LIMIT)",
     )
     p_backfill.add_argument(
-        "--days", type=int, default=None, help="only replay records created in the last N days"
+        "--days",
+        type=int,
+        default=None,
+        help="only replay records written in the last N days (default: no window; "
+        "SKYBRIDGE_BACKFILL_DAYS applies to the web import only)",
     )
     p_backfill.add_argument("--deliver", action="store_true")
     p_backfill.set_defaults(func=_cmd_backfill)

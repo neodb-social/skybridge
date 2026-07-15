@@ -74,6 +74,9 @@ async def opt_out(did: str, *, worker: DeliveryWorker | None = None) -> int:
     # delivery could otherwise enqueue a Create AFTER the purge's Delete for
     # the same record, leaving the opted-out content live on remote peers.
     # (Late import: backfill imports this module for its opt-out guard.)
+    # This guards IN-PROCESS imports only — a `backfill --deliver` running
+    # in a separate process delivers through its own queue and can still
+    # race the purge; don't run one concurrently with live opt-outs.
     from skybridge.atproto import backfill
 
     await backfill.cancel_import(did)
