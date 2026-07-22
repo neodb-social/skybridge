@@ -89,6 +89,38 @@ def test_review_facets_render_as_links(settings):
     assert '<a href="https://www.ign.com/videos/superman"' in note["content"]
 
 
+def test_review_facet_with_unsafe_scheme_is_not_linked(settings):
+    record = {
+        **REVIEW,
+        "text": "watch this click me now",
+        "facets": [
+            {
+                "index": {"byteStart": 11, "byteEnd": 19},
+                "features": [
+                    {
+                        "$type": "app.bsky.richtext.facet#link",
+                        "uri": "javascript:alert(1)",
+                    }
+                ],
+            }
+        ],
+    }
+    ref = works.work_ref(record)
+    note, _ = neodb.translate(
+        did="did:plc:abc",
+        handle="alice.test",
+        collection="social.popfeed.feed.review",
+        rkey="rv10",
+        record=record,
+        operation="create",
+        time_us=None,
+        ref=ref,
+    )
+    assert note is not None
+    assert "javascript:" not in note["content"]
+    assert "click me" in note["content"]
+
+
 def test_list_becomes_shelf(settings):
     note, _activity = neodb.translate(
         did="did:plc:abc",
