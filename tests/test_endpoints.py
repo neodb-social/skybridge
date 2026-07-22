@@ -267,6 +267,73 @@ def test_work_html_page_with_poster_and_opengraph(client, settings):
     assert "https://www.imdb.com/title/tt6710474" in page
 
 
+def _a_published_review() -> tuple[str, str]:
+    with session_scope() as session:
+        rec = session.scalar(
+            select(Record).where(
+                Record.collection == "social.popfeed.feed.review",
+                Record.ap_object_json.isnot(None),
+            )
+        )
+        assert rec is not None
+        actor = session.get(BridgedActor, rec.did)
+        assert actor is not None
+        return actor.handle, rec.rkey
+
+
+def test_post_html_page_with_opengraph(client, settings):
+    handle, rkey = _a_published_review()
+    doc = client.get(f"/users/{handle}/posts/{rkey}", headers=AP).json()
+    r = client.get(f"/users/{handle}/posts/{rkey}")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/html")
+    page = r.text
+    assert handle in page
+    # the translator's lead-in line is embedded as HTML, not escaped
+    assert "Rated " in page or "Reviewed " in page
+    post_url = settings.post_id(handle, rkey)
+    assert f'<meta property="og:url" content="{post_url}" />' in page
+    # the work tag surfaces as a poster card linking to our catalog page
+    work_tag = next(t for t in doc["tag"] if "href" in t)
+    assert work_tag["href"] in page
+    if work_tag.get("image"):
+        assert f'<meta property="og:image" content="{work_tag["image"]}" />' in page
+
+
+def test_post_json_accept_variants_still_get_ap(client):
+    handle, rkey = _a_published_review()
+    for accept in ("application/activity+json", "application/ld+json", "application/json"):
+        r = client.get(f"/users/{handle}/posts/{rkey}", headers={"accept": accept})
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("application/activity+json")
+        assert r.json()["type"] == "Note"
+
+
+def test_deleted_post_html_page_is_410(client):
+    handle, rkey = _a_published_review()
+    with session_scope() as session:
+        rec = session.scalar(select(Record).where(Record.rkey == rkey))
+        assert rec is not None
+        did, collection = rec.did, rec.collection
+    event = {
+        "did": did,
+        "kind": "commit",
+        "commit": {"operation": "delete", "collection": collection, "rkey": rkey},
+    }
+    asyncio.run(process_event(event, allow_network=False))
+    r = client.get(f"/users/{handle}/posts/{rkey}")
+    assert r.status_code == 410
+    assert r.headers["content-type"].startswith("text/html")
+    assert "deleted" in r.text
+
+
+def test_unknown_post_html_page_is_404(client):
+    handle = _a_bridged_handle()
+    r = client.get(f"/users/{handle}/posts/nope")
+    assert r.status_code == 404
+    assert r.headers["content-type"].startswith("text/html")
+
+
 def test_dashboard_shows_jetstream_endpoint_only_when_ingesting(client, settings):
     # no ingest task (or a finished one) -> not shown
     assert settings.jetstream_url not in client.get("/").text

@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -82,7 +83,7 @@ app = FastAPI(title="Skybridge", lifespan=lifespan)
 # --------------------------------------------------------------------------- #
 def _wants_ap(request: Request) -> bool:
     accept = request.headers.get("accept", "")
-    return "activity+json" in accept or "ld+json" in accept
+    return "activity+json" in accept or "ld+json" in accept or "application/json" in accept
 
 
 def ap_response(doc: dict[str, Any], status: int = 200) -> Response:
@@ -237,18 +238,63 @@ async def user_outbox(ident: str) -> Response:
     )
 
 
+def _post_page_ctx(obj: dict[str, Any], ident: str) -> dict[str, Any]:
+    """Template context for the human-readable view of a Note."""
+    handle = _handle_of(ident) if ident.startswith("did:") else ident
+    work: dict[str, Any] | None = None
+    hashtags: list[str] = []
+    for tag in obj.get("tag") or []:
+        if tag.get("type") == "Hashtag":
+            hashtags.append(tag.get("name", ""))
+        elif tag.get("href") and work is None:
+            work = {
+                "name": tag.get("name"),
+                "href": tag["href"],
+                "image": tag.get("image"),
+                "type": tag.get("type"),
+            }
+    if obj.get("sensitive"):
+        description = obj.get("summary") or "Sensitive content"
+    else:
+        text = re.sub(r"<[^>]+>", " ", obj.get("content", ""))
+        description = " ".join(text.split())[:200]
+    return {
+        "og_title": obj.get("name") or f"Post by @{handle}",
+        "title": obj.get("name"),
+        "handle": handle,
+        "author_url": get_settings().actor_id(handle),
+        "content": obj.get("content", ""),
+        "sensitive": bool(obj.get("sensitive")),
+        "summary": obj.get("summary"),
+        "published": obj.get("published") or "",
+        "updated": obj.get("updated"),
+        "hashtags": hashtags,
+        "work": work,
+        "url": obj["id"],
+        "description": description,
+        "settings": get_settings(),
+    }
+
+
 @app.get("/users/{ident}/posts/{rkey}")
-async def get_post(ident: str, rkey: str) -> Response:
+async def get_post(ident: str, rkey: str, request: Request) -> Response:
     obj = objects.get_post_object(ident, rkey)
+    wants_ap = _wants_ap(request)
     if obj is None:
-        return JSONResponse({"error": "not found"}, status_code=404)
-    status = 410 if obj.get("type") == "Tombstone" else 200
-    return ap_response(obj, status=status)
+        if wants_ap:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return HTMLResponse("<h1>404</h1><p>No such post.</p>", status_code=404)
+    if wants_ap:
+        status = 410 if obj.get("type") == "Tombstone" else 200
+        return ap_response(obj, status=status)
+    if obj.get("type") == "Tombstone":
+        return HTMLResponse("<h1>410</h1><p>This post was deleted.</p>", status_code=410)
+    return _TEMPLATES.TemplateResponse(request, "post.html", _post_page_ctx(obj, ident))
 
 
 @app.get("/objects/{ident}/{rkey}")
-async def get_object(ident: str, rkey: str) -> Response:
-    return await get_post(ident, rkey)
+async def get_object(ident: str, rkey: str, request: Request) -> Response:
+    return await get_post(ident, rkey, request)
 
 
 @app.get("/catalog/{work_type}/{work_id}")

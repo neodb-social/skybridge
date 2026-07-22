@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}{{ og_title }} · Skybridge{% endblock %}
+{% block head %}
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="Skybridge" />
+<meta property="og:title" content="{{ og_title }}" />
+<meta property="og:description" content="{{ description }}" />
+<meta property="og:url" content="{{ url }}" />
+{% if work and work.image %}
+<meta property="og:image" content="{{ work.image }}" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:image" content="{{ work.image }}" />
+{% endif %}
+{% endblock %}
+{% block content %}
+<div class="hero">
+  {% if work %}
+  {% if work.image %}
+  <a href="{{ work.href }}"><img class="poster" src="{{ work.image }}" alt="Cover of {{ work.name }}" /></a>
+  {% else %}
+  <div class="poster-fallback" aria-hidden="true">{{ work.type }}</div>
+  {% endif %}
+  {% endif %}
+  <div>
+    <p>
+      <a href="{{ author_url }}"><strong>{{ handle }}</strong></a>
+      <span class="muted">· @{{ handle }}@{{ settings.domain }}</span>
+    </p>
+    {% if title %}<h2>{{ title }}</h2>{% endif %}
+    {# content is server-generated HTML: all user text is escaped by the
+       translator (render_facets / _title_html), so it is safe to embed. #}
+    {% if sensitive %}
+    <details>
+      <summary>{{ summary or "Sensitive content" }}</summary>
+      {{ content | safe }}
+    </details>
+    {% else %}
+    {{ content | safe }}
+    {% endif %}
+    {% if hashtags %}
+    <p>{% for t in hashtags %}<span class="pill">{{ t }}</span> {% endfor %}</p>
+    {% endif %}
+    <p class="muted">
+      Published {{ published[:10] }}{% if updated %} · updated {{ updated[:10] }}{% endif %}
+      · bridged from Atmosphere
+    </p>
+  </div>
+</div>
+<p class="muted">ActivityPub object: <code>{{ url }}</code></p>
+{% endblock %}
