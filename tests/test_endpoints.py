@@ -9,6 +9,7 @@ fixture replay.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from fastapi.testclient import TestClient
@@ -325,6 +326,22 @@ def test_deleted_post_html_page_is_410(client):
     assert r.status_code == 410
     assert r.headers["content-type"].startswith("text/html")
     assert "deleted" in r.text
+
+
+def test_post_html_page_scrubs_unsafe_hrefs_in_stored_content(client):
+    # Records translated before render_facets validated link schemes may
+    # still carry e.g. javascript: hrefs; the web view must not emit them.
+    handle, rkey = _a_published_review()
+    with session_scope() as session:
+        rec = session.scalar(select(Record).where(Record.rkey == rkey))
+        assert rec is not None
+        assert rec.ap_object_json is not None
+        obj = json.loads(rec.ap_object_json)
+        obj["content"] += '<p><a href="javascript:alert(1)" rel="nofollow">click</a></p>'
+        rec.ap_object_json = json.dumps(obj)
+    page = client.get(f"/users/{handle}/posts/{rkey}").text
+    assert "javascript:" not in page
+    assert ">click</a>" in page
 
 
 def test_unknown_post_html_page_is_404(client):

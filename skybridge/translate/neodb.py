@@ -156,7 +156,10 @@ def render_facets(text: str, facets: list[dict] | None) -> str:
             ),
             None,
         )
-        if link:
+        # Facet URIs are author-controlled: only http(s) may become a live
+        # link, or a javascript: URI would execute wherever the content HTML
+        # is embedded (our post page, AP peers).
+        if link and link.startswith(("http://", "https://")):
             out.append(
                 f'<a href="{html.escape(link)}" rel="nofollow noopener">'
                 f"{html.escape(slice_text)}</a>"

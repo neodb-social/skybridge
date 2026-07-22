@@ -238,6 +238,13 @@ async def user_outbox(ident: str) -> Response:
     )
 
 
+# Records stored before render_facets validated link schemes may carry unsafe
+# hrefs (e.g. javascript:). The translator double-quotes attributes and
+# html.escape()s all user text, so attribute matching by regex is reliable on
+# this generated HTML.
+_UNSAFE_HREF = re.compile(r'\bhref="(?!https?://)[^"]*"')
+
+
 def _post_page_ctx(obj: dict[str, Any], ident: str) -> dict[str, Any]:
     """Template context for the human-readable view of a Note."""
     handle = _handle_of(ident) if ident.startswith("did:") else ident
@@ -253,17 +260,18 @@ def _post_page_ctx(obj: dict[str, Any], ident: str) -> dict[str, Any]:
                 "image": tag.get("image"),
                 "type": tag.get("type"),
             }
+    content = _UNSAFE_HREF.sub("", obj.get("content", ""))
     if obj.get("sensitive"):
         description = obj.get("summary") or "Sensitive content"
     else:
-        text = re.sub(r"<[^>]+>", " ", obj.get("content", ""))
+        text = re.sub(r"<[^>]+>", " ", content)
         description = " ".join(text.split())[:200]
     return {
         "og_title": obj.get("name") or f"Post by @{handle}",
         "title": obj.get("name"),
         "handle": handle,
         "author_url": get_settings().actor_id(handle),
-        "content": obj.get("content", ""),
+        "content": content,
         "sensitive": bool(obj.get("sensitive")),
         "summary": obj.get("summary"),
         "published": obj.get("published") or "",
