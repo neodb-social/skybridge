@@ -153,11 +153,15 @@ async def process_event(
     record = commit.get("record") or {}
     ref = works.mint(record)
 
-    if ref is not None and ref.work_type == works.EPISODE_TYPE:
+    is_episode_work = ref is not None and ref.work_type == works.EPISODE_TYPE
+    is_unresolved_episode = ref is None and record.get("creativeWorkType") == works.EPISODE_TYPE
+    if is_episode_work or is_unresolved_episode:
         # NeoDB doesn't federate episode-level marks. Episode listItems are
         # bridged as season activity (works.season_view) and never reach this
         # branch; whatever still resolves to a tv_episode work (reviews, or an
-        # episode that can't name its season) is archived without AP emission.
+        # episode that can't name its season) is archived without AP emission
+        # — including episode records whose identifiers can't mint a work at
+        # all, which would otherwise fall through and publish a generic Note.
         # A Note this record already published (legacy pre-cutoff state, or a
         # record updated into an episode) is retracted: the Delete — targeting
         # the stored Note id — is persisted in ap_activity_json BEFORE the
@@ -187,7 +191,7 @@ async def process_event(
             note=None,
             activity=retraction,
             operation=operation,
-            work_key=ref.work_key,
+            work_key=ref.work_key if ref is not None else None,
             # No new retraction: keep any pending (not yet delivered) one
             # from an earlier event rather than wiping it.
             preserve_ap=retraction is None,

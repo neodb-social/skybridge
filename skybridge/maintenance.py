@@ -5,19 +5,25 @@ Positional identifier keys (``episodeNumber``/``seasonNumber``/
 (and seasons) were merged into whichever work registered the number first —
 and the mis-mapped Notes were federated. :func:`repair` cleans that up:
 
-1. **Retract** — broadcast a ``Delete`` for every still-published Note whose
-   record resolves to a ``tv_episode`` work (NeoDB doesn't federate
-   episode-level marks, and the pipeline no longer emits them) — except
-   listItems the rebuild will convert to a season, whose Note is instead
-   Updated in place (step 3) under its existing object id. The Delete is
-   persisted in the row's ``ap_activity_json`` *before* it is enqueued, so a
-   crash or failed delivery leaves a discoverable pending retraction — an
-   unpublished row carrying a Delete — which every later run re-broadcasts.
+1. **Re-send pending retractions** — Deletes persisted by an earlier run
+   (or the pipeline's episode cutoff) whose delivery can't be confirmed are
+   re-broadcast; peers treat duplicates as no-ops.
 2. **Rebuild** — wipe ``work`` / ``work_identifier`` and re-mint every
    archived review/listItem source through the fixed logic, re-pointing each
    record's ``work_key``. Episode listItems come back as season works
    (works.season_view).
-3. **Re-sync** — statelessly: re-derive every active (author, work) pair
+3. **Retract** — broadcast a ``Delete`` for every still-published Note that
+   remains bound to episode-level content after the rebuild (NeoDB doesn't
+   federate episode-level marks, and the pipeline no longer emits them), and
+   for every extra published Note beyond the one anchor a pair keeps (e.g.
+   several watched-episode Notes that collapsed into one season). Each
+   Delete is persisted in the row's ``ap_activity_json`` *before* it is
+   enqueued, so a crash or failed delivery leaves a discoverable pending
+   retraction — an unpublished row carrying a Delete — for step 1 of every
+   later run. listItems converted to seasons keep their Note: step 4 Updates
+   it in place under its existing object id (a Delete + Create of the same
+   id would hit peers' tombstone caches).
+4. **Re-sync** — statelessly: re-derive every active (author, work) pair
    Note and broadcast wherever the derivation differs from what is stored —
    an Update for a Note that referenced the wrong work or carried a moved
    partner's status, a Create for a pair whose Note ended up on a different
@@ -49,6 +55,7 @@ from skybridge.pipeline import (
     _REVIEW_COLLECTION,
     _derive_pair,
     _item_status,
+    _pair_rows,
     _update_ap,
 )
 from skybridge.translate import neodb, works
@@ -77,19 +84,112 @@ def _handle_for(did: str) -> str | None:
         return actor.handle if actor is not None else None
 
 
-async def _retract_episode_notes(
-    worker: DeliveryWorker | None, report: RepairReport, *, dry_run: bool
+def _source_dict(source_json: str | None) -> dict | None:
+    with contextlib.suppress(TypeError, ValueError):
+        source = json.loads(source_json or "{}")
+        if isinstance(source, dict):
+            return source
+    return None
+
+
+def _contributes_row(collection: str, source_json: str | None) -> bool:
+    """Same contribution test as _pair_rows, on raw row columns."""
+    if collection == _REVIEW_COLLECTION:
+        return True
+    source = _source_dict(source_json)
+    return source is not None and _item_status(source) is not None
+
+
+def _is_episode_source(source_json: str | None) -> bool:
+    source = _source_dict(source_json)
+    return source is not None and source.get("creativeWorkType") == works.EPISODE_TYPE
+
+
+async def _preview_retractions(report: RepairReport) -> None:
+    """Dry-run approximation of what the mutating run would retract.
+
+    Runs pre-rebuild, so convertible episode listItems (which the rebuild
+    turns into season works whose Notes are Updated in place, never Deleted)
+    are excluded by inspecting their source; duplicate-holder retractions
+    can't be previewed without the rebuild and are not listed.
+    """
+    with session_scope() as session:
+        rows = session.execute(
+            select(Record.at_uri, Record.collection, Record.work_key, Record.source_json).where(
+                Record.collection.in_(_PAIRED_COLLECTIONS),
+                Record.ap_object_json.is_not(None),
+                Record.deleted_at.is_(None),
+            )
+        ).all()
+    for at_uri, collection, work_key, source_json in rows:
+        episode_bound = works.is_episode_key(work_key) or (
+            work_key is None and _is_episode_source(source_json)
+        )
+        if not episode_bound:
+            continue
+        if collection == _LIST_ITEM_COLLECTION:
+            source = _source_dict(source_json)
+            if source is not None and works.season_view(source) is not None:
+                continue
+        report.would_retract.append((at_uri, work_key))
+        report.retracted += 1
+
+
+async def _retract(
+    worker: DeliveryWorker | None,
+    report: RepairReport,
+    *,
+    at_uri: str,
+    did: str,
+    collection: str,
+    rkey: str,
+    ap_object_json: str | None,
 ) -> None:
-    """Delete every published episode Note from peers and clear its AP forms.
+    """Retract one published Note: persist the pending Delete, then enqueue.
 
     The Tombstone targets the *stored* Note id — not one recomputed from the
     current handle — so the Delete names exactly the object peers received.
+    Persisting the pending retraction (unpublished row carrying the Delete)
+    BEFORE enqueueing means a crash or failed delivery leaves durable state
+    that _resend_pending_retractions rediscovers, instead of a Note stranded
+    on peers with nothing left to find it by.
+    """
+    note_id = None
+    with contextlib.suppress(TypeError, ValueError):
+        note_id = (json.loads(ap_object_json or "") or {}).get("id")
+    handle = _handle_for(did)
+    activity = None
+    if note_id and handle:
+        _, activity = neodb.translate(
+            did=did,
+            handle=handle,
+            collection=collection,
+            rkey=rkey,
+            record=None,
+            operation="delete",
+            time_us=None,
+            prior_object_id=note_id,
+        )
+    with session_scope() as session:
+        row = session.get(Record, at_uri)
+        if row is not None:
+            row.ap_object_json = None
+            row.ap_activity_json = json.dumps(activity) if activity is not None else None
+            row.updated_at = utcnow()
+    report.retracted += 1
+    if worker is not None and activity is not None:
+        report.deliveries += await fanout(worker, record_uri=at_uri, did=did, activity=activity)
 
-    Published episode listItems that can convert to a season are NOT
-    retracted: the rebuild moves them to the season work and _resync_pairs
-    Updates their Note in place under the same object id. Deleting first and
-    re-Creating that id would hit peers' tombstone caches and the corrected
-    season Note might never federate.
+
+async def _retract_episode_notes(worker: DeliveryWorker | None, report: RepairReport) -> None:
+    """Delete every published Note still bound to episode-level content.
+
+    Runs after the rebuild, so listItems converted to season works are
+    already off the tv_episode keys and keep their Note (to be Updated in
+    place — a Delete + Create of the same rkey-derived object id would hit
+    peers' tombstone caches). Also covers episode records whose identifiers
+    couldn't mint any work (work_key NULL) but that published a generic Note
+    before the episode cutoff existed.
     """
     with session_scope() as session:
         rows = session.execute(
@@ -100,54 +200,91 @@ async def _retract_episode_notes(
                 Record.rkey,
                 Record.work_key,
                 Record.source_json,
-                Record.ap_object_json,
             ).where(
-                Record.work_key.like(f"{works.EPISODE_TYPE}:%"),
+                Record.collection.in_(_PAIRED_COLLECTIONS),
                 Record.ap_object_json.is_not(None),
                 Record.deleted_at.is_(None),
             )
         ).all()
-
-    for at_uri, did, collection, rkey, work_key, source_json, ap_object_json in rows:
-        if collection == _LIST_ITEM_COLLECTION:
-            source = None
-            with contextlib.suppress(TypeError, ValueError):
-                source = json.loads(source_json or "{}")
-            if isinstance(source, dict) and works.season_view(source) is not None:
-                continue
-        if dry_run:
-            report.would_retract.append((at_uri, work_key))
-            report.retracted += 1
+    for at_uri, did, collection, rkey, work_key, source_json in rows:
+        episode_bound = works.is_episode_key(work_key) or (
+            work_key is None and _is_episode_source(source_json)
+        )
+        if not episode_bound:
             continue
-        note_id = None
-        with contextlib.suppress(TypeError, ValueError):
-            note_id = (json.loads(ap_object_json) or {}).get("id")
-        handle = _handle_for(did)
-        activity = None
-        if note_id and handle:
-            _, activity = neodb.translate(
-                did=did,
-                handle=handle,
-                collection=collection,
-                rkey=rkey,
-                record=None,
-                operation="delete",
-                time_us=None,
-                prior_object_id=note_id,
-            )
-        # Persist the pending retraction (unpublished row carrying the
-        # Delete) BEFORE enqueueing it: a crash or failed delivery leaves
-        # durable state that _resend_pending_retractions rediscovers, instead
-        # of a Note stranded on peers with nothing left to find it by.
         with session_scope() as session:
             row = session.get(Record, at_uri)
-            if row is not None:
-                row.ap_object_json = None
-                row.ap_activity_json = json.dumps(activity) if activity is not None else None
-                row.updated_at = utcnow()
-        report.retracted += 1
-        if worker is not None and activity is not None:
-            report.deliveries += await fanout(worker, record_uri=at_uri, did=did, activity=activity)
+            ap_object_json = row.ap_object_json if row is not None else None
+        await _retract(
+            worker,
+            report,
+            at_uri=at_uri,
+            did=did,
+            collection=collection,
+            rkey=rkey,
+            ap_object_json=ap_object_json,
+        )
+
+
+async def _retract_duplicate_holders(worker: DeliveryWorker | None, report: RepairReport) -> None:
+    """Keep at most one published Note per (author, work) pair.
+
+    Legacy episode Notes that collapsed into one season during the rebuild
+    (one per watched episode) all stay published, but a pair has a single
+    anchor — the others would keep their stale content federated forever.
+    The row _pair_rows selects as holder keeps its Note (which _resync_pairs
+    then corrects in place); every other published *contributing* row is
+    Deleted. Published status-less membership rows hold standalone Notes by
+    design and are left alone.
+    """
+    with session_scope() as session:
+        pairs = session.execute(
+            select(Record.did, Record.work_key)
+            .where(
+                Record.collection.in_(_PAIRED_COLLECTIONS),
+                Record.work_key.is_not(None),
+                Record.ap_object_json.is_not(None),
+                Record.deleted_at.is_(None),
+            )
+            .distinct()
+            .order_by(Record.did.asc(), Record.work_key.asc())
+        ).all()
+
+    for did, work_key in pairs:
+        if works.is_episode_key(work_key):
+            continue  # episode-keyed rows are retracted wholesale above
+        with session_scope() as session:
+            rows = session.execute(
+                select(Record.at_uri, Record.collection, Record.rkey, Record.source_json)
+                .where(
+                    Record.did == did,
+                    Record.work_key == work_key,
+                    Record.collection.in_(_PAIRED_COLLECTIONS),
+                    Record.ap_object_json.is_not(None),
+                    Record.deleted_at.is_(None),
+                )
+                .order_by(Record.created_at.asc(), Record.at_uri.asc())
+            ).all()
+        contributing = [r for r in rows if _contributes_row(r[1], r[3])]
+        if len(contributing) <= 1:
+            continue
+        _, _, holder = _pair_rows(did, work_key)
+        keep = holder.at_uri if holder is not None else contributing[-1][0]
+        for at_uri, collection, rkey, _source_json in contributing:
+            if at_uri == keep:
+                continue
+            with session_scope() as session:
+                row = session.get(Record, at_uri)
+                ap_object_json = row.ap_object_json if row is not None else None
+            await _retract(
+                worker,
+                report,
+                at_uri=at_uri,
+                did=did,
+                collection=collection,
+                rkey=rkey,
+                ap_object_json=ap_object_json,
+            )
 
 
 def _rebuild_works(report: RepairReport) -> list[tuple[str, str, str | None, str | None]]:
@@ -222,19 +359,10 @@ def _pair_trigger(did: str, work_key: str) -> str | None:
             .order_by(Record.created_at.asc(), Record.at_uri.asc())
         ).all()
 
-    def contributes(collection: str, source_json: str | None) -> bool:
-        if collection == _REVIEW_COLLECTION:
-            return True
-        try:
-            source = json.loads(source_json or "{}")
-        except ValueError:
-            return False
-        return isinstance(source, dict) and _item_status(source) is not None
-
     candidates = [
         (at_uri, ap)
         for at_uri, collection, source_json, ap in rows
-        if contributes(collection, source_json)
+        if _contributes_row(collection, source_json)
     ]
     for at_uri, ap_object_json in candidates:
         if ap_object_json is not None:
@@ -355,14 +483,17 @@ async def repair(worker: DeliveryWorker | None = None, *, dry_run: bool = False)
     broadcasting — is for tests only; the CLI always passes a worker.
     """
     report = RepairReport(dry_run=dry_run)
-    if not dry_run:
-        # Before fresh retractions, so a Delete persisted moments ago isn't
-        # immediately re-found as "pending" and sent twice in one run.
-        await _resend_pending_retractions(worker, report)
-    await _retract_episode_notes(worker, report, dry_run=dry_run)
     if dry_run:
+        await _preview_retractions(report)
         return report
+    # Pending first, so a Delete persisted later this run isn't immediately
+    # re-found as "pending" and sent twice; retractions after the rebuild, so
+    # listItems converted to seasons are already off the episode keys and
+    # keep their Note for the in-place Update.
+    await _resend_pending_retractions(worker, report)
     _rebuild_works(report)
+    await _retract_episode_notes(worker, report)
+    await _retract_duplicate_holders(worker, report)
     await _resync_pairs(worker, report)
     log.info(
         "repair: retracted=%d resent=%d works %d->%d remapped=%d resynced=%d deliveries=%d",

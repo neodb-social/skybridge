@@ -196,6 +196,27 @@ def test_episode_review_is_archived_without_ap(settings):
         assert row.ap_activity_json is None
 
 
+def test_unresolved_episode_review_is_not_published(settings):
+    # Positional-only identifiers can't mint a work (ref is None); the episode
+    # cutoff must still hold or the review falls through as a generic Note.
+    record = {
+        "$type": "social.popfeed.feed.review",
+        "title": "Some Episode",
+        "text": "",
+        "rating": 8,
+        "createdAt": "2026-07-23T01:00:00.000Z",
+        "creativeWorkType": "tv_episode",
+        "identifiers": {"episodeNumber": 4, "seasonNumber": 7, "tmdbTvSeriesId": "88401"},
+    }
+    result = _run(_ev("social.popfeed.feed.review", "ep9", record))
+    assert result is not None and result.activity == {}
+    with session_scope() as session:
+        row = session.get(Record, f"at://{DID}/social.popfeed.feed.review/ep9")
+        assert row is not None
+        assert row.work_key is None
+        assert row.ap_object_json is None and row.ap_activity_json is None
+
+
 def test_episode_review_update_retracts_previously_published_note(settings):
     _run(_ev("social.popfeed.feed.review", "ep1", EP_REVIEW))
     # Simulate a Note published before the cutoff (legacy state).
@@ -550,6 +571,89 @@ def test_repair_resends_pending_retraction_left_by_a_crash(settings):
         assert row is not None and row.ap_activity_json is not None
         # The payload survives for future reruns (delivery is best-effort).
         assert json.loads(row.ap_activity_json)["type"] == "Delete"
+
+
+def test_repair_collapses_duplicate_episode_notes_into_one_season_note(settings):
+    """Several published legacy episode Notes from one season collapse into a
+    single pair: exactly one Note survives (Updated in place to season
+    content), every other holder is Deleted — not left federated and stale."""
+    ep5_item = {
+        **EP_LIST_ITEM,
+        "title": "Dark Side of the Ring - S7E5 - The Dynamite Kid",
+        "identifiers": {**EP_IDENTIFIERS, "episodeNumber": 5, "tmdbId": "7377128"},
+    }
+    _run(_ev("social.popfeed.feed.listItem", "it1", EP_LIST_ITEM))
+    _run(_ev("social.popfeed.feed.listItem", "it2", ep5_item))
+    it1_uri = f"at://{DID}/social.popfeed.feed.listItem/it1"
+    it2_uri = f"at://{DID}/social.popfeed.feed.listItem/it2"
+    # Legacy pre-fix state: one Note per watched episode, each on its own
+    # episode work (the fixed pipeline folds it2 into it1's season Note).
+    with session_scope() as session:
+        r1 = session.get(Record, it1_uri)
+        r2 = session.get(Record, it2_uri)
+        assert r1 is not None and r2 is not None and r1.ap_object_json is not None
+        r1.work_key = "tv_episode:tmdbId-7377127"
+        r2.work_key = "tv_episode:tmdbId-7377128"
+        r2.ap_object_json = json.dumps({"id": "https://bridge.test/users/x/posts/it2"})
+        r2.ap_activity_json = "{}"
+        note_ids = {
+            it1_uri: json.loads(r1.ap_object_json)["id"],
+            it2_uri: "https://bridge.test/users/x/posts/it2",
+        }
+
+    report = asyncio.run(repair(None))
+    assert report.retracted == 1  # the non-anchor duplicate is Deleted...
+    assert report.resynced == 1  # ...and the surviving Note corrected in place
+
+    with session_scope() as session:
+        rows = []
+        for uri in (it1_uri, it2_uri):
+            row = session.get(Record, uri)
+            assert row is not None
+            assert row.work_key == "tv_season:tmdbId-88401-season-7"
+            rows.append(row)
+        published = [r for r in rows if r.ap_object_json is not None]
+        retracted = [r for r in rows if r.ap_object_json is None]
+        assert len(published) == 1 and len(retracted) == 1
+        assert published[0].ap_object_json is not None
+        note = json.loads(published[0].ap_object_json)
+        (tag,) = [t for t in note["tag"] if t["type"] != "Hashtag"]
+        assert tag["type"] == "TVSeason"
+        assert tag["href"].endswith("/catalog/tv_season/tmdbId-88401-season-7")
+        assert retracted[0].ap_activity_json is not None
+        delete = json.loads(retracted[0].ap_activity_json)
+        assert delete["type"] == "Delete"
+        assert delete["object"]["id"] == note_ids[retracted[0].at_uri]
+
+
+def test_repair_retracts_workless_episode_review_note(settings):
+    """A legacy generic Note published for an episode review that never
+    minted a work (work_key NULL) is still found and retracted."""
+    record = {
+        "$type": "social.popfeed.feed.review",
+        "title": "Some Episode",
+        "text": "",
+        "rating": 8,
+        "createdAt": "2026-07-23T01:00:00.000Z",
+        "creativeWorkType": "tv_episode",
+        "identifiers": {"episodeNumber": 4, "seasonNumber": 7, "tmdbTvSeriesId": "88401"},
+    }
+    _run(_ev("social.popfeed.feed.review", "ep9", record))
+    uri = f"at://{DID}/social.popfeed.feed.review/ep9"
+    note_id = "https://bridge.test/users/x/posts/ep9"
+    with session_scope() as session:
+        row = session.get(Record, uri)
+        assert row is not None and row.work_key is None
+        row.ap_object_json = json.dumps({"id": note_id})
+        row.ap_activity_json = "{}"
+
+    report = asyncio.run(repair(None))
+    assert report.retracted == 1
+    with session_scope() as session:
+        row = session.get(Record, uri)
+        assert row is not None and row.ap_object_json is None
+        assert row.ap_activity_json is not None
+        assert json.loads(row.ap_activity_json)["object"]["id"] == note_id
 
 
 def test_repair_resends_pending_retraction_on_tombstoned_row(settings):
