@@ -73,21 +73,38 @@ def _item_status(source: dict) -> str | None:
     return neodb.list_item_status(source)
 
 
-def _published_note_id(at_uri: str) -> str | None:
-    """The stored Note id of a still-published record, or ``None``.
+def _source_dict(source_json: str | None) -> dict | None:
+    try:
+        source = json.loads(source_json or "{}")
+    except (TypeError, ValueError):
+        return None
+    return source if isinstance(source, dict) else None
 
-    Reads the id peers actually received rather than recomputing it from the
-    current handle, so a retraction always names the right object.
+
+def _contributes_row(collection: str, source_json: str | None) -> bool:
+    """Same contribution test as _pair_rows, on raw row columns."""
+    if collection == _REVIEW_COLLECTION:
+        return True
+    source = _source_dict(source_json)
+    return source is not None and _item_status(source) is not None
+
+
+def _prior_state(at_uri: str) -> tuple[str | None, str | None]:
+    """(published Note id, work_key) of the record before this event.
+
+    The Note id is read from the stored AP object — the id peers actually
+    received — never recomputed from the current handle, so a retraction
+    always names the right object. Tombstoned rows yield (None, None): their
+    Note was already retracted on delete.
     """
     with session_scope() as session:
         row = session.get(Record, at_uri)
-        if row is None or row.deleted_at is not None or not row.ap_object_json:
-            return None
-        try:
-            note = json.loads(row.ap_object_json)
-        except ValueError:
-            return None
-    return note.get("id") if isinstance(note, dict) else None
+        if row is None or row.deleted_at is not None:
+            return None, None
+        work_key = row.work_key
+        ap_object_json = row.ap_object_json
+    note = _source_dict(ap_object_json) if ap_object_json else None
+    return (note.get("id") if note else None), work_key
 
 
 def _contributes(collection: str, record: dict) -> bool:
@@ -168,8 +185,8 @@ async def process_event(
         # fanout, so a crash or failed delivery leaves a discoverable pending
         # retraction (an unpublished row carrying a Delete) that the repair
         # command re-broadcasts, instead of a Note stranded on peers forever.
+        note_id, prior_key = _prior_state(at_uri)
         retraction = None
-        note_id = _published_note_id(at_uri)
         if note_id is not None:
             _, retraction = neodb.translate(
                 did=did,
@@ -181,6 +198,7 @@ async def process_event(
                 time_us=None,
                 prior_object_id=note_id,
             )
+        new_key = ref.work_key if ref is not None else None
         _persist(
             at_uri=at_uri,
             did=did,
@@ -191,7 +209,7 @@ async def process_event(
             note=None,
             activity=retraction,
             operation=operation,
-            work_key=ref.work_key if ref is not None else None,
+            work_key=new_key,
             # No new retraction: keep any pending (not yet delivered) one
             # from an earlier event rather than wiping it.
             preserve_ap=retraction is None,
@@ -199,6 +217,21 @@ async def process_event(
         delivered = 0
         if worker is not None and retraction is not None:
             delivered = await fanout(worker, record_uri=at_uri, did=did, activity=retraction)
+        if prior_key and prior_key != new_key and not works.is_episode_key(prior_key):
+            # The record left a non-episode pair (an update turned it into an
+            # episode): re-derive that pair so a surviving partner republishes
+            # under its own rkey (its anchor Note may just have been
+            # retracted) or drops this record's now-stale contribution.
+            trigger_uri = _pair_trigger(did, prior_key)
+            pair_activity = None
+            if trigger_uri is not None:
+                pair_activity = _sync_pair(
+                    did=did, work_key=prior_key, handle=handle, trigger_uri=trigger_uri
+                )
+            if worker is not None and pair_activity is not None:
+                delivered += await fanout(
+                    worker, record_uri=at_uri, did=did, activity=pair_activity
+                )
         return Processed(at_uri, operation, collection, retraction or {}, delivered)
 
     is_membership_only = ref is None or not _contributes(collection, record)
@@ -382,6 +415,39 @@ def _sync_pair(*, did: str, work_key: str, handle: str, trigger_uri: str) -> dic
         return None
     _update_ap(derived.anchor_uri, derived.note, derived.activity)
     return derived.activity
+
+
+def _pair_trigger(did: str, work_key: str) -> str | None:
+    """An active paired row of (author, work) to hand _sync_pair as trigger.
+
+    Prefers the row holding the published Note (the pair's anchor). When
+    nothing is published yet, only a *contributing* row qualifies — same test
+    as _pair_rows — since _sync_pair anchors a fresh Create on the trigger:
+    anchoring on a status-less list membership would tie the pair's Note to a
+    record whose later deletion must not retract it. ``None`` when the pair
+    has no contributing rows left.
+    """
+    with session_scope() as session:
+        rows = session.execute(
+            select(Record.at_uri, Record.collection, Record.source_json, Record.ap_object_json)
+            .where(
+                Record.did == did,
+                Record.work_key == work_key,
+                Record.collection.in_(_PAIRED_COLLECTIONS),
+                Record.deleted_at.is_(None),
+            )
+            .order_by(Record.created_at.asc(), Record.at_uri.asc())
+        ).all()
+
+    candidates = [
+        (at_uri, ap)
+        for at_uri, collection, source_json, ap in rows
+        if _contributes_row(collection, source_json)
+    ]
+    for at_uri, ap_object_json in candidates:
+        if ap_object_json is not None:
+            return at_uri
+    return candidates[0][0] if candidates else None
 
 
 def _update_ap(at_uri: str, note: dict | None, activity: dict | None) -> None:

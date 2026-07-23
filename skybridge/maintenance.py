@@ -58,10 +58,11 @@ from skybridge.models import BridgedActor, Delivery, Record, Work, WorkIdentifie
 from skybridge.pipeline import (
     _LIST_ITEM_COLLECTION,
     _PAIRED_COLLECTIONS,
-    _REVIEW_COLLECTION,
+    _contributes_row,
     _derive_pair,
-    _item_status,
     _pair_rows,
+    _pair_trigger,
+    _source_dict,
     _update_ap,
 )
 from skybridge.translate import neodb, works
@@ -90,38 +91,30 @@ def _handle_for(did: str) -> str | None:
         return actor.handle if actor is not None else None
 
 
-def _source_dict(source_json: str | None) -> dict | None:
-    with contextlib.suppress(TypeError, ValueError):
-        source = json.loads(source_json or "{}")
-        if isinstance(source, dict):
-            return source
-    return None
-
-
-def _contributes_row(collection: str, source_json: str | None) -> bool:
-    """Same contribution test as _pair_rows, on raw row columns."""
-    if collection == _REVIEW_COLLECTION:
-        return True
-    source = _source_dict(source_json)
-    return source is not None and _item_status(source) is not None
-
-
 def _is_episode_source(source_json: str | None) -> bool:
     source = _source_dict(source_json)
     return source is not None and source.get("creativeWorkType") == works.EPISODE_TYPE
 
 
-def _historical_targets(record_uri: str, did: str) -> list[str]:
-    """Inboxes this record was once delivered to, minus the current audience.
+def _historical_targets(did: str) -> list[str]:
+    """Inboxes this *author's* records were ever delivered to, minus the
+    current audience.
 
     A peer that unfollowed (or a relay since removed from the config) still
-    holds the Note it received back then; fanout() no longer reaches it, so
+    holds the Notes it received back then; fanout() no longer reaches it, so
     retractions additionally target every inbox the delivery log remembers.
+    Scoped per author rather than per record: a pair's Note is delivered
+    under whichever partner record triggered the Create/Update, so a
+    per-record lookup would miss partner-triggered deliveries. The superset
+    is safe — a Delete for an object a peer never had is a no-op.
     """
     current = set(relay_inboxes()) | set(follower_targets(did))
     with session_scope() as session:
         past = session.scalars(
-            select(Delivery.target_inbox).where(Delivery.record_uri == record_uri).distinct()
+            select(Delivery.target_inbox)
+            .join(Record, Record.at_uri == Delivery.record_uri)
+            .where(Record.did == did)
+            .distinct()
         ).all()
     return [inbox for inbox in past if inbox not in current]
 
@@ -142,7 +135,7 @@ async def _broadcast_retraction(
         record_uri=at_uri,
         did=did,
         activity=activity,
-        inboxes=_historical_targets(at_uri, did),
+        inboxes=_historical_targets(did),
     )
 
 
@@ -376,39 +369,6 @@ def _rebuild_works(report: RepairReport) -> list[tuple[str, str, str | None, str
         report.works_after = session.scalar(select(func.count()).select_from(Work)) or 0
     report.remapped = len(remapped)
     return remapped
-
-
-def _pair_trigger(did: str, work_key: str) -> str | None:
-    """An active paired row of (author, work) to hand _sync_pair as trigger.
-
-    Prefers the row holding the published Note (the pair's anchor). When
-    nothing is published yet, only a *contributing* row qualifies — same test
-    as _pair_rows — since _sync_pair anchors a fresh Create on the trigger:
-    anchoring on a status-less list membership would tie the pair's Note to a
-    record whose later deletion must not retract it. ``None`` when the pair
-    has no contributing rows left.
-    """
-    with session_scope() as session:
-        rows = session.execute(
-            select(Record.at_uri, Record.collection, Record.source_json, Record.ap_object_json)
-            .where(
-                Record.did == did,
-                Record.work_key == work_key,
-                Record.collection.in_(_PAIRED_COLLECTIONS),
-                Record.deleted_at.is_(None),
-            )
-            .order_by(Record.created_at.asc(), Record.at_uri.asc())
-        ).all()
-
-    candidates = [
-        (at_uri, ap)
-        for at_uri, collection, source_json, ap in rows
-        if _contributes_row(collection, source_json)
-    ]
-    for at_uri, ap_object_json in candidates:
-        if ap_object_json is not None:
-            return at_uri
-    return candidates[0][0] if candidates else None
 
 
 async def _resend_pending_retractions(worker: DeliveryWorker | None, report: RepairReport) -> None:

@@ -257,6 +257,48 @@ def test_episode_review_delete_does_not_republish_sibling(settings):
         assert sibling.ap_object_json is None  # _sync_pair must not resurrect it
 
 
+def test_update_into_episode_resyncs_the_prior_pair(settings):
+    """A published paired record updated into an episode leaves its old pair:
+    the surviving partner must republish under its own rkey (the pair's Note
+    was just retracted with the mover), not stay AP-silent forever."""
+    _run(_ev("social.popfeed.feed.review", "mv1", MOVIE_REVIEW))
+    item = {
+        "$type": "social.popfeed.feed.listItem",
+        "title": "Everything Everywhere All at Once",
+        "listType": "watched_movies",
+        "addedAt": "2026-07-03T17:16:55.308Z",
+        "identifiers": {"tmdbId": "545611"},
+        "creativeWorkType": "movie",
+    }
+    _run(_ev("social.popfeed.feed.listItem", "it1", item))
+    rv_uri = f"at://{DID}/social.popfeed.feed.review/mv1"
+    it_uri = f"at://{DID}/social.popfeed.feed.listItem/it1"
+    with session_scope() as session:
+        rv = session.get(Record, rv_uri)
+        it = session.get(Record, it_uri)
+        assert rv is not None and rv.ap_object_json is not None  # pair anchor
+        assert it is not None and it.ap_object_json is None  # folded partner
+        old_note_id = json.loads(rv.ap_object_json)["id"]
+
+    # popfeed reassigns the record to an episode: the anchor Note is
+    # retracted, and the partner takes over the movie pair.
+    result = _run(_ev("social.popfeed.feed.review", "mv1", EP_REVIEW, op="update"))
+    assert result is not None and result.activity.get("type") == "Delete"
+    assert result.activity["object"]["id"] == old_note_id
+
+    with session_scope() as session:
+        rv = session.get(Record, rv_uri)
+        it = session.get(Record, it_uri)
+        assert rv is not None and it is not None
+        assert rv.work_key == "tv_episode:tmdbId-7377127"
+        assert rv.ap_object_json is None  # retracted (pending Delete kept)
+        assert it.ap_object_json is not None  # partner republished
+        note = json.loads(it.ap_object_json)
+        (status,) = [r for r in note["relatedWith"] if r["type"] == "Status"]
+        assert status["status"] == "complete"
+        assert status["withRegardTo"] == settings.catalog_id("movie", "imdbId-tt6710474")
+
+
 def test_episode_list_add_publishes_season_watching_note(settings):
     result = _run(_ev("social.popfeed.feed.listItem", "it1", EP_LIST_ITEM))
     assert result is not None and result.activity.get("type") == "Create"
@@ -659,22 +701,28 @@ def test_repair_retracts_workless_episode_review_note(settings):
 def test_repair_retracts_to_historical_delivery_targets(settings):
     """A peer that received the Note and has since unfollowed (or a removed
     relay) is not in fanout()'s audience — the Delete must also go to every
-    inbox the delivery log remembers for the record."""
+    inbox the author's delivery log remembers, including inboxes recorded
+    under a *partner* record (pair Notes are delivered under whichever
+    record triggered the Create/Update)."""
     from skybridge.activitypub.delivery import DeliveryWorker
     from skybridge.models import Delivery
 
     _run(_ev("social.popfeed.feed.review", "ep1", EP_REVIEW))
+    _run(_ev("social.popfeed.feed.review", "mv1", MOVIE_REVIEW))
     uri = f"at://{DID}/social.popfeed.feed.review/ep1"
+    partner_uri = f"at://{DID}/social.popfeed.feed.review/mv1"
     with session_scope() as session:
         row = session.get(Record, uri)
         assert row is not None
         row.ap_object_json = json.dumps({"id": "https://bridge.test/users/x/posts/ep1"})
         row.ap_activity_json = "{}"
+        # The historical delivery was logged under another record of the same
+        # author (partner-triggered Update), not the retracted row itself.
         session.add(
             Delivery(
-                record_uri=uri,
+                record_uri=partner_uri,
                 target_inbox="http://old-peer.example/inbox",
-                activity_type="Create",
+                activity_type="Update",
                 status="sent",
             )
         )
