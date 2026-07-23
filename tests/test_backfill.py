@@ -20,6 +20,7 @@ PDS = "https://pds.test"
 REVIEWS = "social.popfeed.feed.review"
 ITEMS = "social.popfeed.feed.listItem"
 LISTS = "social.popfeed.feed.list"
+BOOKS = "buzz.bookhive.book"
 
 
 def _iso(days_ago: float) -> str:
@@ -172,6 +173,17 @@ def test_limit_budgets_reviews_before_archive_only_lists(settings, pds, replayed
     # it, archive-only lists only get the leftover slot.
     assert len(results) == 4
     assert sum(e["commit"]["collection"] == REVIEWS for e in replayed) == 3
+    assert sum(e["commit"]["collection"] == LISTS for e in replayed) == 1
+
+
+def test_limit_budgets_bookhive_before_archive_only_lists(settings, pds, replayed):
+    # BookHive books emit AP activity, so they must be fetched before
+    # archive-only popfeed lists under the shared cap (see _FETCH_PRIORITY).
+    pds[LISTS] = [_rec(LISTS, f"l{i}", {"createdAt": _iso(i + 1)}) for i in range(3)]
+    pds[BOOKS] = [_rec(BOOKS, f"b{i}", {"createdAt": _iso(i + 1)}) for i in range(3)]
+    results = asyncio.run(backfill.backfill_did(DID, limit=4))
+    assert len(results) == 4
+    assert sum(e["commit"]["collection"] == BOOKS for e in replayed) == 3
     assert sum(e["commit"]["collection"] == LISTS for e in replayed) == 1
 
 

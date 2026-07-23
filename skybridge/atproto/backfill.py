@@ -31,6 +31,7 @@ from skybridge.activitypub.delivery import DeliveryWorker
 from skybridge.atproto import identity
 from skybridge.config import get_settings
 from skybridge.pipeline import ARCHIVE_ONLY_COLLECTIONS, Processed, process_event
+from skybridge.translate import bookhive
 
 log = logging.getLogger("skybridge.backfill")
 
@@ -38,11 +39,12 @@ _PROFILE_COLLECTION = "social.popfeed.actor.profile"
 _PAGE_SIZE = 100  # listRecords hard cap per request
 
 # Fetch priority under the shared cap: collections that emit AP activities
-# first, so archive-only records (feed.list) can never starve reviews of
-# budget. Anything wanted-but-unlisted keeps its settings order, after these.
+# first, so archive-only records (feed.list) can never starve them of budget.
+# Anything wanted-but-unlisted keeps its settings order, after these.
 _FETCH_PRIORITY = (
     "social.popfeed.feed.review",
     "social.popfeed.feed.listItem",
+    bookhive.BOOK_COLLECTION,
 )
 
 # TID encoding: 13 chars of base32-sortable, 1 zero bit + 53-bit microseconds

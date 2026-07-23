@@ -1,6 +1,7 @@
 # 🌁 NeoDB Sky Bridge
 
-NeoDB Sky Bridge relays public AT Protocol records (e.g. popfeed) into the Fediverse
+NeoDB Sky Bridge relays public AT Protocol records (e.g. popfeed and
+[BookHive](https://github.com/nperez0111/bookhive)) into the Fediverse
 as NeoDB-compatible ActivityPub activities. 
 
 Any AT Protocol user may opt out by themselves (verified via atproto OAuth).
@@ -86,6 +87,33 @@ Known but not bridged:
 - `app.bsky.actor.profile` on Jetstream (deliberately not watched — that would
   stream every profile edit network-wide); it's instead re-fetched as a
   fallback whenever a `social.popfeed.actor.profile` event arrives.
+
+### BookHive
+
+[BookHive](https://github.com/nperez0111/bookhive) is a separate atproto app —
+a decentralized Goodreads. Unlike popfeed, which splits a user action across a
+`review` and a `listItem`, one BookHive action lives in a *single*
+`buzz.bookhive.book` record that already carries the shelf status, star rating
+and review together, so it bridges to ONE AP `Note` through the same
+non-paired path (no pair-merging). The work type is `book` (AP `Edition`), so a
+BookHive book and a popfeed book that share an ISBN merge into one catalog
+entry.
+
+| BookHive record | becomes |
+|---|---|
+| `buzz.bookhive.book` | a single `Note` carrying, as available: a `Status` mark (`status` → wishlist / progress / complete / dropped, from `wantToRead` / `reading` / `finished` / `abandoned`), a `Rating` (`stars`, 1-10), and — when there is review text — an untitled `Comment` `withRegardTo` the work. A status-only shelf-add (no stars/review) still bridges, leading with a reading verb ("Wants to read", "Reading", …) |
+
+Book identity comes from the record's `identifiers` (isbn13 → isbn10 →
+goodreadsId → hiveId; `hiveId` is always present, so a work always mints). The
+catalog item exposes the `isbn` and a Goodreads `external_resource` so NeoDB
+peers merge it with editions they already know.
+
+Known but not bridged:
+- `buzz.bookhive.buzz` (comments/replies on a book; like popfeed reactions)
+- `buzz.bookhive.hiveBook` / `buzz.bookhive.catalogBook` (the app's own catalog
+  entries, not user activity)
+- the `cover` blob (a PDS blob, not a URL): no poster is derived yet, so the
+  Note relies on the catalog-item tag for imagery
 
 ---
 

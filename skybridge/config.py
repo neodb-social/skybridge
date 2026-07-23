@@ -46,6 +46,13 @@ WANTED_COLLECTIONS: tuple[str, ...] = (
     # bsky profile is instead re-fetched as a fallback whenever a popfeed
     # profile event arrives.
     "social.popfeed.actor.profile",
+    # BookHive (https://github.com/nperez0111/bookhive), a separate atproto
+    # "Goodreads": one book record carries shelf status + stars + review, so
+    # it bridges to a single Note (Status/Rating/Comment) via the pipeline's
+    # non-paired path. See translate.bookhive. Not bridged: buzz.bookhive.buzz
+    # (comments, like popfeed reactions) and buzz.bookhive.hiveBook /
+    # buzz.bookhive.catalogBook (the app's catalog, not user activity).
+    "buzz.bookhive.book",
 )
 
 # Default public Jetstream endpoint; only the collections above are requested.
