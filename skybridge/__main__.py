@@ -1,4 +1,4 @@
-"""Skybridge CLI: ``python -m skybridge {serve|ingest|replay|backfill|repair|repair2}``.
+"""Skybridge CLI: ``python -m skybridge {serve|ingest|replay|backfill|repair|repair2|repair3}``.
 
 All subcommands honour ``SKYBRIDGE_DOMAIN`` (and the other env settings); the
 domain is never hardcoded.
@@ -172,6 +172,37 @@ def _cmd_repair2(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_repair3(args: argparse.Namespace) -> int:
+    from skybridge.activitypub.delivery import DeliveryWorker
+    from skybridge.maintenance import repair_titles
+
+    init_db()
+
+    async def _go():
+        worker = None if args.dry_run else DeliveryWorker()
+        if worker:
+            worker.start()
+        try:
+            return await repair_titles(worker, dry_run=args.dry_run)
+        finally:
+            if worker:
+                await worker.drain()
+                await worker.stop()
+
+    report = asyncio.run(_go())
+    verb = "would retitle" if report.dry_run else "retitled"
+    for work_key, old, new in report.retitled:
+        print(f"{verb} {work_key}: {old!r} -> {new!r}")
+    if report.dry_run:
+        print(f"dry run: {len(report.retitled)} title(s) would change; broadcasts skipped")
+    else:
+        print(
+            f"retitled {len(report.retitled)} work(s), re-synced {report.resynced} note(s), "
+            f"enqueued {report.deliveries} deliver(ies)"
+        )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="skybridge", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -230,6 +261,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--delete", action="store_true", help="actually delete (default: dry-run preview)"
     )
     p_repair2.set_defaults(func=_cmd_repair2)
+
+    p_repair3 = sub.add_parser(
+        "repair3",
+        help="normalize historical tv show/season work titles that carry an "
+        "episode's title, and re-broadcast the affected pair Notes. Safe while serving.",
+    )
+    p_repair3.add_argument(
+        "--dry-run", action="store_true", help="list the title changes, change nothing"
+    )
+    p_repair3.set_defaults(func=_cmd_repair3)
     return parser
 
 

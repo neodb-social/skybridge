@@ -552,36 +552,64 @@ async def _resync_pairs(
         ).all()
 
     for did, work_key in pairs:
-        if works.is_episode_key(work_key):
-            continue
-        trigger_uri = _pair_trigger(did, work_key)
-        if trigger_uri is None:
-            continue
-        handle = _handle_for(did)
-        if handle is None:
-            continue
-        derived = _derive_pair(did=did, work_key=work_key, handle=handle, trigger_uri=trigger_uri)
-        if derived is None:
-            continue
-        stored = None
-        if derived.stored_note_json:
-            with contextlib.suppress(TypeError, ValueError):
-                stored = json.loads(derived.stored_note_json)
-        if stored is not None and _comparable(stored) == _comparable(derived.note):
-            continue
-        await _broadcast(
-            worker,
-            report,
-            at_uri=derived.anchor_uri,
-            did=did,
-            activity=derived.activity,
-            historical=_pair_historical_targets(did, work_key),
-        )
-        pending.append(
-            (derived.anchor_uri, derived.stored_note_json, derived.note, derived.activity)
-        )
-        report.resynced += 1
+        correction = await _resync_pair(worker, report, did, work_key)
+        if correction is not None:
+            pending.append(correction)
     return pending
+
+
+async def _resync_pair(
+    worker: DeliveryWorker | None, report: RepairReport, did: str, work_key: str
+) -> tuple[str, str | None, dict, dict] | None:
+    """Derive one (author, work) pair; broadcast and return the correction if
+    it differs from the stored Note, ``None`` when already in sync."""
+    if works.is_episode_key(work_key):
+        return None
+    trigger_uri = _pair_trigger(did, work_key)
+    if trigger_uri is None:
+        return None
+    handle = _handle_for(did)
+    if handle is None:
+        return None
+    derived = _derive_pair(did=did, work_key=work_key, handle=handle, trigger_uri=trigger_uri)
+    if derived is None:
+        return None
+    stored = None
+    if derived.stored_note_json:
+        with contextlib.suppress(TypeError, ValueError):
+            stored = json.loads(derived.stored_note_json)
+    if stored is not None and _comparable(stored) == _comparable(derived.note):
+        return None
+    await _broadcast(
+        worker,
+        report,
+        at_uri=derived.anchor_uri,
+        did=did,
+        activity=derived.activity,
+        historical=_pair_historical_targets(did, work_key),
+    )
+    report.resynced += 1
+    return (derived.anchor_uri, derived.stored_note_json, derived.note, derived.activity)
+
+
+async def _finalize_corrections(
+    worker: DeliveryWorker | None,
+    corrections: list[tuple[str, str | None, dict, dict]],
+    started_at,
+) -> None:
+    """Persist corrected Notes only after every enqueued delivery has had its
+    bounded retries: the stale stored Note is the durable pending marker, so
+    dying before this point leaves each correction re-derivable (and
+    re-sendable) by the next run, at worst as a duplicate Update."""
+    if worker is not None:
+        await worker.drain()
+    for anchor_uri, observed, note, activity in corrections:
+        if worker is not None and _delivery_failed_since(anchor_uri, started_at):
+            # Every bounded retry to at least one inbox failed (temporary
+            # outage): keep the stored Note stale so the next run re-derives
+            # and re-sends this correction instead of considering it done.
+            continue
+        _persist_correction(anchor_uri, observed, note, activity)
 
 
 def _delivery_failed_since(record_uri: str, since) -> bool:
@@ -646,19 +674,7 @@ async def repair(worker: DeliveryWorker | None = None, *, dry_run: bool = False)
     await _retract_remapped_nonpaired(worker, report, remapped)
     await _retract_duplicate_holders(worker, report)
     corrections = await _resync_pairs(worker, report)
-    # Persist corrected Notes only after every enqueued delivery has had its
-    # bounded retries: the stale stored Note is the durable pending marker,
-    # so dying before this point leaves each correction re-derivable (and
-    # re-sendable) by the next run, at worst as a duplicate Update.
-    if worker is not None:
-        await worker.drain()
-    for anchor_uri, observed, note, activity in corrections:
-        if worker is not None and _delivery_failed_since(anchor_uri, started_at):
-            # Every bounded retry to at least one inbox failed (temporary
-            # outage): keep the stored Note stale so the next run re-derives
-            # and re-sends this correction instead of considering it done.
-            continue
-        _persist_correction(anchor_uri, observed, note, activity)
+    await _finalize_corrections(worker, corrections, started_at)
     log.info(
         "repair: retracted=%d resent=%d works %d->%d remapped=%d resynced=%d deliveries=%d",
         report.retracted,
@@ -666,6 +682,93 @@ async def repair(worker: DeliveryWorker | None = None, *, dry_run: bool = False)
         report.works_before,
         report.works_after,
         report.remapped,
+        report.resynced,
+        report.deliveries,
+    )
+    return report
+
+
+# --------------------------------------------------------------------------- #
+# repair3: normalize episode-shaped titles on historical show/season works
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class TitleRepairReport:
+    dry_run: bool = True
+    # (work_key, old_title, new_title) for every work whose title changed
+    retitled: list[tuple[str, str | None, str | None]] = field(default_factory=list)
+    resynced: int = 0  # pair Notes re-broadcast with the corrected title
+    deliveries: int = 0
+
+
+async def repair_titles(
+    worker: DeliveryWorker | None = None, *, dry_run: bool = False
+) -> TitleRepairReport:
+    """Normalize historical tv_show / tv_season work titles.
+
+    popfeed labels show- and season-typed records with the watched episode's
+    title ("Baron Noir - S1E5 - Grenelle"); works minted before
+    works.normalize_title existed carry it verbatim. This re-runs the
+    normalization over the stored catalog — a tv_show keeps just the show
+    name, a tv_season keeps its season ("<show> - Season <n>") — and
+    re-broadcasts the pair Notes on retitled works so federated copies pick
+    up the corrected name too (same drain-then-persist guarantees as
+    ``repair``'s re-sync).
+
+    Title-only: no catalog rebuild, no retractions. Safe while serving —
+    the title write is one quick transaction and Note persists are
+    compare-and-swap guarded against concurrent live updates.
+    """
+    report = TitleRepairReport(dry_run=dry_run)
+    started_at = utcnow()
+    with session_scope() as session:
+        rows = session.execute(
+            select(Work.work_key, Work.title, Work.identifiers_json).where(
+                Work.creative_work_type.in_(("tv_show", works.SEASON_TYPE))
+            )
+        ).all()
+    for work_key, title, identifiers_json in rows:
+        identifiers = _source_dict(identifiers_json) or {}
+        work_type = work_key.partition(":")[0]
+        new_title = works.normalize_title(work_type, title, identifiers)
+        if new_title != title:
+            report.retitled.append((work_key, title, new_title))
+    if dry_run:
+        return report
+
+    with session_scope() as session:
+        for work_key, _old, new_title in report.retitled:
+            row = session.get(Work, work_key)
+            if row is not None:
+                row.title = new_title
+
+    # Re-broadcast the pair Notes that embed the old title. Scoped to the
+    # retitled works — unlike repair's full-catalog re-sync — so this stays
+    # cheap enough to run while serving.
+    inner = RepairReport()
+    corrections: list[tuple[str, str | None, dict, dict]] = []
+    for work_key, _old, _new in report.retitled:
+        with session_scope() as session:
+            dids = session.scalars(
+                select(Record.did)
+                .where(
+                    Record.work_key == work_key,
+                    Record.collection.in_(_PAIRED_COLLECTIONS),
+                    Record.deleted_at.is_(None),
+                )
+                .distinct()
+            ).all()
+        for did in dids:
+            correction = await _resync_pair(worker, inner, did, work_key)
+            if correction is not None:
+                corrections.append(correction)
+    await _finalize_corrections(worker, corrections, started_at)
+    report.resynced = inner.resynced
+    report.deliveries = inner.deliveries
+    log.info(
+        "repair3: retitled=%d resynced=%d deliveries=%d",
+        len(report.retitled),
         report.resynced,
         report.deliveries,
     )

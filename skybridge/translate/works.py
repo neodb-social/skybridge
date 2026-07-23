@@ -158,7 +158,40 @@ def _pick_identifier(identifiers: dict) -> tuple[str, str] | None:
     return None
 
 
+# popfeed sometimes labels a show- or season-typed record with the specific
+# episode's title ("Baron Noir - S1E5 - Grenelle"). Match "<show> - S<n>E<n>…"
+# to recover the show name and season number.
 _EPISODE_TITLE = re.compile(r"^(?P<show>.+?)\s+-\s+S(?P<season>\d+)E\d+\b")
+# A title that already names its season ("… - Season 1", "Season 1").
+_SEASON_TITLE = re.compile(r"\bSeason\s+\d+\b", re.IGNORECASE)
+
+
+def normalize_title(work_type: str, title: str | None, identifiers: dict) -> str | None:
+    """Clean an episode-shaped title down to what the *work* should be named.
+
+    popfeed puts the watched episode's title on show- and season-typed records
+    alike. A ``tv_show`` work should carry just the show name; a ``tv_season``
+    work should name the season ("<show> - Season <n>"), never a single
+    episode. Movies/books/etc. and titles that don't look episodic pass
+    through unchanged.
+    """
+    if not isinstance(title, str) or not title:
+        return title
+    episode = _EPISODE_TITLE.match(title)
+    if work_type == "tv_show":
+        return episode.group("show") if episode else title
+    if work_type == SEASON_TYPE:
+        # The identifiers' seasonNumber is authoritative when present; the
+        # S<n> parsed from the title is the fallback.
+        season = str(identifiers.get("seasonNumber") or "").strip()
+        if episode:
+            number = season if season.isdigit() else episode.group("season")
+            return f"{episode.group('show')} - Season {int(number)}"
+        if _SEASON_TITLE.search(title):
+            return title  # already a season label
+        if season.isdigit():
+            return f"{title} - Season {int(season)}"
+    return title
 
 
 def season_view(record: dict) -> dict | None:
@@ -167,23 +200,19 @@ def season_view(record: dict) -> dict | None:
     NeoDB doesn't federate episode-level marks, so episode list-adds are
     bridged as activity on the season instead (TVSeason is a supported
     catalog type, resolvable via the TMDB season URL). Returns ``None`` when
-    the record can't name its season (no series id or season number).
+    the record can't name its season (no series id or season number). The
+    episode title is left as-is here; work_ref normalizes it to a season
+    title (see normalize_title) once the type is tv_season.
     """
     identifiers = record.get("identifiers") or {}
     series = identifiers.get("tmdbTvSeriesId")
     season = identifiers.get("seasonNumber")
     if not series or season in (None, ""):
         return None
-    title = record.get("title")
-    if isinstance(title, str):
-        match = _EPISODE_TITLE.match(title)
-        if match:
-            title = f"{match.group('show')} - Season {season}"
     return {
         **record,
         "creativeWorkType": SEASON_TYPE,
         "identifiers": {"tmdbTvSeriesId": str(series), "seasonNumber": str(season)},
-        "title": title,
     }
 
 
@@ -224,7 +253,7 @@ def work_ref(record: dict) -> WorkRef | None:
         work_type=work_type,
         work_id=work_id,
         url=settings.catalog_id(work_type, work_id),
-        title=record.get("title"),
+        title=normalize_title(work_type, record.get("title"), identifiers),
         poster_url=record.get("posterUrl"),
     )
 

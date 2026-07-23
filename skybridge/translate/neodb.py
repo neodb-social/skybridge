@@ -307,7 +307,10 @@ def _title_html(title: str, ref: works.WorkRef | None) -> str:
 def _populate_review(
     note: dict, record: dict, ref: works.WorkRef | None, shelf_status: str | None = None
 ) -> None:
-    title = record.get("title") or "a work"
+    # Prefer the minted work's (normalized) title: popfeed sometimes labels a
+    # show-typed record with the watched episode's title (see
+    # works.normalize_title); the Note should name the work being marked.
+    title = (ref.title if ref is not None else None) or record.get("title") or "a work"
     text = record.get("text") or ""
     rating = record.get("rating")
     if not isinstance(rating, int | float) or isinstance(rating, bool):
