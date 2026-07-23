@@ -656,6 +656,42 @@ def test_repair_retracts_workless_episode_review_note(settings):
         assert json.loads(row.ap_activity_json)["object"]["id"] == note_id
 
 
+def test_repair_retracts_to_historical_delivery_targets(settings):
+    """A peer that received the Note and has since unfollowed (or a removed
+    relay) is not in fanout()'s audience — the Delete must also go to every
+    inbox the delivery log remembers for the record."""
+    from skybridge.activitypub.delivery import DeliveryWorker
+    from skybridge.models import Delivery
+
+    _run(_ev("social.popfeed.feed.review", "ep1", EP_REVIEW))
+    uri = f"at://{DID}/social.popfeed.feed.review/ep1"
+    with session_scope() as session:
+        row = session.get(Record, uri)
+        assert row is not None
+        row.ap_object_json = json.dumps({"id": "https://bridge.test/users/x/posts/ep1"})
+        row.ap_activity_json = "{}"
+        session.add(
+            Delivery(
+                record_uri=uri,
+                target_inbox="http://old-peer.example/inbox",
+                activity_type="Create",
+                status="sent",
+            )
+        )
+
+    worker = DeliveryWorker()  # never started: tasks stay observable in-queue
+    report = asyncio.run(repair(worker))
+    assert report.retracted == 1
+
+    tasks = []
+    while not worker.queue.empty():
+        tasks.append(worker.queue.get_nowait())
+    assert any(
+        t.target_inbox == "http://old-peer.example/inbox" and t.activity["type"] == "Delete"
+        for t in tasks
+    )
+
+
 def test_repair_resends_pending_retraction_on_tombstoned_row(settings):
     """Deleting the source record after a retraction went pending must not
     hide the pending Delete from later runs — the remote Note is still up."""

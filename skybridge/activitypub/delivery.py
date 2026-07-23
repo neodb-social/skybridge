@@ -287,6 +287,44 @@ async def fanout(
     return count
 
 
+async def deliver_to(
+    worker: DeliveryWorker,
+    *,
+    record_uri: str,
+    did: str,
+    activity: dict[str, Any],
+    inboxes: list[str],
+) -> int:
+    """Enqueue the author-signed activity to an explicit inbox list.
+
+    Used by the repair command to reach *historical* delivery targets that
+    are no longer in the current audience (unfollowed peers, removed relays)
+    with a retraction. LD-signs like the relay path, since a historical
+    target may be a relay whose recipients authenticate the author through
+    the embedded signature; a signing failure falls back to the unsigned
+    form rather than dropping the retraction entirely.
+    """
+    if not inboxes:
+        return 0
+    key = _author_key(did)
+    if key is None:
+        return 0
+    priv, key_id = key
+    payload = activity
+    try:
+        signature = await asyncio.to_thread(
+            create_ld_signature, activity, private_pem=priv, key_id=key_id
+        )
+        payload = {**activity, "signature": signature}
+    except Exception:
+        log.exception("LD signing failed for %s; sending unsigned to explicit inboxes", record_uri)
+    count = 0
+    for inbox in inboxes:
+        await worker.enqueue(Task(record_uri, inbox, key_id, priv, payload))
+        count += 1
+    return count
+
+
 async def fanout_actor_update(
     worker: DeliveryWorker,
     *,

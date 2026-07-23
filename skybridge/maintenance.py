@@ -46,9 +46,15 @@ from dataclasses import dataclass, field
 from sqlalchemy import delete as sql_delete
 from sqlalchemy import func, select
 
-from skybridge.activitypub.delivery import DeliveryWorker, fanout
+from skybridge.activitypub.delivery import (
+    DeliveryWorker,
+    deliver_to,
+    fanout,
+    follower_targets,
+    relay_inboxes,
+)
 from skybridge.db import session_scope
-from skybridge.models import BridgedActor, Record, Work, WorkIdentifier, utcnow
+from skybridge.models import BridgedActor, Delivery, Record, Work, WorkIdentifier, utcnow
 from skybridge.pipeline import (
     _LIST_ITEM_COLLECTION,
     _PAIRED_COLLECTIONS,
@@ -103,6 +109,41 @@ def _contributes_row(collection: str, source_json: str | None) -> bool:
 def _is_episode_source(source_json: str | None) -> bool:
     source = _source_dict(source_json)
     return source is not None and source.get("creativeWorkType") == works.EPISODE_TYPE
+
+
+def _historical_targets(record_uri: str, did: str) -> list[str]:
+    """Inboxes this record was once delivered to, minus the current audience.
+
+    A peer that unfollowed (or a relay since removed from the config) still
+    holds the Note it received back then; fanout() no longer reaches it, so
+    retractions additionally target every inbox the delivery log remembers.
+    """
+    current = set(relay_inboxes()) | set(follower_targets(did))
+    with session_scope() as session:
+        past = session.scalars(
+            select(Delivery.target_inbox).where(Delivery.record_uri == record_uri).distinct()
+        ).all()
+    return [inbox for inbox in past if inbox not in current]
+
+
+async def _broadcast_retraction(
+    worker: DeliveryWorker | None,
+    report: RepairReport,
+    *,
+    at_uri: str,
+    did: str,
+    activity: dict,
+) -> None:
+    if worker is None:
+        return
+    report.deliveries += await fanout(worker, record_uri=at_uri, did=did, activity=activity)
+    report.deliveries += await deliver_to(
+        worker,
+        record_uri=at_uri,
+        did=did,
+        activity=activity,
+        inboxes=_historical_targets(at_uri, did),
+    )
 
 
 async def _preview_retractions(report: RepairReport) -> None:
@@ -177,8 +218,8 @@ async def _retract(
             row.ap_activity_json = json.dumps(activity) if activity is not None else None
             row.updated_at = utcnow()
     report.retracted += 1
-    if worker is not None and activity is not None:
-        report.deliveries += await fanout(worker, record_uri=at_uri, did=did, activity=activity)
+    if activity is not None:
+        await _broadcast_retraction(worker, report, at_uri=at_uri, did=did, activity=activity)
 
 
 async def _retract_episode_notes(worker: DeliveryWorker | None, report: RepairReport) -> None:
@@ -400,8 +441,7 @@ async def _resend_pending_retractions(worker: DeliveryWorker | None, report: Rep
         if not isinstance(activity, dict) or activity.get("type") != "Delete":
             continue
         report.resent += 1
-        if worker is not None:
-            report.deliveries += await fanout(worker, record_uri=at_uri, did=did, activity=activity)
+        await _broadcast_retraction(worker, report, at_uri=at_uri, did=did, activity=activity)
 
 
 # Timestamps that legitimately differ between a stored Note and a fresh
