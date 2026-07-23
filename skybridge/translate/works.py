@@ -9,6 +9,7 @@ the catalog item a mark/review refers to.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 
 from skybridge.config import get_settings
@@ -20,6 +21,7 @@ WORK_TYPE_TO_CATEGORY: dict[str, str] = {
     "movie": "movie",
     "tv_show": "tv",
     "tv_season": "tv",
+    "tv_episode": "tv",
     "video_game": "game",
     "book": "book",
     "music": "music",
@@ -99,6 +101,40 @@ _ID_PRIORITY = (
     "mbReleaseId",
 )
 
+# Keys that describe a work's position or parent, not its identity. Two shows'
+# "episode 4" share episodeNumber=4, every episode of a series shares its
+# tmdbTvSeriesId — so these must never key a work or act as a merge alias
+# (doing so is exactly how distinct episodes were once collapsed into one
+# catalog entry). They still ride along in Work.identifiers_json as metadata
+# (external_resource_urls builds season URLs from them).
+_NON_IDENTIFYING = frozenset({"episodeNumber", "seasonNumber", "tmdbTvSeriesId"})
+
+EPISODE_TYPE = "tv_episode"
+SEASON_TYPE = "tv_season"
+
+
+def _stringified(identifiers: dict) -> dict[str, str]:
+    return {str(k): str(v) for k, v in identifiers.items() if v not in (None, "")}
+
+
+def _season_compound(work_type: str, ids: dict[str, str]) -> tuple[str, str] | None:
+    """The derived compound identity of a season: ``tmdbId-<series>-season-<n>``.
+
+    A season is globally identified by (series, seasonNumber) even when the
+    record carries no season-level tmdbId (e.g. a season ref derived from an
+    episode, see season_view). The compound rides in the ``tmdbId`` namespace
+    (real season ids are purely numeric, so the forms can't collide) and is
+    registered as an alias on every season work, so both spellings merge into
+    one work whichever arrives first.
+    """
+    if work_type != SEASON_TYPE:
+        return None
+    series = ids.get("tmdbTvSeriesId")
+    season = ids.get("seasonNumber")
+    if series and season:
+        return ("tmdbId", f"{series}-season-{season}")
+    return None
+
 
 @dataclass
 class WorkRef:
@@ -115,17 +151,65 @@ def _pick_identifier(identifiers: dict) -> tuple[str, str] | None:
         if identifiers.get(key):
             return key, str(identifiers[key])
     for key, val in identifiers.items():
-        if val:
+        if val and key not in _NON_IDENTIFYING:
             return str(key), str(val)
     return None
+
+
+_EPISODE_TITLE = re.compile(r"^(?P<show>.+?)\s+-\s+S(?P<season>\d+)E\d+\b")
+
+
+def season_view(record: dict) -> dict | None:
+    """A ``tv_episode`` record recast as its parent ``tv_season``.
+
+    NeoDB doesn't federate episode-level marks, so episode list-adds are
+    bridged as activity on the season instead (TVSeason is a supported
+    catalog type, resolvable via the TMDB season URL). Returns ``None`` when
+    the record can't name its season (no series id or season number).
+    """
+    identifiers = record.get("identifiers") or {}
+    series = identifiers.get("tmdbTvSeriesId")
+    season = identifiers.get("seasonNumber")
+    if not series or season in (None, ""):
+        return None
+    title = record.get("title")
+    if isinstance(title, str):
+        match = _EPISODE_TITLE.match(title)
+        if match:
+            title = f"{match.group('show')} - Season {season}"
+    return {
+        **record,
+        "creativeWorkType": SEASON_TYPE,
+        "identifiers": {"tmdbTvSeriesId": str(series), "seasonNumber": str(season)},
+        "title": title,
+    }
+
+
+def _effective_record(record: dict) -> dict:
+    """The record whose work actually gets minted.
+
+    Episode list-adds become season activity (see :func:`season_view`); an
+    episode that can't be resolved to a season keeps its own tv_episode work,
+    which the pipeline archives without AP emission.
+    """
+    if record.get("creativeWorkType") == EPISODE_TYPE and str(record.get("$type", "")).endswith(
+        "feed.listItem"
+    ):
+        return season_view(record) or record
+    return record
+
+
+def is_episode_key(work_key: str | None) -> bool:
+    return bool(work_key) and work_key.partition(":")[0] == EPISODE_TYPE
 
 
 def work_ref(record: dict) -> WorkRef | None:
     """Derive a :class:`WorkRef` from a popfeed record, or ``None`` if it has
     no resolvable creative-work identifier."""
-    identifiers = record.get("identifiers") or {}
+    record = _effective_record(record)
+    identifiers = _stringified(record.get("identifiers") or {})
     work_type = record.get("creativeWorkType") or "unknown"
-    picked = _pick_identifier(identifiers)
+    picked = _pick_identifier(identifiers) or _season_compound(work_type, identifiers)
     if picked is None:
         return None
     id_key, id_val = picked
@@ -160,16 +244,23 @@ def _reref(ref: WorkRef, work_key: str) -> WorkRef:
 def mint(record: dict) -> WorkRef | None:
     """Resolve a work ref and upsert its catalog row, returning the ref.
 
-    Any identifier the record carries is registered as an alias, and an alias
-    hit redirects to the existing work — so records that carry different
-    identifier subsets for the same work share one catalog entry.
+    Every *identifying* identifier the record carries is registered as an
+    alias, and an alias hit redirects to the existing work — so records that
+    carry different identifier subsets for the same work share one catalog
+    entry. Positional keys (episode/season numbers, parent series id) are
+    stored as metadata only, never as aliases (see _NON_IDENTIFYING).
     """
+    record = _effective_record(record)
     ref = work_ref(record)
     if ref is None:
         return None
-    identifiers = {k: str(v) for k, v in (record.get("identifiers") or {}).items() if v}
+    identifiers = _stringified(record.get("identifiers") or {})
+    aliases = [(k, v) for k, v in identifiers.items() if k not in _NON_IDENTIFYING]
+    compound = _season_compound(ref.work_type, identifiers)
+    if compound is not None and compound not in aliases:
+        aliases.append(compound)
     with session_scope() as session:
-        for key, val in identifiers.items():
+        for key, val in aliases:
             alias = session.get(WorkIdentifier, (ref.work_type, key, val))
             if alias is not None:
                 if alias.work_key != ref.work_key:
@@ -194,7 +285,7 @@ def mint(record: dict) -> WorkRef | None:
                 row.poster_url = ref.poster_url
             merged = {**json.loads(row.identifiers_json or "{}"), **identifiers}
             row.identifiers_json = json.dumps(merged)
-        for key, val in identifiers.items():
+        for key, val in aliases:
             if session.get(WorkIdentifier, (ref.work_type, key, val)) is None:
                 session.add(
                     WorkIdentifier(

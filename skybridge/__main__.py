@@ -1,4 +1,4 @@
-"""Skybridge CLI: ``python -m skybridge {serve|ingest|replay|backfill}``.
+"""Skybridge CLI: ``python -m skybridge {serve|ingest|replay|backfill|repair}``.
 
 All subcommands honour ``SKYBRIDGE_DOMAIN`` (and the other env settings); the
 domain is never hardcoded.
@@ -107,6 +107,48 @@ def _cmd_backfill(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_repair(args: argparse.Namespace) -> int:
+    from skybridge.activitypub.delivery import DeliveryWorker
+    from skybridge.maintenance import repair
+
+    init_db()
+
+    async def _go():
+        # Delivery is not optional here (only --dry-run skips it): the repair
+        # destroys the state its own broadcasts are built from (stored Note
+        # ids, episode-typed work_keys), so a mutating-but-silent run would
+        # strand the mis-mapped Notes on peers with no way to retract them.
+        worker = None if args.dry_run else DeliveryWorker()
+        if worker:
+            worker.start()
+        try:
+            return await repair(worker, dry_run=args.dry_run)
+        finally:
+            if worker:
+                # Drain before stop: stop() abandons scheduled backoff
+                # retries, and a re-sync correction that fails its first
+                # attempt is never re-derived by a later run (the corrected
+                # Note is already stored) — every bounded retry must get its
+                # chance while the command is still alive.
+                await worker.drain()
+                await worker.stop()
+
+    report = asyncio.run(_go())
+    if report.dry_run:
+        for at_uri, work_key in report.would_retract:
+            print(f"would retract {at_uri} ({work_key})")
+        print(f"dry run: would retract {report.retracted} episode note(s); rebuild skipped")
+    else:
+        print(
+            f"retracted {report.retracted} episode note(s) "
+            f"(+{report.resent} pending re-sent), "
+            f"works {report.works_before} -> {report.works_after}, "
+            f"remapped {report.remapped} record(s), re-synced {report.resynced} note(s), "
+            f"enqueued {report.deliveries} deliver(ies)"
+        )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="skybridge", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -144,6 +186,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_backfill.add_argument("--deliver", action="store_true")
     p_backfill.set_defaults(func=_cmd_backfill)
+
+    p_repair = sub.add_parser(
+        "repair",
+        help="retract published tv_episode notes, rebuild the works catalog from "
+        "the archive, and broadcast the corrections (see skybridge.maintenance)",
+    )
+    p_repair.add_argument(
+        "--dry-run", action="store_true", help="list what would be retracted, change nothing"
+    )
+    p_repair.set_defaults(func=_cmd_repair)
     return parser
 
 
