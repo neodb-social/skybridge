@@ -73,6 +73,23 @@ def _item_status(source: dict) -> str | None:
     return neodb.list_item_status(source)
 
 
+def _published_note_id(at_uri: str) -> str | None:
+    """The stored Note id of a still-published record, or ``None``.
+
+    Reads the id peers actually received rather than recomputing it from the
+    current handle, so a retraction always names the right object.
+    """
+    with session_scope() as session:
+        row = session.get(Record, at_uri)
+        if row is None or row.deleted_at is not None or not row.ap_object_json:
+            return None
+        try:
+            note = json.loads(row.ap_object_json)
+        except ValueError:
+            return None
+    return note.get("id") if isinstance(note, dict) else None
+
+
 def _contributes(collection: str, record: dict) -> bool:
     """Does this record contribute to the single per-(author, work) Note?"""
     if collection == _REVIEW_COLLECTION:
@@ -140,8 +157,24 @@ async def process_event(
         # NeoDB doesn't federate episode-level marks. Episode listItems are
         # bridged as season activity (works.season_view) and never reach this
         # branch; whatever still resolves to a tv_episode work (reviews, or an
-        # episode that can't name its season) is archived without AP emission
-        # — clearing any previously published AP forms along the way.
+        # episode that can't name its season) is archived without AP emission.
+        # A Note this record already published (legacy pre-cutoff state, or a
+        # record updated into an episode) is retracted first — clearing the
+        # AP forms alone would strand the Note on peers, beyond even the
+        # reach of the repair command (which needs the stored AP to find it).
+        retraction = None
+        note_id = _published_note_id(at_uri)
+        if note_id is not None:
+            _, retraction = neodb.translate(
+                did=did,
+                handle=handle,
+                collection=collection,
+                rkey=rkey,
+                record=None,
+                operation="delete",
+                time_us=None,
+                prior_object_id=note_id,
+            )
         _persist(
             at_uri=at_uri,
             did=did,
@@ -154,7 +187,10 @@ async def process_event(
             operation=operation,
             work_key=ref.work_key,
         )
-        return Processed(at_uri, operation, collection, {})
+        delivered = 0
+        if worker is not None and retraction is not None:
+            delivered = await fanout(worker, record_uri=at_uri, did=did, activity=retraction)
+        return Processed(at_uri, operation, collection, retraction or {}, delivered)
 
     is_membership_only = ref is None or not _contributes(collection, record)
     if collection == _LIST_ITEM_COLLECTION and is_membership_only:

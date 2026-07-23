@@ -196,17 +196,21 @@ def test_episode_review_is_archived_without_ap(settings):
         assert row.ap_activity_json is None
 
 
-def test_episode_review_update_clears_previously_published_ap(settings):
+def test_episode_review_update_retracts_previously_published_note(settings):
     _run(_ev("social.popfeed.feed.review", "ep1", EP_REVIEW))
     # Simulate a Note published before the cutoff (legacy state).
     uri = f"at://{DID}/social.popfeed.feed.review/ep1"
+    note_id = "https://bridge.test/users/x/posts/ep1"
     with session_scope() as session:
         row = session.get(Record, uri)
         assert row is not None
-        row.ap_object_json = json.dumps({"id": "https://bridge.test/users/x/posts/ep1"})
+        row.ap_object_json = json.dumps({"id": note_id})
         row.ap_activity_json = "{}"
     result = _run(_ev("social.popfeed.feed.review", "ep1", EP_REVIEW, op="update"))
-    assert result is not None and result.activity == {}
+    # The stranded Note is Deleted on peers (by its stored id), not just
+    # dropped locally — repair can't find it once the AP forms are cleared.
+    assert result is not None and result.activity.get("type") == "Delete"
+    assert result.activity["object"]["id"] == note_id
     with session_scope() as session:
         row = session.get(Record, uri)
         assert row is not None
@@ -325,6 +329,73 @@ def test_repair_retracts_rebuilds_and_resyncs(settings):
     assert again.retracted == 0
     assert again.remapped == 0
     assert again.resynced == 0
+
+
+def test_repair_resyncs_both_sides_of_a_moved_partner(settings):
+    """A pair's Note lives on one anchor row; when a wrongly-merged partner
+    moves to its own work during rebuild, both works need re-publishing —
+    the old one to drop the partner's folded status, the new one to gain a
+    Note — even though the moved row itself was AP-silent."""
+    _run(_ev("social.popfeed.feed.review", "mv1", MOVIE_REVIEW))
+    rv_uri = f"at://{DID}/social.popfeed.feed.review/mv1"
+    item_uri = f"at://{DID}/social.popfeed.feed.listItem/li1"
+    other_item = {
+        "$type": "social.popfeed.feed.listItem",
+        "title": "Another Movie",
+        "listType": "watched_movies",
+        "addedAt": "2026-07-04T00:00:00.000Z",
+        "identifiers": {"tmdbId": "77777"},
+        "creativeWorkType": "movie",
+    }
+    with session_scope() as session:
+        rv = session.get(Record, rv_uri)
+        assert rv is not None and rv.work_key is not None and rv.ap_object_json is not None
+        # Legacy wrong merge: the listItem of a different movie rode the
+        # review's work, its status folded into the review's Note.
+        note = json.loads(rv.ap_object_json)
+        note["relatedWith"].append(
+            {
+                "id": f"{note['id']}#status",
+                "type": "Status",
+                "withRegardTo": settings.catalog_id("movie", rv.work_key.split(":", 1)[1]),
+                "attributedTo": note["attributedTo"],
+                "href": f"{note['id']}#status",
+                "published": note["published"],
+                "updated": note["published"],
+                "status": "complete",
+            }
+        )
+        rv.ap_object_json = json.dumps(note)
+        session.add(
+            Record(
+                at_uri=item_uri,
+                did=DID,
+                collection="social.popfeed.feed.listItem",
+                rkey="li1",
+                source_json=json.dumps(other_item),
+                op="create",
+                work_key=rv.work_key,
+            )
+        )
+
+    report = asyncio.run(repair(None))
+    assert report.remapped == 1  # only the listItem moves
+    assert report.resynced == 2  # ...but both pairs re-publish
+
+    with session_scope() as session:
+        rv = session.get(Record, rv_uri)
+        item = session.get(Record, item_uri)
+        assert rv is not None and item is not None and rv.ap_object_json is not None
+        # The review's Note was re-derived without the stale folded status...
+        rv_note = json.loads(rv.ap_object_json)
+        assert {r["type"] for r in rv_note["relatedWith"]} == {"Rating"}
+        # ...and the moved partner now anchors its own Note on the right work.
+        assert item.work_key == "movie:tmdbId-77777"
+        assert item.ap_object_json is not None
+        item_note = json.loads(item.ap_object_json)
+        (status,) = [r for r in item_note["relatedWith"] if r["type"] == "Status"]
+        assert status["status"] == "complete"
+        assert status["withRegardTo"] == settings.catalog_id("movie", "tmdbId-77777")
 
 
 def test_repair_dry_run_changes_nothing(settings):

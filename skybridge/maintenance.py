@@ -13,9 +13,10 @@ and the mis-mapped Notes were federated. :func:`repair` cleans that up:
    archived review/listItem source through the fixed logic, re-pointing each
    record's ``work_key``. Episode listItems come back as season works
    (works.season_view).
-3. **Re-sync** — for still-published records whose work mapping changed
-   (e.g. a season that had been merged into another show's season),
-   re-derive the pair's Note and broadcast an ``Update``.
+3. **Re-sync** — for every record whose work mapping changed, re-derive the
+   (author, work) pair Notes on both sides of the move: the work it left
+   drops the mover's contribution from its Note (Update), the work it
+   joined gets one published for it (Create/Update).
 
 Idempotent: a second run finds nothing left to retract or re-map.
 """
@@ -115,12 +116,13 @@ async def _retract_episode_notes(
             report.deliveries += await fanout(worker, record_uri=at_uri, did=did, activity=activity)
 
 
-def _rebuild_works(report: RepairReport) -> list[tuple[str, str, str | None]]:
+def _rebuild_works(report: RepairReport) -> list[tuple[str, str, str | None, str | None]]:
     """Re-mint every archived review/listItem source through the fixed logic.
 
-    Returns ``(did, at_uri, new_work_key)`` for each record whose work_key
-    changed. Records are replayed in original arrival order so the first
-    record's best identifier anchors each work_key, as in live ingestion.
+    Returns ``(did, at_uri, old_work_key, new_work_key)`` for each record
+    whose work_key changed. Records are replayed in original arrival order so
+    the first record's best identifier anchors each work_key, as in live
+    ingestion.
     """
     with session_scope() as session:
         report.works_before = session.scalar(select(func.count()).select_from(Work)) or 0
@@ -136,7 +138,7 @@ def _rebuild_works(report: RepairReport) -> list[tuple[str, str, str | None]]:
             .order_by(Record.created_at.asc(), Record.at_uri.asc())
         ).all()
 
-    remapped: list[tuple[str, str, str | None]] = []
+    remapped: list[tuple[str, str, str | None, str | None]] = []
     for at_uri, did, collection, source_json, old_key in rows:
         try:
             source = json.loads(source_json or "{}")
@@ -156,7 +158,7 @@ def _rebuild_works(report: RepairReport) -> list[tuple[str, str, str | None]]:
             if row is not None:
                 row.work_key = new_key
                 row.updated_at = utcnow()
-        remapped.append((did, at_uri, new_key))
+        remapped.append((did, at_uri, old_key, new_key))
 
     with session_scope() as session:
         report.works_after = session.scalar(select(func.count()).select_from(Work)) or 0
@@ -164,38 +166,66 @@ def _rebuild_works(report: RepairReport) -> list[tuple[str, str, str | None]]:
     return remapped
 
 
+def _pair_trigger(did: str, work_key: str) -> str | None:
+    """An active paired row of (author, work) to hand _sync_pair as trigger.
+
+    Prefers the row holding the published Note (the pair's anchor); any
+    contributing row works when nothing is published yet — _sync_pair then
+    anchors a fresh Create on it. ``None`` when the pair has no rows left.
+    """
+    with session_scope() as session:
+        rows = session.execute(
+            select(Record.at_uri, Record.ap_object_json)
+            .where(
+                Record.did == did,
+                Record.work_key == work_key,
+                Record.collection.in_(_PAIRED_COLLECTIONS),
+                Record.deleted_at.is_(None),
+            )
+            .order_by(Record.created_at.asc(), Record.at_uri.asc())
+        ).all()
+    for at_uri, ap_object_json in rows:
+        if ap_object_json is not None:
+            return at_uri
+    return rows[0][0] if rows else None
+
+
 async def _resync_remapped(
     worker: DeliveryWorker | None,
-    remapped: list[tuple[str, str, str | None]],
+    remapped: list[tuple[str, str, str | None, str | None]],
     report: RepairReport,
 ) -> None:
-    """Broadcast corrected Notes for still-published records that moved works.
+    """Re-derive and broadcast the pairs on *both* sides of every move.
 
-    Episode rows were already retracted (their AP is cleared), so this only
-    touches records that keep publishing — e.g. a season Note that had been
-    pointing at another show's season. One re-sync per (author, work).
+    A pair's Note lives on one anchor row while partner records stay
+    AP-silent, so the moved record itself often isn't the published one:
+    the work it left keeps a Note that must drop the mover's contribution
+    (Update), and the work it joined may have no Note at all yet (Create,
+    anchored on a contributing row). Episode works are never re-published;
+    one re-sync per (author, work).
     """
     seen: set[tuple[str, str]] = set()
-    for did, at_uri, new_key in remapped:
-        if new_key is None or (did, new_key) in seen:
-            continue
-        with session_scope() as session:
-            row = session.get(Record, at_uri)
-            published = (
-                row is not None and row.ap_object_json is not None and row.deleted_at is None
+    for did, _at_uri, old_key, new_key in remapped:
+        for work_key in (old_key, new_key):
+            if not work_key or (did, work_key) in seen or works.is_episode_key(work_key):
+                continue
+            seen.add((did, work_key))
+            trigger_uri = _pair_trigger(did, work_key)
+            if trigger_uri is None:
+                continue
+            handle = _handle_for(did)
+            if handle is None:
+                continue
+            activity = _sync_pair(
+                did=did, work_key=work_key, handle=handle, trigger_uri=trigger_uri
             )
-        if not published:
-            continue
-        seen.add((did, new_key))
-        handle = _handle_for(did)
-        if handle is None:
-            continue
-        activity = _sync_pair(did=did, work_key=new_key, handle=handle, trigger_uri=at_uri)
-        if activity is None:
-            continue
-        report.resynced += 1
-        if worker is not None:
-            report.deliveries += await fanout(worker, record_uri=at_uri, did=did, activity=activity)
+            if activity is None:
+                continue
+            report.resynced += 1
+            if worker is not None:
+                report.deliveries += await fanout(
+                    worker, record_uri=trigger_uri, did=did, activity=activity
+                )
 
 
 async def repair(worker: DeliveryWorker | None = None, *, dry_run: bool = False) -> RepairReport:
