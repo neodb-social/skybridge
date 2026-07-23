@@ -256,6 +256,7 @@ async def process_event(
     if ref is not None and collection in _PAIRED_COLLECTIONS and _contributes(collection, record):
         # Persist the source first (keeping any Note this row already
         # anchors), then re-derive the pair's single Note.
+        _, prior_key = _prior_state(at_uri)
         _persist(
             at_uri=at_uri,
             did=did,
@@ -273,6 +274,21 @@ async def process_event(
         delivered = 0
         if worker is not None and activity is not None:
             delivered = await fanout(worker, record_uri=at_uri, did=did, activity=activity)
+        if prior_key and prior_key != ref.work_key and not works.is_episode_key(prior_key):
+            # The update moved this record to a different work (popfeed
+            # reassigned identifiers, or an episode item advanced to the next
+            # season): re-derive the pair it left, so a surviving partner
+            # republishes or drops this record's stale contribution.
+            trigger_uri = _pair_trigger(did, prior_key)
+            prior_activity = None
+            if trigger_uri is not None:
+                prior_activity = _sync_pair(
+                    did=did, work_key=prior_key, handle=handle, trigger_uri=trigger_uri
+                )
+            if worker is not None and prior_activity is not None:
+                delivered += await fanout(
+                    worker, record_uri=at_uri, did=did, activity=prior_activity
+                )
         return Processed(at_uri, operation, collection, activity or {}, delivered)
 
     note, activity = neodb.translate(

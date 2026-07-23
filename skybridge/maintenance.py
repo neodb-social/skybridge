@@ -326,7 +326,7 @@ async def _retract_duplicate_holders(worker: DeliveryWorker | None, report: Repa
 
 
 def _rebuild_works(report: RepairReport) -> list[tuple[str, str, str | None, str | None]]:
-    """Re-mint every archived review/listItem source through the fixed logic.
+    """Re-mint every archived record source through the fixed logic.
 
     Returns ``(did, at_uri, old_work_key, new_work_key)`` for each record
     whose work_key changed. Records are replayed in original arrival order so
@@ -354,7 +354,11 @@ def _rebuild_works(report: RepairReport) -> list[tuple[str, str, str | None, str
             select(
                 Record.at_uri, Record.did, Record.collection, Record.source_json, Record.work_key
             )
-            .where(Record.collection.in_(_PAIRED_COLLECTIONS))
+            # Every archived record, not just the paired collections: the
+            # wipe above removed works minted from ANY collection, so any
+            # source that can mint must be replayed or its catalog entry
+            # (and its records' work_keys) would dangle. Sources with no
+            # resolvable work (lists, ...) are no-ops here.
             # at_uri tiebreak: created_at can collide (backfill bursts), and a
             # stable replay order keeps rebuilt work_keys identical across runs.
             .order_by(Record.created_at.asc(), Record.at_uri.asc())

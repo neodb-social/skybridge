@@ -299,6 +299,42 @@ def test_update_into_episode_resyncs_the_prior_pair(settings):
         assert status["withRegardTo"] == settings.catalog_id("movie", "imdbId-tt6710474")
 
 
+def test_episode_item_moving_seasons_resyncs_the_old_season(settings):
+    """An episode item updated to the next season takes the pair Note along;
+    the season it left must republish from its surviving items, not go
+    silent while still being watched."""
+    ep5_item = {
+        **EP_LIST_ITEM,
+        "title": "Dark Side of the Ring - S7E5 - The Dynamite Kid",
+        "identifiers": {**EP_IDENTIFIERS, "episodeNumber": 5, "tmdbId": "7377128"},
+    }
+    _run(_ev("social.popfeed.feed.listItem", "it1", EP_LIST_ITEM))  # anchors S7 Note
+    _run(_ev("social.popfeed.feed.listItem", "it2", ep5_item))  # folds into it
+    s8_item = {
+        **EP_LIST_ITEM,
+        "title": "Dark Side of the Ring - S8E1 - Premiere",
+        "identifiers": {
+            "episodeNumber": 1,
+            "seasonNumber": 8,
+            "tmdbId": "8000001",
+            "tmdbTvSeriesId": "88401",
+        },
+    }
+    _run(_ev("social.popfeed.feed.listItem", "it1", s8_item, op="update"))
+
+    with session_scope() as session:
+        it1 = session.get(Record, f"at://{DID}/social.popfeed.feed.listItem/it1")
+        it2 = session.get(Record, f"at://{DID}/social.popfeed.feed.listItem/it2")
+        assert it1 is not None and it2 is not None
+        assert it1.work_key == "tv_season:tmdbId-88401-season-8"
+        assert it2.work_key == "tv_season:tmdbId-88401-season-7"
+        # The S7 pair republished from the surviving item.
+        assert it2.ap_object_json is not None
+        note = json.loads(it2.ap_object_json)
+        (status,) = [r for r in note["relatedWith"] if r["type"] == "Status"]
+        assert status["withRegardTo"].endswith("/catalog/tv_season/tmdbId-88401-season-7")
+
+
 def test_episode_list_add_publishes_season_watching_note(settings):
     result = _run(_ev("social.popfeed.feed.listItem", "it1", EP_LIST_ITEM))
     assert result is not None and result.activity.get("type") == "Create"
@@ -832,6 +868,38 @@ def test_delivery_drain_waits_for_backoff_retries(settings, monkeypatch):
 
     asyncio.run(_go())
     assert len(attempts) == 2  # the backoff retry ran before drain returned
+
+
+def test_repair_rebuilds_works_from_all_collections(settings):
+    """The rebuild wipes the whole catalog, so every archived record that can
+    mint a work must be replayed — not just the paired collections — or its
+    catalog entry would dangle after a repair."""
+    legacy = {
+        "$type": "social.popfeed.feed.post",
+        "title": "Superman",
+        "identifiers": {"tmdbId": "1061474"},
+        "creativeWorkType": "movie",
+    }
+    works.mint(legacy)
+    with session_scope() as session:
+        session.add(
+            Record(
+                at_uri=f"at://{DID}/social.popfeed.feed.post/p1",
+                did=DID,
+                collection="social.popfeed.feed.post",
+                rkey="p1",
+                source_json=json.dumps(legacy),
+                op="create",
+                work_key="movie:tmdbId-1061474",
+            )
+        )
+
+    asyncio.run(repair(None))
+
+    with session_scope() as session:
+        assert session.get(Work, "movie:tmdbId-1061474") is not None
+        row = session.get(Record, f"at://{DID}/social.popfeed.feed.post/p1")
+        assert row is not None and row.work_key == "movie:tmdbId-1061474"
 
 
 def test_repair_dry_run_changes_nothing(settings):
