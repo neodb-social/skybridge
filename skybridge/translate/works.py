@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from skybridge.config import get_settings
 from skybridge.db import session_scope
 from skybridge.models import Work, WorkIdentifier
+from skybridge.translate import bookhive
 
 # popfeed creativeWorkType -> NeoDB catalog category.
 WORK_TYPE_TO_CATEGORY: dict[str, str] = {
@@ -77,6 +78,10 @@ def external_resource_urls(work_type: str, identifiers: dict) -> list[str]:
     if slug and work_type == "video_game":
         # IGDB urls are slug-based; the numeric igdbId is not resolvable.
         urls.append(f"https://www.igdb.com/games/{slug}")
+    goodreads = identifiers.get("goodreadsId")
+    if goodreads and work_type == "book":
+        # NeoDB resolves Goodreads book URLs (catalog/sites/goodreads.py).
+        urls.append(f"https://www.goodreads.com/book/show/{goodreads}")
     steam = identifiers.get("steamId")
     if steam:
         urls.append(f"https://store.steampowered.com/app/{steam}")
@@ -89,7 +94,9 @@ def external_resource_urls(work_type: str, identifiers: dict) -> list[str]:
 
 # Preferred identifier per work type (first match wins), then any remaining.
 # isbn13 over isbn10 (canonical form); mbId (musicbrainz release group, stable
-# across pressings) over mbReleaseId.
+# across pressings) over mbReleaseId. BookHive's goodreadsId/hiveId rank after
+# the ISBNs so a book still merges with popfeed/NeoDB editions by ISBN first,
+# falling back to hiveId (always present on a BookHive book) when it has none.
 _ID_PRIORITY = (
     "imdbId",
     "tmdbId",
@@ -98,9 +105,11 @@ _ID_PRIORITY = (
     "isbn",
     "isbn13",
     "isbn10",
+    "goodreadsId",
     "musicbrainzId",
     "mbId",
     "mbReleaseId",
+    "hiveId",
 )
 
 # Keys that describe a work's position or parent, not its identity. Two shows'
@@ -219,10 +228,14 @@ def season_view(record: dict) -> dict | None:
 def _effective_record(record: dict) -> dict:
     """The record whose work actually gets minted.
 
-    Episode list-adds become season activity (see :func:`season_view`); an
-    episode that can't be resolved to a season keeps its own tv_episode work,
-    which the pipeline archives without AP emission.
+    A BookHive book is normalized to the generic ``book`` work shape (see
+    :mod:`skybridge.translate.bookhive`). Episode list-adds become season
+    activity (see :func:`season_view`); an episode that can't be resolved to a
+    season keeps its own tv_episode work, which the pipeline archives without
+    AP emission.
     """
+    if bookhive.is_book(record):
+        return bookhive.as_work_record(record)
     if record.get("creativeWorkType") == EPISODE_TYPE and str(record.get("$type", "")).endswith(
         "feed.listItem"
     ):

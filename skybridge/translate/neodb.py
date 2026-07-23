@@ -28,7 +28,7 @@ from skybridge.atproto import identity
 from skybridge.config import get_settings
 from skybridge.db import session_scope
 from skybridge.models import Record
-from skybridge.translate import works
+from skybridge.translate import bookhive, works
 
 PUBLIC = "https://www.w3.org/ns/activitystreams#Public"
 
@@ -265,7 +265,9 @@ def build_note(
 
     # (Legacy social.popfeed.feed.post — free text about a work, superseded by
     # feed.review in 2025 — is no longer bridged; see config.WANTED_COLLECTIONS.)
-    if collection.endswith("feed.list"):
+    if collection == bookhive.BOOK_COLLECTION:
+        _populate_book(note, record, ref)
+    elif collection.endswith("feed.list"):
         _populate_list(note, record, handle, rkey, ref)
     elif collection.endswith("feed.listItem"):
         _populate_list_item(note, record, ref)
@@ -353,6 +355,74 @@ def _populate_review(
             note["relatedWith"].append(_related(note, "Comment", ref.url, {"content": text_html}))
         if shelf_status:
             note["relatedWith"].append(_related(note, "Status", ref.url, {"status": shelf_status}))
+
+
+# NeoDB shelf status -> the reading verb that leads a status-only book Note
+# (one with no rating and no review text), so an unrated shelf-add still reads
+# naturally on a plain Mastodon renderer.
+_BOOK_STATUS_LEAD = {
+    "wishlist": "Wants to read",
+    "progress": "Reading",
+    "complete": "Finished reading",
+    "dropped": "Abandoned",
+}
+
+
+def _plain_html(text: str) -> str:
+    """Render BookHive's plain-text review (no atproto facets) into HTML,
+    escaping it and preserving paragraph and line breaks."""
+    paragraphs = [p for p in re.split(r"\n{2,}", text.strip()) if p.strip()]
+    return "".join(
+        "<p>" + "<br/>".join(html.escape(line) for line in para.split("\n")) + "</p>"
+        for para in paragraphs
+    )
+
+
+def _populate_book(note: dict, record: dict, ref: works.WorkRef | None) -> None:
+    """Populate the Note for a ``buzz.bookhive.book`` record.
+
+    A single BookHive book carries the shelf status, star rating (1-10) and
+    review text together, so its one Note may carry ``Status`` + ``Rating`` +
+    ``Comment`` at once — the same facets popfeed reassembles from a
+    review/listItem pair (see :func:`_populate_review`).
+    """
+    title = (ref.title if ref is not None else None) or record.get("title") or "a book"
+    review = record.get("review") if isinstance(record.get("review"), str) else ""
+    stars = record.get("stars")
+    if not isinstance(stars, int) or isinstance(stars, bool):
+        stars = None
+    status = bookhive.shelf_status(record)
+
+    if stars is not None:
+        lead = f"<p>Rated {_title_html(title, ref)} {stars:g}/{_RATING_BEST}</p>"
+    elif review:
+        lead = f"<p>Reviewed {_title_html(title, ref)}</p>"
+    elif status:
+        lead = f"<p>{_BOOK_STATUS_LEAD[status]} {_title_html(title, ref)}</p>"
+    else:
+        lead = f"<p>Added {_title_html(title, ref)}</p>"
+    review_html = _plain_html(review) if review else ""
+    note["content"] = lead + review_html
+
+    # As with reviews, the cover rides on the catalog-item tag, not as media.
+    if ref is not None:
+        note["tag"].append(_work_tag(ref))
+        note["tag"].append({"type": "Hashtag", "name": f"#{works.category_for(ref.work_type)}"})
+        if stars is not None:
+            note["relatedWith"].append(
+                _related(
+                    note,
+                    "Rating",
+                    ref.url,
+                    {"value": stars, "best": _RATING_BEST, "worst": _RATING_WORST},
+                )
+            )
+        if review:
+            # An untitled Comment on the mark (never a titled Review, which
+            # NeoDB renders Article-like); carries only the review text.
+            note["relatedWith"].append(_related(note, "Comment", ref.url, {"content": review_html}))
+        if status:
+            note["relatedWith"].append(_related(note, "Status", ref.url, {"status": status}))
 
 
 def _populate_list(
