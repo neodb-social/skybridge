@@ -12,6 +12,8 @@ import json
 import re
 from dataclasses import dataclass
 
+from sqlalchemy.orm import Session
+
 from skybridge.config import get_settings
 from skybridge.db import session_scope
 from skybridge.models import Work, WorkIdentifier
@@ -241,7 +243,7 @@ def _reref(ref: WorkRef, work_key: str) -> WorkRef:
     )
 
 
-def mint(record: dict) -> WorkRef | None:
+def mint(record: dict, *, session: Session | None = None) -> WorkRef | None:
     """Resolve a work ref and upsert its catalog row, returning the ref.
 
     Every *identifying* identifier the record carries is registered as an
@@ -249,7 +251,14 @@ def mint(record: dict) -> WorkRef | None:
     carry different identifier subsets for the same work share one catalog
     entry. Positional keys (episode/season numbers, parent series id) are
     stored as metadata only, never as aliases (see _NON_IDENTIFYING).
+
+    ``session`` joins an existing transaction instead of opening one — the
+    repair command's rebuild re-mints the whole archive atomically so live
+    ingestion can never observe (or mint against) a half-rebuilt catalog.
     """
+    if session is None:
+        with session_scope() as own_session:
+            return mint(record, session=own_session)
     record = _effective_record(record)
     ref = work_ref(record)
     if ref is None:
@@ -259,42 +268,45 @@ def mint(record: dict) -> WorkRef | None:
     compound = _season_compound(ref.work_type, identifiers)
     if compound is not None and compound not in aliases:
         aliases.append(compound)
-    with session_scope() as session:
-        for key, val in aliases:
-            alias = session.get(WorkIdentifier, (ref.work_type, key, val))
-            if alias is not None:
-                if alias.work_key != ref.work_key:
-                    ref = _reref(ref, alias.work_key)
-                break
-        row = session.get(Work, ref.work_key)
-        if row is None:
+    for key, val in aliases:
+        alias = session.get(WorkIdentifier, (ref.work_type, key, val))
+        if alias is not None:
+            if alias.work_key != ref.work_key:
+                ref = _reref(ref, alias.work_key)
+            break
+    row = session.get(Work, ref.work_key)
+    if row is None:
+        session.add(
+            Work(
+                work_key=ref.work_key,
+                creative_work_type=ref.work_type,
+                title=ref.title,
+                poster_url=ref.poster_url,
+                identifiers_json=json.dumps(identifiers),
+            )
+        )
+        # Make the row (and its aliases below) visible to the next mint()
+        # call sharing this session before the transaction commits.
+        session.flush()
+    else:
+        # Backfill metadata we may not have had at first sight.
+        if ref.title and not row.title:
+            row.title = ref.title
+        if ref.poster_url and not row.poster_url:
+            row.poster_url = ref.poster_url
+        merged = {**json.loads(row.identifiers_json or "{}"), **identifiers}
+        row.identifiers_json = json.dumps(merged)
+    for key, val in aliases:
+        if session.get(WorkIdentifier, (ref.work_type, key, val)) is None:
             session.add(
-                Work(
-                    work_key=ref.work_key,
+                WorkIdentifier(
                     creative_work_type=ref.work_type,
-                    title=ref.title,
-                    poster_url=ref.poster_url,
-                    identifiers_json=json.dumps(identifiers),
+                    id_key=key,
+                    id_value=val,
+                    work_key=ref.work_key,
                 )
             )
-        else:
-            # Backfill metadata we may not have had at first sight.
-            if ref.title and not row.title:
-                row.title = ref.title
-            if ref.poster_url and not row.poster_url:
-                row.poster_url = ref.poster_url
-            merged = {**json.loads(row.identifiers_json or "{}"), **identifiers}
-            row.identifiers_json = json.dumps(merged)
-        for key, val in aliases:
-            if session.get(WorkIdentifier, (ref.work_type, key, val)) is None:
-                session.add(
-                    WorkIdentifier(
-                        creative_work_type=ref.work_type,
-                        id_key=key,
-                        id_value=val,
-                        work_key=ref.work_key,
-                    )
-                )
+    session.flush()
     return ref
 
 

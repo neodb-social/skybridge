@@ -740,6 +740,44 @@ def test_repair_retracts_to_historical_delivery_targets(settings):
     )
 
 
+def test_repair_resync_updates_reach_historical_targets(settings):
+    """In-place corrections must reach past recipients too — a peer that got
+    the damaged Note and unfollowed would otherwise keep it forever."""
+    from skybridge.activitypub.delivery import DeliveryWorker
+    from skybridge.models import Delivery
+
+    _run(_ev("social.popfeed.feed.review", "mv1", MOVIE_REVIEW))
+    rv_uri = f"at://{DID}/social.popfeed.feed.review/mv1"
+    with session_scope() as session:
+        rv = session.get(Record, rv_uri)
+        assert rv is not None and rv.ap_object_json is not None
+        note = json.loads(rv.ap_object_json)
+        for tag in note.get("tag", []):
+            if "href" in tag:
+                tag["href"] = settings.catalog_id("movie", "tmdbId-999999")
+        rv.ap_object_json = json.dumps(note)
+        session.add(
+            Delivery(
+                record_uri=rv_uri,
+                target_inbox="http://old-peer.example/inbox",
+                activity_type="Create",
+                status="sent",
+            )
+        )
+
+    worker = DeliveryWorker()  # never started: tasks stay observable in-queue
+    report = asyncio.run(repair(worker))
+    assert report.resynced == 1
+
+    tasks = []
+    while not worker.queue.empty():
+        tasks.append(worker.queue.get_nowait())
+    assert any(
+        t.target_inbox == "http://old-peer.example/inbox" and t.activity["type"] == "Update"
+        for t in tasks
+    )
+
+
 def test_repair_resends_pending_retraction_on_tombstoned_row(settings):
     """Deleting the source record after a retraction went pending must not
     hide the pending Delete from later runs — the remote Note is still up."""

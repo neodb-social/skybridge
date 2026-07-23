@@ -119,7 +119,7 @@ def _historical_targets(did: str) -> list[str]:
     return [inbox for inbox in past if inbox not in current]
 
 
-async def _broadcast_retraction(
+async def _broadcast(
     worker: DeliveryWorker | None,
     report: RepairReport,
     *,
@@ -127,6 +127,10 @@ async def _broadcast_retraction(
     did: str,
     activity: dict,
 ) -> None:
+    """Fan a repair activity out to the current audience AND every inbox the
+    author's delivery log remembers — retractions and in-place corrections
+    alike must reach peers that received the damaged Note but have since
+    left the audience."""
     if worker is None:
         return
     report.deliveries += await fanout(worker, record_uri=at_uri, did=did, activity=activity)
@@ -212,7 +216,7 @@ async def _retract(
             row.updated_at = utcnow()
     report.retracted += 1
     if activity is not None:
-        await _broadcast_retraction(worker, report, at_uri=at_uri, did=did, activity=activity)
+        await _broadcast(worker, report, at_uri=at_uri, did=did, activity=activity)
 
 
 async def _retract_episode_notes(worker: DeliveryWorker | None, report: RepairReport) -> None:
@@ -328,7 +332,14 @@ def _rebuild_works(report: RepairReport) -> list[tuple[str, str, str | None, str
     whose work_key changed. Records are replayed in original arrival order so
     the first record's best identifier anchors each work_key, as in live
     ingestion.
+
+    The wipe, every re-mint, and every work_key update commit as ONE
+    transaction: concurrent ingestion can never mint against a half-rebuilt
+    catalog or have its freshly-written work_key clobbered from a stale
+    snapshot (its write serializes before the snapshot or after the commit),
+    and a crash mid-rebuild rolls the whole phase back.
     """
+    remapped: list[tuple[str, str, str | None, str | None]] = []
     with session_scope() as session:
         report.works_before = session.scalar(select(func.count()).select_from(Work)) or 0
         session.execute(sql_delete(WorkIdentifier))
@@ -343,29 +354,26 @@ def _rebuild_works(report: RepairReport) -> list[tuple[str, str, str | None, str
             .order_by(Record.created_at.asc(), Record.at_uri.asc())
         ).all()
 
-    remapped: list[tuple[str, str, str | None, str | None]] = []
-    for at_uri, did, collection, source_json, old_key in rows:
-        try:
-            source = json.loads(source_json or "{}")
-        except ValueError:
-            continue
-        if not isinstance(source, dict) or not source:
-            continue
-        # Archived sources normally carry $type; backstop it from the
-        # collection so works.season_view keys off the right record kind.
-        source.setdefault("$type", collection)
-        ref = works.mint(source)
-        new_key = ref.work_key if ref is not None else None
-        if new_key == old_key:
-            continue
-        with session_scope() as session:
+        for at_uri, did, collection, source_json, old_key in rows:
+            try:
+                source = json.loads(source_json or "{}")
+            except ValueError:
+                continue
+            if not isinstance(source, dict) or not source:
+                continue
+            # Archived sources normally carry $type; backstop it from the
+            # collection so works.season_view keys off the right record kind.
+            source.setdefault("$type", collection)
+            ref = works.mint(source, session=session)
+            new_key = ref.work_key if ref is not None else None
+            if new_key == old_key:
+                continue
             row = session.get(Record, at_uri)
             if row is not None:
                 row.work_key = new_key
                 row.updated_at = utcnow()
-        remapped.append((did, at_uri, old_key, new_key))
+            remapped.append((did, at_uri, old_key, new_key))
 
-    with session_scope() as session:
         report.works_after = session.scalar(select(func.count()).select_from(Work)) or 0
     report.remapped = len(remapped)
     return remapped
@@ -401,7 +409,7 @@ async def _resend_pending_retractions(worker: DeliveryWorker | None, report: Rep
         if not isinstance(activity, dict) or activity.get("type") != "Delete":
             continue
         report.resent += 1
-        await _broadcast_retraction(worker, report, at_uri=at_uri, did=did, activity=activity)
+        await _broadcast(worker, report, at_uri=at_uri, did=did, activity=activity)
 
 
 # Timestamps that legitimately differ between a stored Note and a fresh
@@ -466,10 +474,9 @@ async def _resync_pairs(worker: DeliveryWorker | None, report: RepairReport) -> 
         # correction peers silently miss. (An enqueued delivery that exhausts
         # its retries is logged in the delivery table; like every skybridge
         # broadcast, that last mile is best-effort.)
-        if worker is not None:
-            report.deliveries += await fanout(
-                worker, record_uri=derived.anchor_uri, did=did, activity=derived.activity
-            )
+        await _broadcast(
+            worker, report, at_uri=derived.anchor_uri, did=did, activity=derived.activity
+        )
         _update_ap(derived.anchor_uri, derived.note, derived.activity)
         report.resynced += 1
 
