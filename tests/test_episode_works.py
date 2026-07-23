@@ -552,6 +552,62 @@ def test_repair_resends_pending_retraction_left_by_a_crash(settings):
         assert json.loads(row.ap_activity_json)["type"] == "Delete"
 
 
+def test_repair_resends_pending_retraction_on_tombstoned_row(settings):
+    """Deleting the source record after a retraction went pending must not
+    hide the pending Delete from later runs — the remote Note is still up."""
+    _run(_ev("social.popfeed.feed.review", "ep1", EP_REVIEW))
+    uri = f"at://{DID}/social.popfeed.feed.review/ep1"
+    pending = {
+        "type": "Delete",
+        "id": "https://bridge.test/users/x/posts/ep1#delete",
+        "object": {"id": "https://bridge.test/users/x/posts/ep1", "type": "Tombstone"},
+    }
+    with session_scope() as session:
+        row = session.get(Record, uri)
+        assert row is not None
+        row.ap_activity_json = json.dumps(pending)
+    _run(_ev("social.popfeed.feed.review", "ep1", None, op="delete"))
+
+    report = asyncio.run(repair(None))
+    assert report.resent == 1
+    with session_scope() as session:
+        row = session.get(Record, uri)
+        assert row is not None and row.deleted_at is not None
+        assert row.ap_activity_json is not None
+        assert json.loads(row.ap_activity_json)["type"] == "Delete"
+
+
+def test_delivery_drain_waits_for_backoff_retries(settings, monkeypatch):
+    """repair relies on drain(): stop() alone abandons scheduled retries, and
+    a re-sync correction that failed its first attempt is never re-derived by
+    a later run once the corrected Note is stored."""
+    import dataclasses
+
+    from skybridge.activitypub import delivery as delivery_mod
+    from skybridge.config import set_settings
+
+    set_settings(dataclasses.replace(settings, retry_backoff=(0, 0)))
+    attempts: list[int] = []
+
+    async def fake_post_signed(client, *, inbox, key_id, private_pem, body):
+        attempts.append(len(attempts))
+        return (len(attempts) >= 2, 202 if len(attempts) >= 2 else 500)
+
+    monkeypatch.setattr(delivery_mod, "post_signed", fake_post_signed)
+
+    async def _go():
+        worker = delivery_mod.DeliveryWorker()
+        worker.start()
+        await worker.enqueue(
+            delivery_mod.Task("at://x/y/z", "http://peer/inbox", "kid", "pem", {"type": "Delete"})
+        )
+        await worker.drain()
+        await worker.stop()
+
+    asyncio.run(_go())
+    assert len(attempts) == 2  # the backoff retry ran before drain returned
+
+
 def test_repair_dry_run_changes_nothing(settings):
     ep_uri, _ = _seed_legacy_damage(settings)
     report = asyncio.run(repair(None, dry_run=True))

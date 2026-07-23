@@ -125,6 +125,12 @@ def _cmd_repair(args: argparse.Namespace) -> int:
             return await repair(worker, dry_run=args.dry_run)
         finally:
             if worker:
+                # Drain before stop: stop() abandons scheduled backoff
+                # retries, and a re-sync correction that fails its first
+                # attempt is never re-derived by a later run (the corrected
+                # Note is already stored) — every bounded retry must get its
+                # chance while the command is still alive.
+                await worker.drain()
                 await worker.stop()
 
     report = asyncio.run(_go())

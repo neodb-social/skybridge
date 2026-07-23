@@ -245,11 +245,17 @@ def _pair_trigger(did: str, work_key: str) -> str | None:
 async def _resend_pending_retractions(worker: DeliveryWorker | None, report: RepairReport) -> None:
     """Re-broadcast retractions persisted by an earlier, interrupted run.
 
-    A pending retraction is an active row whose Note was unpublished but that
-    still carries a Delete in ``ap_activity_json`` (written by
+    A pending retraction is a row whose Note was unpublished but that still
+    carries a Delete in ``ap_activity_json`` (written by
     _retract_episode_notes or the pipeline's episode cutoff). Delivery is
     best-effort and in-memory, so the payload is kept and re-sent on every
     run — peers treat a Delete for an already-deleted object as a no-op.
+
+    Tombstoned rows are deliberately included: deleting the source record
+    after a retraction went pending keeps the pending Delete (see
+    _process_delete's no-note branch), and the stranded remote Note still
+    needs it. Rows deleted the ordinary way keep their ``ap_object_json``
+    alongside the Delete, so they don't match this shape.
     """
     with session_scope() as session:
         rows = session.execute(
@@ -257,7 +263,6 @@ async def _resend_pending_retractions(worker: DeliveryWorker | None, report: Rep
                 Record.collection.in_(_PAIRED_COLLECTIONS),
                 Record.ap_object_json.is_(None),
                 Record.ap_activity_json.is_not(None),
-                Record.deleted_at.is_(None),
             )
         ).all()
     for at_uri, did, activity_json in rows:

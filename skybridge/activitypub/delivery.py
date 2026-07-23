@@ -64,6 +64,23 @@ class DeliveryWorker:
             self._task.cancel()
             self._task = None
 
+    async def drain(self) -> None:
+        """Wait until the queue is empty AND every backoff retry has run.
+
+        ``stop()`` alone abandons scheduled retries (``_stopping`` makes
+        ``_requeue_after`` drop its task), which is fine for long-running
+        processes but loses first-attempt failures in one-shot runs. One-shot
+        callers whose deliveries must not be silently dropped (``repair``)
+        drain first, then stop. Terminates because retries are bounded by the
+        ``retry_backoff`` schedule.
+        """
+        while True:
+            await self.queue.join()
+            pending = list(self._pending)
+            if not pending:
+                return
+            await asyncio.gather(*pending, return_exceptions=True)
+
     async def enqueue(self, task: Task) -> None:
         await self.queue.put(task)
 
