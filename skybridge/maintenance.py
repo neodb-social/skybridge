@@ -34,6 +34,12 @@ Idempotent and crash-resumable: a completed second run finds nothing to
 retract or re-map and every pair derivation matching its stored Note; only
 pending (undeliverable-so-far) retractions are re-broadcast, which peers
 treat as no-ops.
+
+RUN WITH THE INGEST PROCESS STOPPED. The rebuild transaction serializes
+against concurrent SQLite writers, but a long write lock can make a
+concurrent ingest transaction fail with SQLITE_BUSY after Jetstream has
+already advanced its cursor — permanently skipping that event. Repair is a
+brief one-shot; pausing ingestion for its duration is the safe procedure.
 """
 
 from __future__ import annotations
@@ -122,16 +128,22 @@ def _pair_historical_targets(did: str, work_key: str) -> list[str]:
     """Historical recipients of THIS pair's Note, minus the current audience.
 
     Correction (Update/Create) deliveries are scoped to inboxes that were
-    sent one of the pair's own records — peers that plausibly hold the
-    damaged Note. The author-wide superset used for Deletes would push new
-    public content to former followers who never had this Note.
+    sent one of the pair's own *active* records — peers that plausibly hold
+    the damaged Note. Tombstoned records are excluded (their Notes were
+    already Deleted; those recipients don't hold the pair's current Note),
+    and the author-wide superset used for Deletes would push new public
+    content to former followers who never had this Note.
     """
     current = set(relay_inboxes()) | set(follower_targets(did))
     with session_scope() as session:
         past = session.scalars(
             select(Delivery.target_inbox)
             .join(Record, Record.at_uri == Delivery.record_uri)
-            .where(Record.did == did, Record.work_key == work_key)
+            .where(
+                Record.did == did,
+                Record.work_key == work_key,
+                Record.deleted_at.is_(None),
+            )
             .distinct()
         ).all()
     return [inbox for inbox in past if inbox not in current]

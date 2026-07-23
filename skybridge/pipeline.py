@@ -241,14 +241,17 @@ async def process_event(
             # under its own rkey (its anchor Note may just have been
             # retracted) or drops this record's now-stale contribution.
             trigger_uri = _pair_trigger(did, prior_key)
-            pair_activity = None
+            prior_pair = None
             if trigger_uri is not None:
-                pair_activity = _sync_pair(
+                prior_pair = _sync_pair(
                     did=did, work_key=prior_key, handle=handle, trigger_uri=trigger_uri
                 )
-            if worker is not None and pair_activity is not None:
+            if worker is not None and prior_pair is not None:
                 delivered += await fanout(
-                    worker, record_uri=at_uri, did=did, activity=pair_activity
+                    worker,
+                    record_uri=prior_pair.anchor_uri,
+                    did=did,
+                    activity=prior_pair.activity,
                 )
         return Processed(at_uri, operation, collection, retraction or {}, delivered)
 
@@ -313,23 +316,29 @@ async def process_event(
         delivered = 0
         if worker is not None and retraction is not None:
             delivered += await fanout(worker, record_uri=at_uri, did=did, activity=retraction)
-        activity = _sync_pair(did=did, work_key=ref.work_key, handle=handle, trigger_uri=at_uri)
-        if worker is not None and activity is not None:
-            delivered += await fanout(worker, record_uri=at_uri, did=did, activity=activity)
+        pair = _sync_pair(did=did, work_key=ref.work_key, handle=handle, trigger_uri=at_uri)
+        activity = pair.activity if pair is not None else None
+        if worker is not None and pair is not None:
+            delivered += await fanout(
+                worker, record_uri=pair.anchor_uri, did=did, activity=pair.activity
+            )
         if prior_key and prior_key != ref.work_key and not works.is_episode_key(prior_key):
             # The update moved this record to a different work (popfeed
             # reassigned identifiers, or an episode item advanced to the next
             # season): re-derive the pair it left, so a surviving partner
             # republishes or drops this record's stale contribution.
             trigger_uri = _pair_trigger(did, prior_key)
-            prior_activity = None
+            prior_pair = None
             if trigger_uri is not None:
-                prior_activity = _sync_pair(
+                prior_pair = _sync_pair(
                     did=did, work_key=prior_key, handle=handle, trigger_uri=trigger_uri
                 )
-            if worker is not None and prior_activity is not None:
+            if worker is not None and prior_pair is not None:
                 delivered += await fanout(
-                    worker, record_uri=at_uri, did=did, activity=prior_activity
+                    worker,
+                    record_uri=prior_pair.anchor_uri,
+                    did=did,
+                    activity=prior_pair.activity,
                 )
         return Processed(at_uri, operation, collection, activity or {}, delivered)
 
@@ -481,13 +490,19 @@ def _derive_pair(*, did: str, work_key: str, handle: str, trigger_uri: str) -> D
     return DerivedPair(anchor.at_uri, anchor.ap_object_json, note, activity)
 
 
-def _sync_pair(*, did: str, work_key: str, handle: str, trigger_uri: str) -> dict | None:
-    """Re-derive, persist, and return the pair's Create/Update activity."""
+def _sync_pair(*, did: str, work_key: str, handle: str, trigger_uri: str) -> DerivedPair | None:
+    """Re-derive and persist the pair's Note; return the derivation.
+
+    Callers fan the activity out with ``record_uri=derived.anchor_uri`` —
+    the row the Note actually lives on — so the delivery log stays
+    associated with the pair and repair's historical-recipient discovery
+    (maintenance._pair_historical_targets) can find those inboxes later.
+    """
     derived = _derive_pair(did=did, work_key=work_key, handle=handle, trigger_uri=trigger_uri)
     if derived is None:
         return None
     _update_ap(derived.anchor_uri, derived.note, derived.activity)
-    return derived.activity
+    return derived
 
 
 def _pair_trigger(did: str, work_key: str) -> str | None:
@@ -660,13 +675,17 @@ async def _process_delete(
             row.op = "delete"
             row.deleted_at = utcnow()
             row.updated_at = utcnow()
-    activity = None
+    pair = None
     if collection in _PAIRED_COLLECTIONS and work_key and _contributes(collection, source):
-        activity = _sync_pair(did=did, work_key=work_key, handle=handle, trigger_uri=at_uri)
+        pair = _sync_pair(did=did, work_key=work_key, handle=handle, trigger_uri=at_uri)
     delivered = 0
-    if worker is not None and activity is not None:
-        delivered = await fanout(worker, record_uri=at_uri, did=did, activity=activity)
-    return Processed(at_uri, "delete", collection, activity or {}, delivered)
+    if worker is not None and pair is not None:
+        delivered = await fanout(
+            worker, record_uri=pair.anchor_uri, did=did, activity=pair.activity
+        )
+    return Processed(
+        at_uri, "delete", collection, pair.activity if pair is not None else {}, delivered
+    )
 
 
 def _persist(

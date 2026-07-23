@@ -190,7 +190,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_repair = sub.add_parser(
         "repair",
         help="retract published tv_episode notes, rebuild the works catalog from "
-        "the archive, and broadcast the corrections (see skybridge.maintenance)",
+        "the archive, and broadcast the corrections (see skybridge.maintenance). "
+        "Run with the ingest process stopped.",
     )
     p_repair.add_argument(
         "--dry-run", action="store_true", help="list what would be retracted, change nothing"
