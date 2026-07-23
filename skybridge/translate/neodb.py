@@ -116,6 +116,19 @@ def shelf_status(list_type: str) -> str | None:
     return None
 
 
+def list_item_status(record: dict) -> str | None:
+    """Shelf status a listItem record marks on its work.
+
+    An episode list-add is bridged as activity on the parent season (see
+    works.season_view), where it always means "watching": one episode never
+    completes (or wishlists) a season, whatever the list's own verb says.
+    """
+    status = shelf_status((record.get("listType") or "").lower())
+    if status and record.get("creativeWorkType") == works.EPISODE_TYPE:
+        return "progress"
+    return status
+
+
 def _published(record: dict, time_us: int | None) -> str:
     """Best-effort ISO-8601 published timestamp.
 
@@ -294,7 +307,10 @@ def _title_html(title: str, ref: works.WorkRef | None) -> str:
 def _populate_review(
     note: dict, record: dict, ref: works.WorkRef | None, shelf_status: str | None = None
 ) -> None:
-    title = record.get("title") or "a work"
+    # Prefer the minted work's (normalized) title: popfeed sometimes labels a
+    # show-typed record with the watched episode's title (see
+    # works.normalize_title); the Note should name the work being marked.
+    title = (ref.title if ref is not None else None) or record.get("title") or "a work"
     text = record.get("text") or ""
     rating = record.get("rating")
     if not isinstance(rating, int | float) or isinstance(rating, bool):
@@ -464,8 +480,9 @@ def _populate_list_item(note: dict, record: dict, ref: works.WorkRef | None) -> 
     # ``watchedEpisodes`` array ({tmdbId, seasonNumber, episodeNumber} per
     # episode). NeoDB supports episode-level marks; we only emit the
     # whole-work Status until that mapping is designed.
-    title = record.get("title") or "a work"
-    list_type = (record.get("listType") or "").lower()
+    # The linked/displayed title is the minted work's, so an episode add
+    # bridged as season activity names the season, not the episode.
+    title = (ref.title if ref is not None else None) or record.get("title") or "a work"
     label = _list_label(record.get("listUri"))
     if label:
         note["content"] = (
@@ -478,7 +495,7 @@ def _populate_list_item(note: dict, record: dict, ref: works.WorkRef | None) -> 
     if ref is not None:
         note["tag"].append(_work_tag(ref))
         note["tag"].append({"type": "Hashtag", "name": f"#{works.category_for(ref.work_type)}"})
-        status = shelf_status(list_type)
+        status = list_item_status(record)
         if status:
             note["relatedWith"].append(_related(note, "Status", ref.url, {"status": status}))
         # No shelf status => collection membership, which the pipeline archives

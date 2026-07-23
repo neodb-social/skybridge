@@ -70,7 +70,59 @@ def _wanted(collection: str) -> bool:
 
 
 def _item_status(source: dict) -> str | None:
-    return neodb.shelf_status(source.get("listType") or "")
+    return neodb.list_item_status(source)
+
+
+def _source_dict(source_json: str | None) -> dict | None:
+    try:
+        source = json.loads(source_json or "{}")
+    except (TypeError, ValueError):
+        return None
+    return source if isinstance(source, dict) else None
+
+
+def _contributes_row(collection: str, source_json: str | None) -> bool:
+    """Same contribution test as _pair_rows, on raw row columns."""
+    if collection == _REVIEW_COLLECTION:
+        return True
+    source = _source_dict(source_json)
+    return source is not None and _item_status(source) is not None
+
+
+def _pair_has_other_holder(did: str, work_key: str, *, exclude_uri: str) -> bool:
+    """Does (author, work) already have a published contributing Note on a
+    row other than *exclude_uri*? (Published status-less membership rows hold
+    standalone Notes and don't count.)"""
+    with session_scope() as session:
+        rows = session.execute(
+            select(Record.collection, Record.source_json).where(
+                Record.did == did,
+                Record.work_key == work_key,
+                Record.collection.in_(_PAIRED_COLLECTIONS),
+                Record.ap_object_json.is_not(None),
+                Record.deleted_at.is_(None),
+                Record.at_uri != exclude_uri,
+            )
+        ).all()
+    return any(_contributes_row(collection, source_json) for collection, source_json in rows)
+
+
+def _prior_state(at_uri: str) -> tuple[str | None, str | None]:
+    """(published Note id, work_key) of the record before this event.
+
+    The Note id is read from the stored AP object — the id peers actually
+    received — never recomputed from the current handle, so a retraction
+    always names the right object. Tombstoned rows yield (None, None): their
+    Note was already retracted on delete.
+    """
+    with session_scope() as session:
+        row = session.get(Record, at_uri)
+        if row is None or row.deleted_at is not None:
+            return None, None
+        work_key = row.work_key
+        ap_object_json = row.ap_object_json
+    note = _source_dict(ap_object_json) if ap_object_json else None
+    return (note.get("id") if note else None), work_key
 
 
 def _contributes(collection: str, record: dict) -> bool:
@@ -136,6 +188,73 @@ async def process_event(
     record = commit.get("record") or {}
     ref = works.mint(record)
 
+    is_episode_work = ref is not None and ref.work_type == works.EPISODE_TYPE
+    is_unresolved_episode = ref is None and record.get("creativeWorkType") == works.EPISODE_TYPE
+    if is_episode_work or is_unresolved_episode:
+        # NeoDB doesn't federate episode-level marks. Episode listItems are
+        # bridged as season activity (works.season_view) and never reach this
+        # branch; whatever still resolves to a tv_episode work (reviews, or an
+        # episode that can't name its season) is archived without AP emission
+        # — including episode records whose identifiers can't mint a work at
+        # all, which would otherwise fall through and publish a generic Note.
+        # A Note this record already published (legacy pre-cutoff state, or a
+        # record updated into an episode) is retracted: the Delete — targeting
+        # the stored Note id — is persisted in ap_activity_json BEFORE the
+        # fanout, so a crash or failed delivery leaves a discoverable pending
+        # retraction (an unpublished row carrying a Delete) rather than a Note
+        # stranded on peers with nothing recording that it still needs one.
+        note_id, prior_key = _prior_state(at_uri)
+        retraction = None
+        if note_id is not None:
+            _, retraction = neodb.translate(
+                did=did,
+                handle=handle,
+                collection=collection,
+                rkey=rkey,
+                record=None,
+                operation="delete",
+                time_us=None,
+                prior_object_id=note_id,
+            )
+        new_key = ref.work_key if ref is not None else None
+        _persist(
+            at_uri=at_uri,
+            did=did,
+            collection=collection,
+            rkey=rkey,
+            cid=commit.get("cid"),
+            source=record,
+            note=None,
+            activity=retraction,
+            operation=operation,
+            work_key=new_key,
+            # No new retraction: keep any pending (not yet delivered) one
+            # from an earlier event rather than wiping it.
+            preserve_ap=retraction is None,
+        )
+        delivered = 0
+        if worker is not None and retraction is not None:
+            delivered = await fanout(worker, record_uri=at_uri, did=did, activity=retraction)
+        if prior_key and prior_key != new_key and not works.is_episode_key(prior_key):
+            # The record left a non-episode pair (an update turned it into an
+            # episode): re-derive that pair so a surviving partner republishes
+            # under its own rkey (its anchor Note may just have been
+            # retracted) or drops this record's now-stale contribution.
+            trigger_uri = _pair_trigger(did, prior_key)
+            prior_pair = None
+            if trigger_uri is not None:
+                prior_pair = _sync_pair(
+                    did=did, work_key=prior_key, handle=handle, trigger_uri=trigger_uri
+                )
+            if worker is not None and prior_pair is not None:
+                delivered += await fanout(
+                    worker,
+                    record_uri=prior_pair.anchor_uri,
+                    did=did,
+                    activity=prior_pair.activity,
+                )
+        return Processed(at_uri, operation, collection, retraction or {}, delivered)
+
     is_membership_only = ref is None or not _contributes(collection, record)
     if collection == _LIST_ITEM_COLLECTION and is_membership_only:
         # Collection membership (a status-less list) or an item with no
@@ -158,6 +277,27 @@ async def process_event(
     if ref is not None and collection in _PAIRED_COLLECTIONS and _contributes(collection, record):
         # Persist the source first (keeping any Note this row already
         # anchors), then re-derive the pair's single Note.
+        note_id, prior_key = _prior_state(at_uri)
+        retraction = None
+        if (
+            note_id is not None
+            and prior_key != ref.work_key
+            and _pair_has_other_holder(did, ref.work_key, exclude_uri=at_uri)
+        ):
+            # This record anchors a Note but is moving into a pair that
+            # already has one: carrying its Note along would leave two
+            # published Notes for one (author, work). Retract it — the
+            # destination's existing holder absorbs the contribution below.
+            _, retraction = neodb.translate(
+                did=did,
+                handle=handle,
+                collection=collection,
+                rkey=rkey,
+                record=None,
+                operation="delete",
+                time_us=None,
+                prior_object_id=note_id,
+            )
         _persist(
             at_uri=at_uri,
             did=did,
@@ -166,15 +306,40 @@ async def process_event(
             cid=commit.get("cid"),
             source=record,
             note=None,
-            activity=None,
+            activity=retraction,
             operation=operation,
             work_key=ref.work_key,
-            preserve_ap=True,
+            # The retraction replaces the stored AP forms (pending-Delete
+            # shape); otherwise the row's Note or pending state is kept.
+            preserve_ap=retraction is None,
         )
-        activity = _sync_pair(did=did, work_key=ref.work_key, handle=handle, trigger_uri=at_uri)
         delivered = 0
-        if worker is not None and activity is not None:
-            delivered = await fanout(worker, record_uri=at_uri, did=did, activity=activity)
+        if worker is not None and retraction is not None:
+            delivered += await fanout(worker, record_uri=at_uri, did=did, activity=retraction)
+        pair = _sync_pair(did=did, work_key=ref.work_key, handle=handle, trigger_uri=at_uri)
+        activity = pair.activity if pair is not None else None
+        if worker is not None and pair is not None:
+            delivered += await fanout(
+                worker, record_uri=pair.anchor_uri, did=did, activity=pair.activity
+            )
+        if prior_key and prior_key != ref.work_key and not works.is_episode_key(prior_key):
+            # The update moved this record to a different work (popfeed
+            # reassigned identifiers, or an episode item advanced to the next
+            # season): re-derive the pair it left, so a surviving partner
+            # republishes or drops this record's stale contribution.
+            trigger_uri = _pair_trigger(did, prior_key)
+            prior_pair = None
+            if trigger_uri is not None:
+                prior_pair = _sync_pair(
+                    did=did, work_key=prior_key, handle=handle, trigger_uri=trigger_uri
+                )
+            if worker is not None and prior_pair is not None:
+                delivered += await fanout(
+                    worker,
+                    record_uri=prior_pair.anchor_uri,
+                    did=did,
+                    activity=prior_pair.activity,
+                )
         return Processed(at_uri, operation, collection, activity or {}, delivered)
 
     note, activity = neodb.translate(
@@ -248,20 +413,51 @@ def _pair_rows(did: str, work_key: str) -> tuple[Record | None, Record | None, R
     return review_row, item_row, holder
 
 
-def _sync_pair(*, did: str, work_key: str, handle: str, trigger_uri: str) -> dict | None:
-    """Re-derive the single combined Note for an (author, work) pair.
+@dataclass
+class DerivedPair:
+    """A pair Note derived by :func:`_derive_pair`, not yet persisted."""
+
+    anchor_uri: str
+    stored_note_json: str | None  # the anchor's currently stored Note, if any
+    note: dict[str, Any]
+    activity: dict[str, Any]
+
+
+def _derive_pair(*, did: str, work_key: str, handle: str, trigger_uri: str) -> DerivedPair | None:
+    """Derive the single combined Note for an (author, work) pair.
 
     The Note stays anchored on the row that first published it; if nothing is
     published yet, the triggering record's rkey becomes the anchor (Create).
-    Returns the Create/Update activity, or None when nothing contributes.
+    Returns ``None`` when nothing contributes. Persisting the result is the
+    caller's call — _sync_pair always writes.
     """
+    if works.is_episode_key(work_key):
+        # Episode-level marks are never (re)published — without this guard a
+        # delete of one episode record could re-derive and re-emit a Note for
+        # a surviving sibling record of the same episode work.
+        return None
     review_row, item_row, anchor = _pair_rows(did, work_key)
     if review_row is None and item_row is None:
         return None
     operation = "update"
     if anchor is None:
         with session_scope() as session:
-            anchor = session.get(Record, trigger_uri)
+            trigger = session.get(Record, trigger_uri)
+
+        def _burned(row: Record) -> bool:
+            # A pending retraction (unpublished row still carrying its
+            # Delete): the rkey-derived object id was tombstoned on peers,
+            # and tombstone-caching servers may reject a Create reusing it.
+            return row.ap_object_json is None and bool(row.ap_activity_json)
+
+        candidates = [r for r in (trigger, review_row, item_row) if r is not None]
+        # Prefer an anchor whose object id was never Deleted. When every
+        # contributing row is burned (e.g. a partnerless record flipped to an
+        # episode and back), the id is reused — same known limit as the
+        # opt-out revive path (see _persist).
+        anchor = next((r for r in candidates if not _burned(r)), None)
+        if anchor is None and candidates:
+            anchor = candidates[0]
         operation = "create"
         if anchor is None:
             return None
@@ -289,8 +485,56 @@ def _sync_pair(*, did: str, work_key: str, handle: str, trigger_uri: str) -> dic
         ref=works.mint(source),
         shelf_status=shelf_status,
     )
-    _update_ap(anchor.at_uri, note, activity)
-    return activity
+    assert note is not None  # never a delete translation on this path
+    return DerivedPair(anchor.at_uri, anchor.ap_object_json, note, activity)
+
+
+def _sync_pair(*, did: str, work_key: str, handle: str, trigger_uri: str) -> DerivedPair | None:
+    """Re-derive and persist the pair's Note; return the derivation.
+
+    Callers fan the activity out with ``record_uri=derived.anchor_uri`` —
+    the row the Note actually lives on — so the delivery log stays
+    associated with the pair rather than whichever partner record happened
+    to trigger the update.
+    """
+    derived = _derive_pair(did=did, work_key=work_key, handle=handle, trigger_uri=trigger_uri)
+    if derived is None:
+        return None
+    _update_ap(derived.anchor_uri, derived.note, derived.activity)
+    return derived
+
+
+def _pair_trigger(did: str, work_key: str) -> str | None:
+    """An active paired row of (author, work) to hand _sync_pair as trigger.
+
+    Prefers the row holding the published Note (the pair's anchor). When
+    nothing is published yet, only a *contributing* row qualifies — same test
+    as _pair_rows — since _sync_pair anchors a fresh Create on the trigger:
+    anchoring on a status-less list membership would tie the pair's Note to a
+    record whose later deletion must not retract it. ``None`` when the pair
+    has no contributing rows left.
+    """
+    with session_scope() as session:
+        rows = session.execute(
+            select(Record.at_uri, Record.collection, Record.source_json, Record.ap_object_json)
+            .where(
+                Record.did == did,
+                Record.work_key == work_key,
+                Record.collection.in_(_PAIRED_COLLECTIONS),
+                Record.deleted_at.is_(None),
+            )
+            .order_by(Record.created_at.asc(), Record.at_uri.asc())
+        ).all()
+
+    candidates = [
+        (at_uri, ap)
+        for at_uri, collection, source_json, ap in rows
+        if _contributes_row(collection, source_json)
+    ]
+    for at_uri, ap_object_json in candidates:
+        if ap_object_json is not None:
+            return at_uri
+    return candidates[0][0] if candidates else None
 
 
 def _update_ap(at_uri: str, note: dict | None, activity: dict | None) -> None:
@@ -430,13 +674,17 @@ async def _process_delete(
             row.op = "delete"
             row.deleted_at = utcnow()
             row.updated_at = utcnow()
-    activity = None
+    pair = None
     if collection in _PAIRED_COLLECTIONS and work_key and _contributes(collection, source):
-        activity = _sync_pair(did=did, work_key=work_key, handle=handle, trigger_uri=at_uri)
+        pair = _sync_pair(did=did, work_key=work_key, handle=handle, trigger_uri=at_uri)
     delivered = 0
-    if worker is not None and activity is not None:
-        delivered = await fanout(worker, record_uri=at_uri, did=did, activity=activity)
-    return Processed(at_uri, "delete", collection, activity or {}, delivered)
+    if worker is not None and pair is not None:
+        delivered = await fanout(
+            worker, record_uri=pair.anchor_uri, did=did, activity=pair.activity
+        )
+    return Processed(
+        at_uri, "delete", collection, pair.activity if pair is not None else {}, delivered
+    )
 
 
 def _persist(

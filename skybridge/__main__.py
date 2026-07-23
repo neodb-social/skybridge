@@ -144,6 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_backfill.add_argument("--deliver", action="store_true")
     p_backfill.set_defaults(func=_cmd_backfill)
+
     return parser
 
 
