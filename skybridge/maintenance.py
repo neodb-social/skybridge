@@ -131,7 +131,9 @@ def _rebuild_works(report: RepairReport) -> list[tuple[str, str, str | None]]:
                 Record.at_uri, Record.did, Record.collection, Record.source_json, Record.work_key
             )
             .where(Record.collection.in_(_PAIRED_COLLECTIONS))
-            .order_by(Record.created_at.asc())
+            # at_uri tiebreak: created_at can collide (backfill bursts), and a
+            # stable replay order keeps rebuilt work_keys identical across runs.
+            .order_by(Record.created_at.asc(), Record.at_uri.asc())
         ).all()
 
     remapped: list[tuple[str, str, str | None]] = []
