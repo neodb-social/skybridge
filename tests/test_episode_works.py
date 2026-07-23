@@ -398,6 +398,54 @@ def test_repair_resyncs_both_sides_of_a_moved_partner(settings):
         assert status["withRegardTo"] == settings.catalog_id("movie", "tmdbId-77777")
 
 
+def test_repair_new_pair_anchor_skips_membership_rows(settings):
+    """A fresh Note for a remapped pair must anchor on a contributing row.
+
+    An older status-less list membership on the same work would otherwise win
+    the anchor (oldest row first), and deleting that membership later would
+    retract the real status Note."""
+    # Older membership-only row on the target work: archived, no AP, no status.
+    membership = {
+        "$type": "social.popfeed.feed.listItem",
+        "title": "Another Movie",
+        "listType": "favorites",
+        "addedAt": "2026-07-01T00:00:00.000Z",
+        "identifiers": {"tmdbId": "77777"},
+        "creativeWorkType": "movie",
+    }
+    _run(_ev("social.popfeed.feed.listItem", "fav1", membership))
+    _run(_ev("social.popfeed.feed.review", "mv1", MOVIE_REVIEW))
+    rv_uri = f"at://{DID}/social.popfeed.feed.review/mv1"
+    item_uri = f"at://{DID}/social.popfeed.feed.listItem/li1"
+    with session_scope() as session:
+        rv = session.get(Record, rv_uri)
+        assert rv is not None and rv.work_key is not None
+        # Legacy wrong merge: a contributing listItem of movie 77777 rode the
+        # review's work; the rebuild will move it home.
+        session.add(
+            Record(
+                at_uri=item_uri,
+                did=DID,
+                collection="social.popfeed.feed.listItem",
+                rkey="li1",
+                source_json=json.dumps({**membership, "listType": "watched_movies"}),
+                op="create",
+                work_key=rv.work_key,
+            )
+        )
+
+    asyncio.run(repair(None))
+
+    with session_scope() as session:
+        membership_row = session.get(Record, f"at://{DID}/social.popfeed.feed.listItem/fav1")
+        item = session.get(Record, item_uri)
+        assert membership_row is not None and item is not None
+        assert membership_row.work_key == item.work_key == "movie:tmdbId-77777"
+        # The Note anchors on the contributing row, not the older membership.
+        assert membership_row.ap_object_json is None
+        assert item.ap_object_json is not None
+
+
 def test_repair_dry_run_changes_nothing(settings):
     ep_uri, _ = _seed_legacy_damage(settings)
     report = asyncio.run(repair(None, dry_run=True))

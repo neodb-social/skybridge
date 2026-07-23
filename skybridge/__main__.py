@@ -114,7 +114,11 @@ def _cmd_repair(args: argparse.Namespace) -> int:
     init_db()
 
     async def _go():
-        worker = DeliveryWorker() if args.deliver else None
+        # Delivery is not optional here (only --dry-run skips it): the repair
+        # destroys the state its own broadcasts are built from (stored Note
+        # ids, episode-typed work_keys), so a mutating-but-silent run would
+        # strand the mis-mapped Notes on peers with no way to retract them.
+        worker = None if args.dry_run else DeliveryWorker()
         if worker:
             worker.start()
         try:
@@ -178,11 +182,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_repair = sub.add_parser(
         "repair",
-        help="retract published tv_episode notes and rebuild the works catalog "
-        "from the archive (see skybridge.maintenance)",
-    )
-    p_repair.add_argument(
-        "--deliver", action="store_true", help="actually broadcast the Deletes/Updates"
+        help="retract published tv_episode notes, rebuild the works catalog from "
+        "the archive, and broadcast the corrections (see skybridge.maintenance)",
     )
     p_repair.add_argument(
         "--dry-run", action="store_true", help="list what would be retracted, change nothing"
