@@ -313,6 +313,7 @@ def test_repair_retracts_rebuilds_and_resyncs(settings):
 
     report = asyncio.run(repair(None))
     assert report.retracted == 1
+    assert report.resent == 0  # a fresh retraction is not also "pending"
     assert report.remapped == 2
     assert report.resynced == 1
 
@@ -457,6 +458,43 @@ def test_repair_new_pair_anchor_skips_membership_rows(settings):
         # The Note anchors on the contributing row, not the older membership.
         assert membership_row.ap_object_json is None
         assert item.ap_object_json is not None
+
+
+def test_repair_updates_published_episode_listitem_in_place(settings):
+    """A published episode listItem that converts to a season keeps its Note:
+    Delete + Create of the same rkey-derived object id would hit peers'
+    tombstone caches, so the Note is Updated in place instead."""
+    _run(_ev("social.popfeed.feed.listItem", "it1", EP_LIST_ITEM))
+    uri = f"at://{DID}/social.popfeed.feed.listItem/it1"
+    with session_scope() as session:
+        row = session.get(Record, uri)
+        assert row is not None and row.ap_object_json is not None
+        note = json.loads(row.ap_object_json)
+        note_id = note["id"]
+        # Doctor into the legacy pre-fix state: episode work, episode-flavored
+        # Note published under the same object id.
+        row.work_key = "tv_episode:tmdbId-7377127"
+        for tag in note.get("tag", []):
+            if "href" in tag:
+                tag["type"] = "Link"
+                tag["href"] = settings.catalog_id("tv_episode", "tmdbId-7377127")
+        row.ap_object_json = json.dumps(note)
+
+    report = asyncio.run(repair(None))
+    assert report.retracted == 0  # never Deleted...
+    assert report.resynced == 1  # ...corrected in place instead
+
+    with session_scope() as session:
+        row = session.get(Record, uri)
+        assert row is not None
+        assert row.work_key == "tv_season:tmdbId-88401-season-7"
+        assert row.ap_object_json is not None and row.ap_activity_json is not None
+        fixed = json.loads(row.ap_object_json)
+        assert fixed["id"] == note_id  # same object id, no tombstone conflict
+        (item_tag,) = [t for t in fixed["tag"] if t["type"] != "Hashtag"]
+        assert item_tag["type"] == "TVSeason"
+        assert item_tag["href"].endswith("/catalog/tv_season/tmdbId-88401-season-7")
+        assert json.loads(row.ap_activity_json)["type"] == "Update"
 
 
 def test_repair_resync_is_stateless_across_interrupted_runs(settings):

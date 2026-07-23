@@ -7,7 +7,9 @@ and the mis-mapped Notes were federated. :func:`repair` cleans that up:
 
 1. **Retract** — broadcast a ``Delete`` for every still-published Note whose
    record resolves to a ``tv_episode`` work (NeoDB doesn't federate
-   episode-level marks, and the pipeline no longer emits them). The Delete is
+   episode-level marks, and the pipeline no longer emits them) — except
+   listItems the rebuild will convert to a season, whose Note is instead
+   Updated in place (step 3) under its existing object id. The Delete is
    persisted in the row's ``ap_activity_json`` *before* it is enqueued, so a
    crash or failed delivery leaves a discoverable pending retraction — an
    unpublished row carrying a Delete — which every later run re-broadcasts.
@@ -42,6 +44,7 @@ from skybridge.activitypub.delivery import DeliveryWorker, fanout
 from skybridge.db import session_scope
 from skybridge.models import BridgedActor, Record, Work, WorkIdentifier, utcnow
 from skybridge.pipeline import (
+    _LIST_ITEM_COLLECTION,
     _PAIRED_COLLECTIONS,
     _REVIEW_COLLECTION,
     _derive_pair,
@@ -81,6 +84,12 @@ async def _retract_episode_notes(
 
     The Tombstone targets the *stored* Note id — not one recomputed from the
     current handle — so the Delete names exactly the object peers received.
+
+    Published episode listItems that can convert to a season are NOT
+    retracted: the rebuild moves them to the season work and _resync_pairs
+    Updates their Note in place under the same object id. Deleting first and
+    re-Creating that id would hit peers' tombstone caches and the corrected
+    season Note might never federate.
     """
     with session_scope() as session:
         rows = session.execute(
@@ -90,6 +99,7 @@ async def _retract_episode_notes(
                 Record.collection,
                 Record.rkey,
                 Record.work_key,
+                Record.source_json,
                 Record.ap_object_json,
             ).where(
                 Record.work_key.like(f"{works.EPISODE_TYPE}:%"),
@@ -98,7 +108,13 @@ async def _retract_episode_notes(
             )
         ).all()
 
-    for at_uri, did, collection, rkey, work_key, ap_object_json in rows:
+    for at_uri, did, collection, rkey, work_key, source_json, ap_object_json in rows:
+        if collection == _LIST_ITEM_COLLECTION:
+            source = None
+            with contextlib.suppress(TypeError, ValueError):
+                source = json.loads(source_json or "{}")
+            if isinstance(source, dict) and works.season_view(source) is not None:
+                continue
         if dry_run:
             report.would_retract.append((at_uri, work_key))
             report.retracted += 1
@@ -311,12 +327,18 @@ async def _resync_pairs(worker: DeliveryWorker | None, report: RepairReport) -> 
                 stored = json.loads(derived.stored_note_json)
         if stored is not None and _comparable(stored) == _comparable(derived.note):
             continue
-        _update_ap(derived.anchor_uri, derived.note, derived.activity)
-        report.resynced += 1
+        # Enqueue before persisting: once the corrected Note is stored, a
+        # later run derives identical content and skips the pair, so a crash
+        # in between must cost a duplicate Update on the rerun — never a
+        # correction peers silently miss. (An enqueued delivery that exhausts
+        # its retries is logged in the delivery table; like every skybridge
+        # broadcast, that last mile is best-effort.)
         if worker is not None:
             report.deliveries += await fanout(
                 worker, record_uri=derived.anchor_uri, did=did, activity=derived.activity
             )
+        _update_ap(derived.anchor_uri, derived.note, derived.activity)
+        report.resynced += 1
 
 
 async def repair(worker: DeliveryWorker | None = None, *, dry_run: bool = False) -> RepairReport:
@@ -328,10 +350,13 @@ async def repair(worker: DeliveryWorker | None = None, *, dry_run: bool = False)
     broadcasting — is for tests only; the CLI always passes a worker.
     """
     report = RepairReport(dry_run=dry_run)
+    if not dry_run:
+        # Before fresh retractions, so a Delete persisted moments ago isn't
+        # immediately re-found as "pending" and sent twice in one run.
+        await _resend_pending_retractions(worker, report)
     await _retract_episode_notes(worker, report, dry_run=dry_run)
     if dry_run:
         return report
-    await _resend_pending_retractions(worker, report)
     _rebuild_works(report)
     await _resync_pairs(worker, report)
     log.info(
