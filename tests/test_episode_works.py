@@ -934,6 +934,125 @@ def test_resync_corrections_persist_only_after_broadcast(settings):
         assert rv is not None and stale_href not in (rv.ap_object_json or "")
 
 
+def test_resync_corrections_skip_unrelated_historical_inboxes(settings):
+    """Corrections (Update/Create) go only to recipients of the damaged
+    Note's pair — an author-wide superset would push new public content to
+    former followers who never had it. (Deletes keep the wide net.)"""
+    from skybridge.activitypub.delivery import DeliveryWorker
+    from skybridge.models import Delivery
+
+    _run(_ev("social.popfeed.feed.review", "mv1", MOVIE_REVIEW))
+    _run(_ev("social.popfeed.feed.review", "ep1", EP_REVIEW))  # unrelated record
+    rv_uri = f"at://{DID}/social.popfeed.feed.review/mv1"
+    with session_scope() as session:
+        rv = session.get(Record, rv_uri)
+        assert rv is not None and rv.ap_object_json is not None
+        note = json.loads(rv.ap_object_json)
+        for tag in note.get("tag", []):
+            if "href" in tag:
+                tag["href"] = settings.catalog_id("movie", "tmdbId-999999")
+        rv.ap_object_json = json.dumps(note)
+        # This inbox only ever received a different (episode) record.
+        session.add(
+            Delivery(
+                record_uri=f"at://{DID}/social.popfeed.feed.review/ep1",
+                target_inbox="http://stranger.example/inbox",
+                activity_type="Create",
+                status="sent",
+            )
+        )
+
+    worker = DeliveryWorker()
+    report = asyncio.run(repair(worker))
+    assert report.resynced == 1
+
+    tasks = []
+    while not worker.queue.empty():
+        tasks.append(worker.queue.get_nowait())
+    updates_to_stranger = [
+        t
+        for t in tasks
+        if t.target_inbox == "http://stranger.example/inbox" and t.activity["type"] != "Delete"
+    ]
+    assert not updates_to_stranger
+
+
+def test_correction_stays_pending_when_all_deliveries_fail(settings, monkeypatch):
+    """Exhausted retries must not mark a correction done: the stored Note
+    stays stale so the next run re-derives and re-sends it."""
+    import dataclasses
+
+    from skybridge.activitypub import delivery as delivery_mod
+    from skybridge.config import set_settings
+    from skybridge.models import Delivery
+
+    set_settings(dataclasses.replace(settings, retry_backoff=(0,)))
+
+    _run(_ev("social.popfeed.feed.review", "mv1", MOVIE_REVIEW))
+    rv_uri = f"at://{DID}/social.popfeed.feed.review/mv1"
+    stale_href = settings.catalog_id("movie", "tmdbId-999999")
+    with session_scope() as session:
+        rv = session.get(Record, rv_uri)
+        assert rv is not None and rv.ap_object_json is not None
+        note = json.loads(rv.ap_object_json)
+        for tag in note.get("tag", []):
+            if "href" in tag:
+                tag["href"] = stale_href
+        rv.ap_object_json = json.dumps(note)
+        # A historical recipient of this pair, so the correction has a target.
+        session.add(
+            Delivery(
+                record_uri=rv_uri,
+                target_inbox="http://flaky.example/inbox",
+                activity_type="Create",
+                status="sent",
+            )
+        )
+
+    async def failing_post_signed(client, *, inbox, key_id, private_pem, body):
+        return (False, 503)
+
+    monkeypatch.setattr(delivery_mod, "post_signed", failing_post_signed)
+
+    async def _go():
+        worker = delivery_mod.DeliveryWorker()
+        worker.start()
+        try:
+            return await repair(worker)
+        finally:
+            await worker.drain()
+            await worker.stop()
+
+    report = asyncio.run(_go())
+    assert report.resynced == 1
+    with session_scope() as session:
+        rv = session.get(Record, rv_uri)
+        assert rv is not None and stale_href in (rv.ap_object_json or "")  # still pending
+
+
+def test_persist_correction_yields_to_concurrent_live_update(settings):
+    """A live event rewriting the anchor during the delivery drain must not
+    be rolled back to the pre-drain derivation."""
+    from skybridge import maintenance
+
+    _run(_ev("social.popfeed.feed.review", "mv1", MOVIE_REVIEW))
+    rv_uri = f"at://{DID}/social.popfeed.feed.review/mv1"
+    with session_scope() as session:
+        rv = session.get(Record, rv_uri)
+        assert rv is not None and rv.ap_object_json is not None
+        observed = rv.ap_object_json
+    # Simulate a concurrent live update landing between derive and persist.
+    with session_scope() as session:
+        rv = session.get(Record, rv_uri)
+        assert rv is not None
+        rv.ap_object_json = json.dumps({"id": "live", "content": "newer state"})
+    maintenance._persist_correction(rv_uri, observed, {"id": "stale"}, {"type": "Update"})
+    with session_scope() as session:
+        rv = session.get(Record, rv_uri)
+        assert rv is not None and rv.ap_object_json is not None
+        assert json.loads(rv.ap_object_json)["id"] == "live"  # not rolled back
+
+
 def test_repair_resends_pending_retraction_on_tombstoned_row(settings):
     """Deleting the source record after a retraction went pending must not
     hide the pending Delete from later runs — the remote Note is still up."""

@@ -63,7 +63,6 @@ from skybridge.pipeline import (
     _pair_rows,
     _pair_trigger,
     _source_dict,
-    _update_ap,
 )
 from skybridge.translate import neodb, works
 
@@ -119,6 +118,25 @@ def _historical_targets(did: str) -> list[str]:
     return [inbox for inbox in past if inbox not in current]
 
 
+def _pair_historical_targets(did: str, work_key: str) -> list[str]:
+    """Historical recipients of THIS pair's Note, minus the current audience.
+
+    Correction (Update/Create) deliveries are scoped to inboxes that were
+    sent one of the pair's own records — peers that plausibly hold the
+    damaged Note. The author-wide superset used for Deletes would push new
+    public content to former followers who never had this Note.
+    """
+    current = set(relay_inboxes()) | set(follower_targets(did))
+    with session_scope() as session:
+        past = session.scalars(
+            select(Delivery.target_inbox)
+            .join(Record, Record.at_uri == Delivery.record_uri)
+            .where(Record.did == did, Record.work_key == work_key)
+            .distinct()
+        ).all()
+    return [inbox for inbox in past if inbox not in current]
+
+
 async def _broadcast(
     worker: DeliveryWorker | None,
     report: RepairReport,
@@ -126,20 +144,16 @@ async def _broadcast(
     at_uri: str,
     did: str,
     activity: dict,
+    historical: list[str],
 ) -> None:
-    """Fan a repair activity out to the current audience AND every inbox the
-    author's delivery log remembers — retractions and in-place corrections
-    alike must reach peers that received the damaged Note but have since
-    left the audience."""
+    """Fan a repair activity out to the current audience AND the given
+    historical inboxes — peers that received the damaged Note but have since
+    left the audience must still get its retraction/correction."""
     if worker is None:
         return
     report.deliveries += await fanout(worker, record_uri=at_uri, did=did, activity=activity)
     report.deliveries += await deliver_to(
-        worker,
-        record_uri=at_uri,
-        did=did,
-        activity=activity,
-        inboxes=_historical_targets(did),
+        worker, record_uri=at_uri, did=did, activity=activity, inboxes=historical
     )
 
 
@@ -215,7 +229,14 @@ async def _retract(
             row.updated_at = utcnow()
     report.retracted += 1
     if activity is not None:
-        await _broadcast(worker, report, at_uri=at_uri, did=did, activity=activity)
+        await _broadcast(
+            worker,
+            report,
+            at_uri=at_uri,
+            did=did,
+            activity=activity,
+            historical=_historical_targets(did),
+        )
 
 
 async def _retract_episode_notes(worker: DeliveryWorker | None, report: RepairReport) -> None:
@@ -451,7 +472,14 @@ async def _resend_pending_retractions(worker: DeliveryWorker | None, report: Rep
         if not isinstance(activity, dict) or activity.get("type") != "Delete":
             continue
         report.resent += 1
-        await _broadcast(worker, report, at_uri=at_uri, did=did, activity=activity)
+        await _broadcast(
+            worker,
+            report,
+            at_uri=at_uri,
+            did=did,
+            activity=activity,
+            historical=_historical_targets(did),
+        )
 
 
 # Timestamps that legitimately differ between a stored Note and a fresh
@@ -470,7 +498,7 @@ def _comparable(node):
 
 async def _resync_pairs(
     worker: DeliveryWorker | None, report: RepairReport
-) -> list[tuple[str, dict, dict]]:
+) -> list[tuple[str, str | None, dict, dict]]:
     """Re-derive every active (author, work) pair; broadcast what changed.
 
     Stateless on purpose: driven by comparing each pair's fresh derivation
@@ -483,13 +511,13 @@ async def _resync_pairs(
     works are never re-published.
 
     Corrections are enqueued here but NOT persisted: the un-updated stored
-    Note is the durable pending marker. Returns ``(anchor_uri, note,
-    activity)`` for the caller to persist only after the delivery queue has
-    drained — a process death anywhere before that leaves the divergence
-    detectable, so the next run re-derives and re-sends instead of skipping
-    a correction peers never received.
+    Note is the durable pending marker. Returns ``(anchor_uri,
+    observed_note_json, note, activity)`` for the caller to persist only
+    after the delivery queue has drained — a process death anywhere before
+    that leaves the divergence detectable, so the next run re-derives and
+    re-sends instead of skipping a correction peers never received.
     """
-    pending: list[tuple[str, dict, dict]] = []
+    pending: list[tuple[str, str | None, dict, dict]] = []
     with session_scope() as session:
         pairs = session.execute(
             select(Record.did, Record.work_key)
@@ -521,11 +549,57 @@ async def _resync_pairs(
         if stored is not None and _comparable(stored) == _comparable(derived.note):
             continue
         await _broadcast(
-            worker, report, at_uri=derived.anchor_uri, did=did, activity=derived.activity
+            worker,
+            report,
+            at_uri=derived.anchor_uri,
+            did=did,
+            activity=derived.activity,
+            historical=_pair_historical_targets(did, work_key),
         )
-        pending.append((derived.anchor_uri, derived.note, derived.activity))
+        pending.append(
+            (derived.anchor_uri, derived.stored_note_json, derived.note, derived.activity)
+        )
         report.resynced += 1
     return pending
+
+
+def _delivery_failed_since(record_uri: str, since) -> bool:
+    """Did any delivery for *record_uri* end in failure during this run?
+
+    _record_attempt keeps one row per (record_uri, inbox) whose status
+    reflects the LAST attempt, so after drain() a ``failed`` row newer than
+    the run start means the bounded retry schedule was exhausted.
+    """
+    with session_scope() as session:
+        failed = session.scalar(
+            select(func.count())
+            .select_from(Delivery)
+            .where(
+                Delivery.record_uri == record_uri,
+                Delivery.status == "failed",
+                Delivery.last_attempt >= since,
+            )
+        )
+    return bool(failed)
+
+
+def _persist_correction(
+    anchor_uri: str, observed_note_json: str | None, note: dict, activity: dict
+) -> None:
+    """Store the corrected Note — unless the anchor changed while we drained.
+
+    A live event may have re-derived the same anchor during the delivery
+    window; its state is newer than this correction (and was broadcast by
+    its own pipeline flow), so an unconditional write would roll it back to
+    the pre-drain derivation.
+    """
+    with session_scope() as session:
+        row = session.get(Record, anchor_uri)
+        if row is None or row.ap_object_json != observed_note_json:
+            return
+        row.ap_object_json = json.dumps(note)
+        row.ap_activity_json = json.dumps(activity)
+        row.updated_at = utcnow()
 
 
 async def repair(worker: DeliveryWorker | None = None, *, dry_run: bool = False) -> RepairReport:
@@ -537,6 +611,7 @@ async def repair(worker: DeliveryWorker | None = None, *, dry_run: bool = False)
     broadcasting — is for tests only; the CLI always passes a worker.
     """
     report = RepairReport(dry_run=dry_run)
+    started_at = utcnow()
     if dry_run:
         await _preview_retractions(report)
         return report
@@ -556,8 +631,13 @@ async def repair(worker: DeliveryWorker | None = None, *, dry_run: bool = False)
     # re-sendable) by the next run, at worst as a duplicate Update.
     if worker is not None:
         await worker.drain()
-    for anchor_uri, note, activity in corrections:
-        _update_ap(anchor_uri, note, activity)
+    for anchor_uri, observed, note, activity in corrections:
+        if worker is not None and _delivery_failed_since(anchor_uri, started_at):
+            # Every bounded retry to at least one inbox failed (temporary
+            # outage): keep the stored Note stale so the next run re-derives
+            # and re-sends this correction instead of considering it done.
+            continue
+        _persist_correction(anchor_uri, observed, note, activity)
     log.info(
         "repair: retracted=%d resent=%d works %d->%d remapped=%d resynced=%d deliveries=%d",
         report.retracted,
