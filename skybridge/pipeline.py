@@ -392,7 +392,22 @@ def _derive_pair(*, did: str, work_key: str, handle: str, trigger_uri: str) -> D
     operation = "update"
     if anchor is None:
         with session_scope() as session:
-            anchor = session.get(Record, trigger_uri)
+            trigger = session.get(Record, trigger_uri)
+
+        def _burned(row: Record) -> bool:
+            # A pending retraction (unpublished row still carrying its
+            # Delete): the rkey-derived object id was tombstoned on peers,
+            # and tombstone-caching servers may reject a Create reusing it.
+            return row.ap_object_json is None and bool(row.ap_activity_json)
+
+        candidates = [r for r in (trigger, review_row, item_row) if r is not None]
+        # Prefer an anchor whose object id was never Deleted. When every
+        # contributing row is burned (e.g. a partnerless record flipped to an
+        # episode and back), the id is reused — same known limit as the
+        # opt-out revive path (see _persist).
+        anchor = next((r for r in candidates if not _burned(r)), None)
+        if anchor is None and candidates:
+            anchor = candidates[0]
         operation = "create"
         if anchor is None:
             return None

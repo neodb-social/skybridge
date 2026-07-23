@@ -335,6 +335,45 @@ def test_episode_item_moving_seasons_resyncs_the_old_season(settings):
         assert status["withRegardTo"].endswith("/catalog/tv_season/tmdbId-88401-season-7")
 
 
+def test_flip_back_from_episode_anchors_on_an_unburned_partner(settings):
+    """A record flipped to an episode had its Note Deleted; when it flips
+    back, the pair's fresh Create must anchor on a partner whose object id
+    was never tombstoned — peers may cache the Tombstone and reject a Create
+    reusing the Deleted id."""
+    _run(_ev("social.popfeed.feed.review", "mv1", MOVIE_REVIEW))
+    item = {
+        "$type": "social.popfeed.feed.listItem",
+        "title": "Everything Everywhere All at Once",
+        "listType": "watched_movies",
+        "addedAt": "2026-07-03T17:16:55.308Z",
+        "identifiers": {"tmdbId": "545611"},
+        "creativeWorkType": "movie",
+    }
+    _run(_ev("social.popfeed.feed.listItem", "it1", item))
+    rv_uri = f"at://{DID}/social.popfeed.feed.review/mv1"
+    it_uri = f"at://{DID}/social.popfeed.feed.listItem/it1"
+    # Simulate a completed episode flip whose prior-pair resync never ran
+    # (crash): the review is a pending retraction on an episode work, the
+    # partner is AP-silent.
+    with session_scope() as session:
+        rv = session.get(Record, rv_uri)
+        it = session.get(Record, it_uri)
+        assert rv is not None and it is not None
+        rv.work_key = "tv_episode:tmdbId-7377127"
+        rv.ap_object_json = None
+        rv.ap_activity_json = json.dumps({"type": "Delete", "object": {"id": "x"}})
+        it.ap_object_json = None
+        it.ap_activity_json = None
+
+    result = _run(_ev("social.popfeed.feed.review", "mv1", MOVIE_REVIEW, op="update"))
+    assert result is not None and result.activity.get("type") == "Create"
+    # Anchored on the partner's never-Deleted id, not the burned review id.
+    assert result.activity["object"]["id"].endswith("/posts/it1")
+    with session_scope() as session:
+        it = session.get(Record, it_uri)
+        assert it is not None and it.ap_object_json is not None
+
+
 def test_episode_list_add_publishes_season_watching_note(settings):
     result = _run(_ev("social.popfeed.feed.listItem", "it1", EP_LIST_ITEM))
     assert result is not None and result.activity.get("type") == "Create"
