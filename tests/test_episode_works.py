@@ -335,6 +335,51 @@ def test_episode_item_moving_seasons_resyncs_the_old_season(settings):
         assert status["withRegardTo"].endswith("/catalog/tv_season/tmdbId-88401-season-7")
 
 
+def test_anchor_moving_into_existing_pair_retracts_its_duplicate_note(settings):
+    """One Note per (author, work): an anchoring record moving into a pair
+    that already holds a published Note must retract its own Note instead of
+    leaving two published for the same work."""
+    s8_item = {
+        **EP_LIST_ITEM,
+        "title": "Dark Side of the Ring - S8E1 - Premiere",
+        "identifiers": {
+            "episodeNumber": 1,
+            "seasonNumber": 8,
+            "tmdbId": "8000001",
+            "tmdbTvSeriesId": "88401",
+        },
+    }
+    _run(_ev("social.popfeed.feed.listItem", "it1", EP_LIST_ITEM))  # anchors S7 Note
+    _run(_ev("social.popfeed.feed.listItem", "it2", s8_item))  # anchors S8 Note
+    it2_uri = f"at://{DID}/social.popfeed.feed.listItem/it2"
+    with session_scope() as session:
+        it2 = session.get(Record, it2_uri)
+        assert it2 is not None and it2.ap_object_json is not None
+        s8_note_id = json.loads(it2.ap_object_json)["id"]
+
+    # it2 moves into S7, which already has it1's Note.
+    s7e5 = {
+        **EP_LIST_ITEM,
+        "title": "Dark Side of the Ring - S7E5 - The Dynamite Kid",
+        "identifiers": {**EP_IDENTIFIERS, "episodeNumber": 5, "tmdbId": "7377128"},
+    }
+    result = _run(_ev("social.popfeed.feed.listItem", "it2", s7e5, op="update"))
+    # The S7 pair is served by it1's existing Note (an Update, not a second
+    # Create), and it2's S8 Note was retracted.
+    assert result is not None and result.activity.get("type") == "Update"
+    assert result.activity["object"]["id"].endswith("/posts/it1")
+    with session_scope() as session:
+        it1 = session.get(Record, f"at://{DID}/social.popfeed.feed.listItem/it1")
+        it2 = session.get(Record, it2_uri)
+        assert it1 is not None and it2 is not None
+        assert it1.ap_object_json is not None
+        assert it2.ap_object_json is None
+        assert it2.ap_activity_json is not None
+        delete = json.loads(it2.ap_activity_json)
+        assert delete["type"] == "Delete"
+        assert delete["object"]["id"] == s8_note_id
+
+
 def test_flip_back_from_episode_anchors_on_an_unburned_partner(settings):
     """A record flipped to an episode had its Note Deleted; when it flips
     back, the pair's fresh Create must anchor on a partner whose object id

@@ -89,6 +89,24 @@ def _contributes_row(collection: str, source_json: str | None) -> bool:
     return source is not None and _item_status(source) is not None
 
 
+def _pair_has_other_holder(did: str, work_key: str, *, exclude_uri: str) -> bool:
+    """Does (author, work) already have a published contributing Note on a
+    row other than *exclude_uri*? (Published status-less membership rows hold
+    standalone Notes and don't count.)"""
+    with session_scope() as session:
+        rows = session.execute(
+            select(Record.collection, Record.source_json).where(
+                Record.did == did,
+                Record.work_key == work_key,
+                Record.collection.in_(_PAIRED_COLLECTIONS),
+                Record.ap_object_json.is_not(None),
+                Record.deleted_at.is_(None),
+                Record.at_uri != exclude_uri,
+            )
+        ).all()
+    return any(_contributes_row(collection, source_json) for collection, source_json in rows)
+
+
 def _prior_state(at_uri: str) -> tuple[str | None, str | None]:
     """(published Note id, work_key) of the record before this event.
 
@@ -256,7 +274,27 @@ async def process_event(
     if ref is not None and collection in _PAIRED_COLLECTIONS and _contributes(collection, record):
         # Persist the source first (keeping any Note this row already
         # anchors), then re-derive the pair's single Note.
-        _, prior_key = _prior_state(at_uri)
+        note_id, prior_key = _prior_state(at_uri)
+        retraction = None
+        if (
+            note_id is not None
+            and prior_key != ref.work_key
+            and _pair_has_other_holder(did, ref.work_key, exclude_uri=at_uri)
+        ):
+            # This record anchors a Note but is moving into a pair that
+            # already has one: carrying its Note along would leave two
+            # published Notes for one (author, work). Retract it — the
+            # destination's existing holder absorbs the contribution below.
+            _, retraction = neodb.translate(
+                did=did,
+                handle=handle,
+                collection=collection,
+                rkey=rkey,
+                record=None,
+                operation="delete",
+                time_us=None,
+                prior_object_id=note_id,
+            )
         _persist(
             at_uri=at_uri,
             did=did,
@@ -265,15 +303,19 @@ async def process_event(
             cid=commit.get("cid"),
             source=record,
             note=None,
-            activity=None,
+            activity=retraction,
             operation=operation,
             work_key=ref.work_key,
-            preserve_ap=True,
+            # The retraction replaces the stored AP forms (pending-Delete
+            # shape); otherwise the row's Note or pending state is kept.
+            preserve_ap=retraction is None,
         )
-        activity = _sync_pair(did=did, work_key=ref.work_key, handle=handle, trigger_uri=at_uri)
         delivered = 0
+        if worker is not None and retraction is not None:
+            delivered += await fanout(worker, record_uri=at_uri, did=did, activity=retraction)
+        activity = _sync_pair(did=did, work_key=ref.work_key, handle=handle, trigger_uri=at_uri)
         if worker is not None and activity is not None:
-            delivered = await fanout(worker, record_uri=at_uri, did=did, activity=activity)
+            delivered += await fanout(worker, record_uri=at_uri, did=did, activity=activity)
         if prior_key and prior_key != ref.work_key and not works.is_episode_key(prior_key):
             # The update moved this record to a different work (popfeed
             # reassigned identifiers, or an episode item advanced to the next
