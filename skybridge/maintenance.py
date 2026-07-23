@@ -60,7 +60,16 @@ from skybridge.activitypub.delivery import (
     relay_inboxes,
 )
 from skybridge.db import session_scope
-from skybridge.models import BridgedActor, Delivery, Record, Work, WorkIdentifier, utcnow
+from skybridge.models import (
+    BridgedActor,
+    Delivery,
+    Follow,
+    Record,
+    Relay,
+    Work,
+    WorkIdentifier,
+    utcnow,
+)
 from skybridge.pipeline import (
     _LIST_ITEM_COLLECTION,
     _PAIRED_COLLECTIONS,
@@ -660,4 +669,81 @@ async def repair(worker: DeliveryWorker | None = None, *, dry_run: bool = False)
         report.resynced,
         report.deliveries,
     )
+    return report
+
+
+# --------------------------------------------------------------------------- #
+# repair2: prune stale delivery-log rows
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class DeliveryPruneReport:
+    dry_run: bool = True
+    kept: list[tuple[str, int]] = field(default_factory=list)  # (inbox, rows) still current
+    stale: list[tuple[str, int]] = field(default_factory=list)  # (inbox, rows) pruned
+    deleted: int = 0
+
+
+def _current_audience_inboxes() -> set[str]:
+    """Every inbox we could still deliver to.
+
+    Every *accepted* relay (read straight from the Relay table, NOT via
+    relay_inboxes() — that intersects with the SKYBRIDGE_RELAYS env var, so a
+    run without it set would wrongly treat the live relay as stale and prune
+    its rows) plus every accepted follower's inbox, both plain and shared
+    forms since the log records whichever was used at send time. A delivery
+    row whose target is absent here can never receive traffic again — a relay
+    removed from the Relay table, or an unfollowed peer.
+    """
+    inboxes: set[str] = set()
+    with session_scope() as session:
+        for inbox in session.scalars(select(Relay.inbox).where(Relay.state == "accepted")):
+            inboxes.add(inbox)
+        for inbox, shared in session.execute(
+            select(Follow.follower_inbox, Follow.follower_shared_inbox).where(
+                Follow.state == "accepted"
+            )
+        ).all():
+            if inbox:
+                inboxes.add(inbox)
+            if shared:
+                inboxes.add(shared)
+    return inboxes
+
+
+def prune_stale_deliveries(*, delete: bool = False) -> DeliveryPruneReport:
+    """Delete delivery-log rows whose target inbox left the current audience.
+
+    The ``delivery`` table is an append-only-ish log: retries/stats read it,
+    and repair's historical-target discovery re-reaches past recipients
+    through it. Rows for inboxes we can no longer deliver to (a removed relay
+    such as a decommissioned ``eggplant.place``, an unfollowed peer) are dead
+    weight — they bloat the log and make ``repair`` waste time trying to
+    re-reach a dead host. Current relay + follower inboxes are always kept.
+
+    ``delete=False`` (default) only reports; pass ``delete=True`` to apply.
+    Safe to run while serving — it is a single quick DELETE, not the heavy
+    catalog rebuild ``repair`` performs.
+
+    Trade-off: pruning an inbox also drops repair's ability to send it a
+    later retraction/correction. That's the intended effect for dead relays;
+    for a genuinely unfollowed human peer it means a future repair won't
+    reach them (acceptable — they left, and a re-follow re-logs deliveries).
+    """
+    report = DeliveryPruneReport(dry_run=not delete)
+    current = _current_audience_inboxes()
+    with session_scope() as session:
+        counts = session.execute(
+            select(Delivery.target_inbox, func.count()).group_by(Delivery.target_inbox)
+        ).all()
+    for inbox, count in counts:
+        (report.kept if inbox in current else report.stale).append((inbox, count))
+    if delete and report.stale:
+        stale_inboxes = [inbox for inbox, _ in report.stale]
+        with session_scope() as session:
+            result = session.execute(
+                sql_delete(Delivery).where(Delivery.target_inbox.in_(stale_inboxes))
+            )
+            report.deleted = getattr(result, "rowcount", 0) or 0
     return report

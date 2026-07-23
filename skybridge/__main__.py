@@ -1,4 +1,4 @@
-"""Skybridge CLI: ``python -m skybridge {serve|ingest|replay|backfill|repair}``.
+"""Skybridge CLI: ``python -m skybridge {serve|ingest|replay|backfill|repair|repair2}``.
 
 All subcommands honour ``SKYBRIDGE_DOMAIN`` (and the other env settings); the
 domain is never hardcoded.
@@ -149,6 +149,29 @@ def _cmd_repair(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_repair2(args: argparse.Namespace) -> int:
+    from skybridge.maintenance import prune_stale_deliveries
+
+    init_db()
+    report = prune_stale_deliveries(delete=args.delete)
+    verb = "delete" if args.delete else "would delete"
+    for inbox, count in sorted(report.stale, key=lambda r: -r[1]):
+        print(f"{verb:>12} {count:>8} rows  {inbox}")
+    for inbox, count in sorted(report.kept, key=lambda r: -r[1]):
+        print(f"{'keep':>12} {count:>8} rows  {inbox}")
+    stale_rows = sum(c for _, c in report.stale)
+    if args.delete:
+        print(
+            f"deleted {report.deleted} stale delivery row(s) across {len(report.stale)} inbox(es)"
+        )
+    else:
+        print(
+            f"dry run: would delete {stale_rows} stale delivery row(s) across "
+            f"{len(report.stale)} inbox(es); pass --delete to apply"
+        )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="skybridge", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -197,6 +220,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="list what would be retracted, change nothing"
     )
     p_repair.set_defaults(func=_cmd_repair)
+
+    p_repair2 = sub.add_parser(
+        "repair2",
+        help="prune stale delivery-log rows whose target inbox left the current "
+        "relay/follower audience (removed relays, unfollowed peers). Safe while serving.",
+    )
+    p_repair2.add_argument(
+        "--delete", action="store_true", help="actually delete (default: dry-run preview)"
+    )
+    p_repair2.set_defaults(func=_cmd_repair2)
     return parser
 
 
