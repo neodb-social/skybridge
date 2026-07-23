@@ -87,12 +87,10 @@ def external_resource_urls(work_type: str, identifiers: dict) -> list[str]:
 
 # Preferred identifier per work type (first match wins), then any remaining.
 # isbn13 over isbn10 (canonical form); mbId (musicbrainz release group, stable
-# across pressings) over mbReleaseId. tmdbSeason is the derived compound season
-# identity (see _with_derived) — a real tv_season record's own tmdbId beats it.
+# across pressings) over mbReleaseId.
 _ID_PRIORITY = (
     "imdbId",
     "tmdbId",
-    "tmdbSeason",
     "igdbId",
     "steamId",
     "isbn",
@@ -115,21 +113,27 @@ EPISODE_TYPE = "tv_episode"
 SEASON_TYPE = "tv_season"
 
 
-def _with_derived(work_type: str, identifiers: dict) -> dict[str, str]:
-    """Stringified identifiers plus derived compound identities.
+def _stringified(identifiers: dict) -> dict[str, str]:
+    return {str(k): str(v) for k, v in identifiers.items() if v not in (None, "")}
+
+
+def _season_compound(work_type: str, ids: dict[str, str]) -> tuple[str, str] | None:
+    """The derived compound identity of a season: ``tmdbId-<series>-season-<n>``.
 
     A season is globally identified by (series, seasonNumber) even when the
     record carries no season-level tmdbId (e.g. a season ref derived from an
-    episode, see season_view) — the ``tmdbSeason`` compound makes that pair a
-    usable key/alias so both spellings merge into one work.
+    episode, see season_view). The compound rides in the ``tmdbId`` namespace
+    (real season ids are purely numeric, so the forms can't collide) and is
+    registered as an alias on every season work, so both spellings merge into
+    one work whichever arrives first.
     """
-    ids = {str(k): str(v) for k, v in identifiers.items() if v not in (None, "")}
-    if work_type == SEASON_TYPE:
-        series = ids.get("tmdbTvSeriesId")
-        season = ids.get("seasonNumber")
-        if series and season:
-            ids["tmdbSeason"] = f"{series}-{season}"
-    return ids
+    if work_type != SEASON_TYPE:
+        return None
+    series = ids.get("tmdbTvSeriesId")
+    season = ids.get("seasonNumber")
+    if series and season:
+        return ("tmdbId", f"{series}-season-{season}")
+    return None
 
 
 @dataclass
@@ -203,9 +207,9 @@ def work_ref(record: dict) -> WorkRef | None:
     """Derive a :class:`WorkRef` from a popfeed record, or ``None`` if it has
     no resolvable creative-work identifier."""
     record = _effective_record(record)
-    identifiers = record.get("identifiers") or {}
+    identifiers = _stringified(record.get("identifiers") or {})
     work_type = record.get("creativeWorkType") or "unknown"
-    picked = _pick_identifier(_with_derived(work_type, identifiers))
+    picked = _pick_identifier(identifiers) or _season_compound(work_type, identifiers)
     if picked is None:
         return None
     id_key, id_val = picked
@@ -250,10 +254,13 @@ def mint(record: dict) -> WorkRef | None:
     ref = work_ref(record)
     if ref is None:
         return None
-    identifiers = _with_derived(ref.work_type, record.get("identifiers") or {})
-    aliases = {k: v for k, v in identifiers.items() if k not in _NON_IDENTIFYING}
+    identifiers = _stringified(record.get("identifiers") or {})
+    aliases = [(k, v) for k, v in identifiers.items() if k not in _NON_IDENTIFYING]
+    compound = _season_compound(ref.work_type, identifiers)
+    if compound is not None and compound not in aliases:
+        aliases.append(compound)
     with session_scope() as session:
-        for key, val in aliases.items():
+        for key, val in aliases:
             alias = session.get(WorkIdentifier, (ref.work_type, key, val))
             if alias is not None:
                 if alias.work_key != ref.work_key:
@@ -278,7 +285,7 @@ def mint(record: dict) -> WorkRef | None:
                 row.poster_url = ref.poster_url
             merged = {**json.loads(row.identifiers_json or "{}"), **identifiers}
             row.identifiers_json = json.dumps(merged)
-        for key, val in aliases.items():
+        for key, val in aliases:
             if session.get(WorkIdentifier, (ref.work_type, key, val)) is None:
                 session.add(
                     WorkIdentifier(

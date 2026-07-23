@@ -144,9 +144,9 @@ def test_episode_list_item_minted_as_season(settings):
     ref = works.mint(EP_LIST_ITEM)
     assert ref is not None
     assert ref.work_type == "tv_season"
-    assert ref.work_key == "tv_season:tmdbSeason-88401-7"
+    assert ref.work_key == "tv_season:tmdbId-88401-season-7"
     assert ref.title == "Dark Side of the Ring - Season 7"
-    assert ref.url.endswith("/catalog/tv_season/tmdbSeason-88401-7")
+    assert ref.url.endswith("/catalog/tv_season/tmdbId-88401-season-7")
     # The episode's own tmdbId must not alias the season work.
     assert ("tmdbId", "7377127") not in _aliases("tv_season")
 
@@ -172,7 +172,7 @@ def test_converted_season_merges_with_real_season_record(settings):
     ref3 = works.mint(EP_LIST_ITEM)
     ref4 = works.mint(SEASON_REVIEW)
     assert ref3 is not None and ref4 is not None
-    assert ref3.work_key == "tv_season:tmdbSeason-88401-7"
+    assert ref3.work_key == "tv_season:tmdbId-88401-season-7"
     assert ref4.work_key == ref3.work_key
 
 
@@ -230,13 +230,13 @@ def test_episode_list_add_publishes_season_watching_note(settings):
     note = result.activity["object"]
     (item_tag,) = [t for t in note["tag"] if t["type"] != "Hashtag"]
     assert item_tag["type"] == "TVSeason"
-    assert item_tag["href"].endswith("/catalog/tv_season/tmdbSeason-88401-7")
+    assert item_tag["href"].endswith("/catalog/tv_season/tmdbId-88401-season-7")
     assert item_tag["name"] == "Dark Side of the Ring - Season 7"
     (status,) = [r for r in note["relatedWith"] if r["type"] == "Status"]
     # "watched_episodes" would normally mean complete; one episode never
     # completes a season, so the season mark is always progress.
     assert status["status"] == "progress"
-    assert status["withRegardTo"].endswith("/catalog/tv_season/tmdbSeason-88401-7")
+    assert status["withRegardTo"].endswith("/catalog/tv_season/tmdbId-88401-season-7")
     assert "Dark Side of the Ring - Season 7" in note["content"]
     assert "#tv" in {t.get("name") for t in note["tag"]}
 
