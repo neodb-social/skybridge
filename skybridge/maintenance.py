@@ -468,7 +468,9 @@ def _comparable(node):
     return node
 
 
-async def _resync_pairs(worker: DeliveryWorker | None, report: RepairReport) -> None:
+async def _resync_pairs(
+    worker: DeliveryWorker | None, report: RepairReport
+) -> list[tuple[str, dict, dict]]:
     """Re-derive every active (author, work) pair; broadcast what changed.
 
     Stateless on purpose: driven by comparing each pair's fresh derivation
@@ -479,7 +481,15 @@ async def _resync_pairs(worker: DeliveryWorker | None, report: RepairReport) -> 
     partner's status (Update), and a pair left Note-less because its records
     moved to a new work (Create, anchored on a contributing row). Episode
     works are never re-published.
+
+    Corrections are enqueued here but NOT persisted: the un-updated stored
+    Note is the durable pending marker. Returns ``(anchor_uri, note,
+    activity)`` for the caller to persist only after the delivery queue has
+    drained — a process death anywhere before that leaves the divergence
+    detectable, so the next run re-derives and re-sends instead of skipping
+    a correction peers never received.
     """
+    pending: list[tuple[str, dict, dict]] = []
     with session_scope() as session:
         pairs = session.execute(
             select(Record.did, Record.work_key)
@@ -510,17 +520,12 @@ async def _resync_pairs(worker: DeliveryWorker | None, report: RepairReport) -> 
                 stored = json.loads(derived.stored_note_json)
         if stored is not None and _comparable(stored) == _comparable(derived.note):
             continue
-        # Enqueue before persisting: once the corrected Note is stored, a
-        # later run derives identical content and skips the pair, so a crash
-        # in between must cost a duplicate Update on the rerun — never a
-        # correction peers silently miss. (An enqueued delivery that exhausts
-        # its retries is logged in the delivery table; like every skybridge
-        # broadcast, that last mile is best-effort.)
         await _broadcast(
             worker, report, at_uri=derived.anchor_uri, did=did, activity=derived.activity
         )
-        _update_ap(derived.anchor_uri, derived.note, derived.activity)
+        pending.append((derived.anchor_uri, derived.note, derived.activity))
         report.resynced += 1
+    return pending
 
 
 async def repair(worker: DeliveryWorker | None = None, *, dry_run: bool = False) -> RepairReport:
@@ -544,7 +549,15 @@ async def repair(worker: DeliveryWorker | None = None, *, dry_run: bool = False)
     await _retract_episode_notes(worker, report)
     await _retract_remapped_nonpaired(worker, report, remapped)
     await _retract_duplicate_holders(worker, report)
-    await _resync_pairs(worker, report)
+    corrections = await _resync_pairs(worker, report)
+    # Persist corrected Notes only after every enqueued delivery has had its
+    # bounded retries: the stale stored Note is the durable pending marker,
+    # so dying before this point leaves each correction re-derivable (and
+    # re-sendable) by the next run, at worst as a duplicate Update.
+    if worker is not None:
+        await worker.drain()
+    for anchor_uri, note, activity in corrections:
+        _update_ap(anchor_uri, note, activity)
     log.info(
         "repair: retracted=%d resent=%d works %d->%d remapped=%d resynced=%d deliveries=%d",
         report.retracted,

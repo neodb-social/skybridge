@@ -72,8 +72,11 @@ class DeliveryWorker:
         processes but loses first-attempt failures in one-shot runs. One-shot
         callers whose deliveries must not be silently dropped (``repair``)
         drain first, then stop. Terminates because retries are bounded by the
-        ``retry_backoff`` schedule.
+        ``retry_backoff`` schedule. A worker that was never started has no
+        consumer — nothing can drain, so this returns immediately.
         """
+        if self._task is None:
+            return
         while True:
             await self.queue.join()
             pending = list(self._pending)

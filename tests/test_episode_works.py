@@ -898,6 +898,42 @@ def test_repair_resync_updates_reach_historical_targets(settings):
     )
 
 
+def test_resync_corrections_persist_only_after_broadcast(settings):
+    """The stale stored Note is the durable pending-resync marker: it must
+    survive until deliveries had their bounded retries, so a process death
+    mid-repair leaves the correction re-derivable (and re-sendable) by the
+    next run instead of silently skipped."""
+    from skybridge import maintenance
+
+    _run(_ev("social.popfeed.feed.review", "mv1", MOVIE_REVIEW))
+    rv_uri = f"at://{DID}/social.popfeed.feed.review/mv1"
+    stale_href = settings.catalog_id("movie", "tmdbId-999999")
+    with session_scope() as session:
+        rv = session.get(Record, rv_uri)
+        assert rv is not None and rv.ap_object_json is not None
+        note = json.loads(rv.ap_object_json)
+        for tag in note.get("tag", []):
+            if "href" in tag:
+                tag["href"] = stale_href
+        rv.ap_object_json = json.dumps(note)
+
+    # The broadcast phase alone (simulating death before the final persist)
+    # leaves the stored Note stale...
+    report = maintenance.RepairReport()
+    pending = asyncio.run(maintenance._resync_pairs(None, report))
+    assert report.resynced == 1 and len(pending) == 1
+    with session_scope() as session:
+        rv = session.get(Record, rv_uri)
+        assert rv is not None and stale_href in (rv.ap_object_json or "")
+
+    # ...so a full next run still detects the divergence and repairs it.
+    rerun = asyncio.run(repair(None))
+    assert rerun.resynced == 1
+    with session_scope() as session:
+        rv = session.get(Record, rv_uri)
+        assert rv is not None and stale_href not in (rv.ap_object_json or "")
+
+
 def test_repair_resends_pending_retraction_on_tombstoned_row(settings):
     """Deleting the source record after a retraction went pending must not
     hide the pending Delete from later runs — the remote Note is still up."""
