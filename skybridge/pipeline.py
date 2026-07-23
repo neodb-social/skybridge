@@ -70,7 +70,7 @@ def _wanted(collection: str) -> bool:
 
 
 def _item_status(source: dict) -> str | None:
-    return neodb.shelf_status(source.get("listType") or "")
+    return neodb.list_item_status(source)
 
 
 def _contributes(collection: str, record: dict) -> bool:
@@ -135,6 +135,26 @@ async def process_event(
 
     record = commit.get("record") or {}
     ref = works.mint(record)
+
+    if ref is not None and ref.work_type == works.EPISODE_TYPE:
+        # NeoDB doesn't federate episode-level marks. Episode listItems are
+        # bridged as season activity (works.season_view) and never reach this
+        # branch; whatever still resolves to a tv_episode work (reviews, or an
+        # episode that can't name its season) is archived without AP emission
+        # — clearing any previously published AP forms along the way.
+        _persist(
+            at_uri=at_uri,
+            did=did,
+            collection=collection,
+            rkey=rkey,
+            cid=commit.get("cid"),
+            source=record,
+            note=None,
+            activity=None,
+            operation=operation,
+            work_key=ref.work_key,
+        )
+        return Processed(at_uri, operation, collection, {})
 
     is_membership_only = ref is None or not _contributes(collection, record)
     if collection == _LIST_ITEM_COLLECTION and is_membership_only:
@@ -255,6 +275,11 @@ def _sync_pair(*, did: str, work_key: str, handle: str, trigger_uri: str) -> dic
     published yet, the triggering record's rkey becomes the anchor (Create).
     Returns the Create/Update activity, or None when nothing contributes.
     """
+    if works.is_episode_key(work_key):
+        # Episode-level marks are never (re)published — without this guard a
+        # delete of one episode record could re-derive and re-emit a Note for
+        # a surviving sibling record of the same episode work.
+        return None
     review_row, item_row, anchor = _pair_rows(did, work_key)
     if review_row is None and item_row is None:
         return None

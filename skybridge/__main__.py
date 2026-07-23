@@ -1,4 +1,4 @@
-"""Skybridge CLI: ``python -m skybridge {serve|ingest|replay|backfill}``.
+"""Skybridge CLI: ``python -m skybridge {serve|ingest|replay|backfill|repair}``.
 
 All subcommands honour ``SKYBRIDGE_DOMAIN`` (and the other env settings); the
 domain is never hardcoded.
@@ -107,6 +107,37 @@ def _cmd_backfill(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_repair(args: argparse.Namespace) -> int:
+    from skybridge.activitypub.delivery import DeliveryWorker
+    from skybridge.maintenance import repair
+
+    init_db()
+
+    async def _go():
+        worker = DeliveryWorker() if args.deliver else None
+        if worker:
+            worker.start()
+        try:
+            return await repair(worker, dry_run=args.dry_run)
+        finally:
+            if worker:
+                await worker.stop()
+
+    report = asyncio.run(_go())
+    if report.dry_run:
+        for at_uri, work_key in report.would_retract:
+            print(f"would retract {at_uri} ({work_key})")
+        print(f"dry run: would retract {report.retracted} episode note(s); rebuild skipped")
+    else:
+        print(
+            f"retracted {report.retracted} episode note(s), "
+            f"works {report.works_before} -> {report.works_after}, "
+            f"remapped {report.remapped} record(s), re-synced {report.resynced} note(s), "
+            f"enqueued {report.deliveries} deliver(ies)"
+        )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="skybridge", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -144,6 +175,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_backfill.add_argument("--deliver", action="store_true")
     p_backfill.set_defaults(func=_cmd_backfill)
+
+    p_repair = sub.add_parser(
+        "repair",
+        help="retract published tv_episode notes and rebuild the works catalog "
+        "from the archive (see skybridge.maintenance)",
+    )
+    p_repair.add_argument(
+        "--deliver", action="store_true", help="actually broadcast the Deletes/Updates"
+    )
+    p_repair.add_argument(
+        "--dry-run", action="store_true", help="list what would be retracted, change nothing"
+    )
+    p_repair.set_defaults(func=_cmd_repair)
     return parser
 
 
