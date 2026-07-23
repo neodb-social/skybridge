@@ -159,9 +159,11 @@ async def process_event(
         # branch; whatever still resolves to a tv_episode work (reviews, or an
         # episode that can't name its season) is archived without AP emission.
         # A Note this record already published (legacy pre-cutoff state, or a
-        # record updated into an episode) is retracted first — clearing the
-        # AP forms alone would strand the Note on peers, beyond even the
-        # reach of the repair command (which needs the stored AP to find it).
+        # record updated into an episode) is retracted: the Delete — targeting
+        # the stored Note id — is persisted in ap_activity_json BEFORE the
+        # fanout, so a crash or failed delivery leaves a discoverable pending
+        # retraction (an unpublished row carrying a Delete) that the repair
+        # command re-broadcasts, instead of a Note stranded on peers forever.
         retraction = None
         note_id = _published_note_id(at_uri)
         if note_id is not None:
@@ -183,9 +185,12 @@ async def process_event(
             cid=commit.get("cid"),
             source=record,
             note=None,
-            activity=None,
+            activity=retraction,
             operation=operation,
             work_key=ref.work_key,
+            # No new retraction: keep any pending (not yet delivered) one
+            # from an earlier event rather than wiping it.
+            preserve_ap=retraction is None,
         )
         delivered = 0
         if worker is not None and retraction is not None:
@@ -304,12 +309,24 @@ def _pair_rows(did: str, work_key: str) -> tuple[Record | None, Record | None, R
     return review_row, item_row, holder
 
 
-def _sync_pair(*, did: str, work_key: str, handle: str, trigger_uri: str) -> dict | None:
-    """Re-derive the single combined Note for an (author, work) pair.
+@dataclass
+class DerivedPair:
+    """A pair Note derived by :func:`_derive_pair`, not yet persisted."""
+
+    anchor_uri: str
+    stored_note_json: str | None  # the anchor's currently stored Note, if any
+    note: dict[str, Any]
+    activity: dict[str, Any]
+
+
+def _derive_pair(*, did: str, work_key: str, handle: str, trigger_uri: str) -> DerivedPair | None:
+    """Derive the single combined Note for an (author, work) pair.
 
     The Note stays anchored on the row that first published it; if nothing is
     published yet, the triggering record's rkey becomes the anchor (Create).
-    Returns the Create/Update activity, or None when nothing contributes.
+    Returns ``None`` when nothing contributes. Persisting the result is the
+    caller's call — _sync_pair always writes, the repair command first checks
+    whether the derivation differs from what was already published.
     """
     if works.is_episode_key(work_key):
         # Episode-level marks are never (re)published — without this guard a
@@ -350,8 +367,17 @@ def _sync_pair(*, did: str, work_key: str, handle: str, trigger_uri: str) -> dic
         ref=works.mint(source),
         shelf_status=shelf_status,
     )
-    _update_ap(anchor.at_uri, note, activity)
-    return activity
+    assert note is not None  # never a delete translation on this path
+    return DerivedPair(anchor.at_uri, anchor.ap_object_json, note, activity)
+
+
+def _sync_pair(*, did: str, work_key: str, handle: str, trigger_uri: str) -> dict | None:
+    """Re-derive, persist, and return the pair's Create/Update activity."""
+    derived = _derive_pair(did=did, work_key=work_key, handle=handle, trigger_uri=trigger_uri)
+    if derived is None:
+        return None
+    _update_ap(derived.anchor_uri, derived.note, derived.activity)
+    return derived.activity
 
 
 def _update_ap(at_uri: str, note: dict | None, activity: dict | None) -> None:

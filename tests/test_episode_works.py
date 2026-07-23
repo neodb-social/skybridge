@@ -208,13 +208,21 @@ def test_episode_review_update_retracts_previously_published_note(settings):
         row.ap_activity_json = "{}"
     result = _run(_ev("social.popfeed.feed.review", "ep1", EP_REVIEW, op="update"))
     # The stranded Note is Deleted on peers (by its stored id), not just
-    # dropped locally — repair can't find it once the AP forms are cleared.
+    # dropped locally, and the Delete is persisted as a pending retraction so
+    # a crashed/failed delivery can be re-broadcast by repair.
     assert result is not None and result.activity.get("type") == "Delete"
     assert result.activity["object"]["id"] == note_id
     with session_scope() as session:
         row = session.get(Record, uri)
-        assert row is not None
-        assert row.ap_object_json is None and row.ap_activity_json is None
+        assert row is not None and row.ap_activity_json is not None
+        assert row.ap_object_json is None
+        assert json.loads(row.ap_activity_json)["type"] == "Delete"
+    # A further update must keep the pending retraction, not wipe it.
+    _run(_ev("social.popfeed.feed.review", "ep1", EP_REVIEW, op="update"))
+    with session_scope() as session:
+        row = session.get(Record, uri)
+        assert row is not None and row.ap_activity_json is not None
+        assert json.loads(row.ap_activity_json)["object"]["id"] == note_id
 
 
 def test_episode_review_delete_does_not_republish_sibling(settings):
@@ -312,7 +320,10 @@ def test_repair_retracts_rebuilds_and_resyncs(settings):
         ep = session.get(Record, ep_uri)
         assert ep is not None
         assert ep.work_key == "tv_episode:tmdbId-7377127"
-        assert ep.ap_object_json is None and ep.ap_activity_json is None
+        # Unpublished, but the Delete is kept as a re-broadcastable pending
+        # retraction (delivery is best-effort and in-memory).
+        assert ep.ap_object_json is None and ep.ap_activity_json is not None
+        assert json.loads(ep.ap_activity_json)["type"] == "Delete"
         mv = session.get(Record, mv_uri)
         assert mv is not None and mv.ap_object_json is not None
         assert mv.work_key == "movie:imdbId-tt6710474"
@@ -324,11 +335,13 @@ def test_repair_retracts_rebuilds_and_resyncs(settings):
     assert ("episodeNumber", "4") not in aliases
     assert aliases[("tmdbId", "7377127")] == "tv_episode:tmdbId-7377127"
 
-    # Idempotent: nothing left to retract or remap on a second run.
+    # Idempotent: nothing left to retract or remap on a second run; only the
+    # pending retraction is re-broadcast (a no-op for peers).
     again = asyncio.run(repair(None))
     assert again.retracted == 0
     assert again.remapped == 0
     assert again.resynced == 0
+    assert again.resent == 1
 
 
 def test_repair_resyncs_both_sides_of_a_moved_partner(settings):
@@ -444,6 +457,61 @@ def test_repair_new_pair_anchor_skips_membership_rows(settings):
         # The Note anchors on the contributing row, not the older membership.
         assert membership_row.ap_object_json is None
         assert item.ap_object_json is not None
+
+
+def test_repair_resync_is_stateless_across_interrupted_runs(settings):
+    """Simulates a crash between the rebuild (work_key committed) and the
+    re-sync broadcast: the stored Note still references the old work while
+    the record's key is already correct, so `remapped` is empty on the next
+    run. The re-sync must detect the divergence from stored state alone."""
+    _run(_ev("social.popfeed.feed.review", "mv1", MOVIE_REVIEW))
+    rv_uri = f"at://{DID}/social.popfeed.feed.review/mv1"
+    good_href = settings.catalog_id("movie", "imdbId-tt6710474")
+    with session_scope() as session:
+        rv = session.get(Record, rv_uri)
+        assert rv is not None and rv.ap_object_json is not None
+        note = json.loads(rv.ap_object_json)
+        for tag in note.get("tag", []):
+            if "href" in tag:
+                tag["href"] = settings.catalog_id("movie", "tmdbId-999999")
+        rv.ap_object_json = json.dumps(note)
+
+    report = asyncio.run(repair(None))
+    assert report.remapped == 0  # the rebuild sees nothing to move...
+    assert report.resynced == 1  # ...but the stale Note is still corrected
+
+    with session_scope() as session:
+        rv = session.get(Record, rv_uri)
+        assert rv is not None and rv.ap_object_json is not None
+        note = json.loads(rv.ap_object_json)
+        (item_tag,) = [t for t in note["tag"] if t["type"] != "Hashtag"]
+        assert item_tag["href"] == good_href
+
+
+def test_repair_resends_pending_retraction_left_by_a_crash(settings):
+    """A retraction persisted but never delivered (crash before the fanout
+    drained) must be re-broadcast by the next run, forever if need be."""
+    _run(_ev("social.popfeed.feed.review", "ep1", EP_REVIEW))
+    uri = f"at://{DID}/social.popfeed.feed.review/ep1"
+    pending = {
+        "type": "Delete",
+        "id": "https://bridge.test/users/x/posts/ep1#delete",
+        "object": {"id": "https://bridge.test/users/x/posts/ep1", "type": "Tombstone"},
+    }
+    with session_scope() as session:
+        row = session.get(Record, uri)
+        assert row is not None and row.ap_object_json is None
+        row.ap_activity_json = json.dumps(pending)
+
+    report = asyncio.run(repair(None))
+    assert report.retracted == 0  # nothing newly published to retract
+    assert report.resent == 1
+
+    with session_scope() as session:
+        row = session.get(Record, uri)
+        assert row is not None and row.ap_activity_json is not None
+        # The payload survives for future reruns (delivery is best-effort).
+        assert json.loads(row.ap_activity_json)["type"] == "Delete"
 
 
 def test_repair_dry_run_changes_nothing(settings):

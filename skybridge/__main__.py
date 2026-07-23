@@ -134,7 +134,8 @@ def _cmd_repair(args: argparse.Namespace) -> int:
         print(f"dry run: would retract {report.retracted} episode note(s); rebuild skipped")
     else:
         print(
-            f"retracted {report.retracted} episode note(s), "
+            f"retracted {report.retracted} episode note(s) "
+            f"(+{report.resent} pending re-sent), "
             f"works {report.works_before} -> {report.works_after}, "
             f"remapped {report.remapped} record(s), re-synced {report.resynced} note(s), "
             f"enqueued {report.deliveries} deliver(ies)"

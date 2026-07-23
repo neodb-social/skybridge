@@ -7,18 +7,25 @@ and the mis-mapped Notes were federated. :func:`repair` cleans that up:
 
 1. **Retract** — broadcast a ``Delete`` for every still-published Note whose
    record resolves to a ``tv_episode`` work (NeoDB doesn't federate
-   episode-level marks, and the pipeline no longer emits them) and clear the
-   stored AP forms so the records become archive-only.
+   episode-level marks, and the pipeline no longer emits them). The Delete is
+   persisted in the row's ``ap_activity_json`` *before* it is enqueued, so a
+   crash or failed delivery leaves a discoverable pending retraction — an
+   unpublished row carrying a Delete — which every later run re-broadcasts.
 2. **Rebuild** — wipe ``work`` / ``work_identifier`` and re-mint every
    archived review/listItem source through the fixed logic, re-pointing each
    record's ``work_key``. Episode listItems come back as season works
    (works.season_view).
-3. **Re-sync** — for every record whose work mapping changed, re-derive the
-   (author, work) pair Notes on both sides of the move: the work it left
-   drops the mover's contribution from its Note (Update), the work it
-   joined gets one published for it (Create/Update).
+3. **Re-sync** — statelessly: re-derive every active (author, work) pair
+   Note and broadcast wherever the derivation differs from what is stored —
+   an Update for a Note that referenced the wrong work or carried a moved
+   partner's status, a Create for a pair whose Note ended up on a different
+   work. Driven purely by stored state, never by this run's bookkeeping, so
+   an interrupted run converges on the next one.
 
-Idempotent: a second run finds nothing left to retract or re-map.
+Idempotent and crash-resumable: a completed second run finds nothing to
+retract or re-map and every pair derivation matching its stored Note; only
+pending (undeliverable-so-far) retractions are re-broadcast, which peers
+treat as no-ops.
 """
 
 from __future__ import annotations
@@ -34,7 +41,13 @@ from sqlalchemy import func, select
 from skybridge.activitypub.delivery import DeliveryWorker, fanout
 from skybridge.db import session_scope
 from skybridge.models import BridgedActor, Record, Work, WorkIdentifier, utcnow
-from skybridge.pipeline import _PAIRED_COLLECTIONS, _REVIEW_COLLECTION, _item_status, _sync_pair
+from skybridge.pipeline import (
+    _PAIRED_COLLECTIONS,
+    _REVIEW_COLLECTION,
+    _derive_pair,
+    _item_status,
+    _update_ap,
+)
 from skybridge.translate import neodb, works
 
 log = logging.getLogger("skybridge.maintenance")
@@ -42,15 +55,16 @@ log = logging.getLogger("skybridge.maintenance")
 
 @dataclass
 class RepairReport:
-    retracted: int = 0  # episode Notes deleted from peers / cleared locally
+    retracted: int = 0  # freshly retracted episode Notes (Delete persisted + sent)
+    resent: int = 0  # pending retractions from earlier runs re-broadcast
     works_before: int = 0
     works_after: int = 0
     remapped: int = 0  # records whose work_key changed in the rebuild
-    resynced: int = 0  # published Notes re-derived and Updated
+    resynced: int = 0  # pair Notes whose derivation differed from the stored one
     deliveries: int = 0  # outbound tasks enqueued (0 when run without a worker)
     dry_run: bool = False
     # (at_uri, old_work_key) of what phase 1 would retract; only kept in
-    # dry-run mode, where phases 2-3 don't run.
+    # dry-run mode, where the later phases don't run.
     would_retract: list[tuple[str, str | None]] = field(default_factory=list)
 
 
@@ -105,19 +119,19 @@ async def _retract_episode_notes(
                 time_us=None,
                 prior_object_id=note_id,
             )
-        # Enqueue the Delete before clearing the row: a crash in between
-        # costs at worst a duplicate Delete on the rerun (peers ignore those),
-        # whereas clearing first would lose the retraction forever — the
-        # rerun's query can no longer find the row.
-        if worker is not None and activity is not None:
-            report.deliveries += await fanout(worker, record_uri=at_uri, did=did, activity=activity)
+        # Persist the pending retraction (unpublished row carrying the
+        # Delete) BEFORE enqueueing it: a crash or failed delivery leaves
+        # durable state that _resend_pending_retractions rediscovers, instead
+        # of a Note stranded on peers with nothing left to find it by.
         with session_scope() as session:
             row = session.get(Record, at_uri)
             if row is not None:
                 row.ap_object_json = None
-                row.ap_activity_json = None
+                row.ap_activity_json = json.dumps(activity) if activity is not None else None
                 row.updated_at = utcnow()
         report.retracted += 1
+        if worker is not None and activity is not None:
+            report.deliveries += await fanout(worker, record_uri=at_uri, did=did, activity=activity)
 
 
 def _rebuild_works(report: RepairReport) -> list[tuple[str, str, str | None, str | None]]:
@@ -212,42 +226,97 @@ def _pair_trigger(did: str, work_key: str) -> str | None:
     return candidates[0][0] if candidates else None
 
 
-async def _resync_remapped(
-    worker: DeliveryWorker | None,
-    remapped: list[tuple[str, str, str | None, str | None]],
-    report: RepairReport,
-) -> None:
-    """Re-derive and broadcast the pairs on *both* sides of every move.
+async def _resend_pending_retractions(worker: DeliveryWorker | None, report: RepairReport) -> None:
+    """Re-broadcast retractions persisted by an earlier, interrupted run.
 
-    A pair's Note lives on one anchor row while partner records stay
-    AP-silent, so the moved record itself often isn't the published one:
-    the work it left keeps a Note that must drop the mover's contribution
-    (Update), and the work it joined may have no Note at all yet (Create,
-    anchored on a contributing row). Episode works are never re-published;
-    one re-sync per (author, work).
+    A pending retraction is an active row whose Note was unpublished but that
+    still carries a Delete in ``ap_activity_json`` (written by
+    _retract_episode_notes or the pipeline's episode cutoff). Delivery is
+    best-effort and in-memory, so the payload is kept and re-sent on every
+    run — peers treat a Delete for an already-deleted object as a no-op.
     """
-    seen: set[tuple[str, str]] = set()
-    for did, _at_uri, old_key, new_key in remapped:
-        for work_key in (old_key, new_key):
-            if not work_key or (did, work_key) in seen or works.is_episode_key(work_key):
-                continue
-            seen.add((did, work_key))
-            trigger_uri = _pair_trigger(did, work_key)
-            if trigger_uri is None:
-                continue
-            handle = _handle_for(did)
-            if handle is None:
-                continue
-            activity = _sync_pair(
-                did=did, work_key=work_key, handle=handle, trigger_uri=trigger_uri
+    with session_scope() as session:
+        rows = session.execute(
+            select(Record.at_uri, Record.did, Record.ap_activity_json).where(
+                Record.collection.in_(_PAIRED_COLLECTIONS),
+                Record.ap_object_json.is_(None),
+                Record.ap_activity_json.is_not(None),
+                Record.deleted_at.is_(None),
             )
-            if activity is None:
-                continue
-            report.resynced += 1
-            if worker is not None:
-                report.deliveries += await fanout(
-                    worker, record_uri=trigger_uri, did=did, activity=activity
-                )
+        ).all()
+    for at_uri, did, activity_json in rows:
+        activity = None
+        with contextlib.suppress(TypeError, ValueError):
+            activity = json.loads(activity_json)
+        if not isinstance(activity, dict) or activity.get("type") != "Delete":
+            continue
+        report.resent += 1
+        if worker is not None:
+            report.deliveries += await fanout(worker, record_uri=at_uri, did=did, activity=activity)
+
+
+# Timestamps that legitimately differ between a stored Note and a fresh
+# derivation of the same state (Updates are stamped at derivation time).
+_VOLATILE_NOTE_KEYS = frozenset({"published", "updated"})
+
+
+def _comparable(node):
+    """A Note stripped of volatile timestamps, for change detection."""
+    if isinstance(node, dict):
+        return {k: _comparable(v) for k, v in node.items() if k not in _VOLATILE_NOTE_KEYS}
+    if isinstance(node, list):
+        return [_comparable(v) for v in node]
+    return node
+
+
+async def _resync_pairs(worker: DeliveryWorker | None, report: RepairReport) -> None:
+    """Re-derive every active (author, work) pair; broadcast what changed.
+
+    Stateless on purpose: driven by comparing each pair's fresh derivation
+    against the Note stored on its anchor, not by which records this run
+    happened to remap — so a run interrupted between the rebuild and this
+    phase still converges on the next run. Covers both damage patterns: a
+    published Note that referenced the wrong work or still folds a moved
+    partner's status (Update), and a pair left Note-less because its records
+    moved to a new work (Create, anchored on a contributing row). Episode
+    works are never re-published.
+    """
+    with session_scope() as session:
+        pairs = session.execute(
+            select(Record.did, Record.work_key)
+            .where(
+                Record.collection.in_(_PAIRED_COLLECTIONS),
+                Record.work_key.is_not(None),
+                Record.deleted_at.is_(None),
+            )
+            .distinct()
+            .order_by(Record.did.asc(), Record.work_key.asc())
+        ).all()
+
+    for did, work_key in pairs:
+        if works.is_episode_key(work_key):
+            continue
+        trigger_uri = _pair_trigger(did, work_key)
+        if trigger_uri is None:
+            continue
+        handle = _handle_for(did)
+        if handle is None:
+            continue
+        derived = _derive_pair(did=did, work_key=work_key, handle=handle, trigger_uri=trigger_uri)
+        if derived is None:
+            continue
+        stored = None
+        if derived.stored_note_json:
+            with contextlib.suppress(TypeError, ValueError):
+                stored = json.loads(derived.stored_note_json)
+        if stored is not None and _comparable(stored) == _comparable(derived.note):
+            continue
+        _update_ap(derived.anchor_uri, derived.note, derived.activity)
+        report.resynced += 1
+        if worker is not None:
+            report.deliveries += await fanout(
+                worker, record_uri=derived.anchor_uri, did=did, activity=derived.activity
+            )
 
 
 async def repair(worker: DeliveryWorker | None = None, *, dry_run: bool = False) -> RepairReport:
@@ -262,11 +331,13 @@ async def repair(worker: DeliveryWorker | None = None, *, dry_run: bool = False)
     await _retract_episode_notes(worker, report, dry_run=dry_run)
     if dry_run:
         return report
-    remapped = _rebuild_works(report)
-    await _resync_remapped(worker, remapped, report)
+    await _resend_pending_retractions(worker, report)
+    _rebuild_works(report)
+    await _resync_pairs(worker, report)
     log.info(
-        "repair: retracted=%d works %d->%d remapped=%d resynced=%d deliveries=%d",
+        "repair: retracted=%d resent=%d works %d->%d remapped=%d resynced=%d deliveries=%d",
         report.retracted,
+        report.resent,
         report.works_before,
         report.works_after,
         report.remapped,
