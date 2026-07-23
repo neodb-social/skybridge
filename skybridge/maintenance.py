@@ -341,8 +341,14 @@ def _rebuild_works(report: RepairReport) -> list[tuple[str, str, str | None, str
     """
     remapped: list[tuple[str, str, str | None, str | None]] = []
     with session_scope() as session:
-        report.works_before = session.scalar(select(func.count()).select_from(Work)) or 0
+        # The alias wipe goes FIRST so the transaction's opening statement is
+        # a write: SQLite's deferred transactions start as read transactions
+        # on a SELECT and abort with SQLITE_BUSY when upgrading to write
+        # after a concurrent writer commits — write-first is equivalent to
+        # BEGIN IMMEDIATE. The works count is read after; Work rows are
+        # still intact at that point.
         session.execute(sql_delete(WorkIdentifier))
+        report.works_before = session.scalar(select(func.count()).select_from(Work)) or 0
         session.execute(sql_delete(Work))
         rows = session.execute(
             select(
