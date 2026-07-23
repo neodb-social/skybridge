@@ -154,7 +154,6 @@ async def _preview_retractions(report: RepairReport) -> None:
     with session_scope() as session:
         rows = session.execute(
             select(Record.at_uri, Record.collection, Record.work_key, Record.source_json).where(
-                Record.collection.in_(_PAIRED_COLLECTIONS),
                 Record.ap_object_json.is_not(None),
                 Record.deleted_at.is_(None),
             )
@@ -239,7 +238,6 @@ async def _retract_episode_notes(worker: DeliveryWorker | None, report: RepairRe
                 Record.work_key,
                 Record.source_json,
             ).where(
-                Record.collection.in_(_PAIRED_COLLECTIONS),
                 Record.ap_object_json.is_not(None),
                 Record.deleted_at.is_(None),
             )
@@ -253,6 +251,41 @@ async def _retract_episode_notes(worker: DeliveryWorker | None, report: RepairRe
         with session_scope() as session:
             row = session.get(Record, at_uri)
             ap_object_json = row.ap_object_json if row is not None else None
+        await _retract(
+            worker,
+            report,
+            at_uri=at_uri,
+            did=did,
+            collection=collection,
+            rkey=rkey,
+            ap_object_json=ap_object_json,
+        )
+
+
+async def _retract_remapped_nonpaired(
+    worker: DeliveryWorker | None,
+    report: RepairReport,
+    remapped: list[tuple[str, str, str | None, str | None]],
+) -> None:
+    """Retract published Notes of remapped records outside the pair machinery.
+
+    Only the paired collections publish work-bearing Notes today, so this is
+    a safety net for future work-bearing collections (and hand-seeded
+    archives): such a Note can't be re-derived by _resync_pairs, and after
+    the rebuild moved its record to a different work it references a catalog
+    entry that no longer exists — a stale federated Note is worse than none.
+    """
+    for did, at_uri, _old_key, _new_key in remapped:
+        with session_scope() as session:
+            row = session.get(Record, at_uri)
+            if (
+                row is None
+                or row.collection in _PAIRED_COLLECTIONS
+                or row.ap_object_json is None
+                or row.deleted_at is not None
+            ):
+                continue
+            collection, rkey, ap_object_json = row.collection, row.rkey, row.ap_object_json
         await _retract(
             worker,
             report,
@@ -407,7 +440,6 @@ async def _resend_pending_retractions(worker: DeliveryWorker | None, report: Rep
     with session_scope() as session:
         rows = session.execute(
             select(Record.at_uri, Record.did, Record.ap_activity_json).where(
-                Record.collection.in_(_PAIRED_COLLECTIONS),
                 Record.ap_object_json.is_(None),
                 Record.ap_activity_json.is_not(None),
             )
@@ -508,8 +540,9 @@ async def repair(worker: DeliveryWorker | None = None, *, dry_run: bool = False)
     # listItems converted to seasons are already off the episode keys and
     # keep their Note for the in-place Update.
     await _resend_pending_retractions(worker, report)
-    _rebuild_works(report)
+    remapped = _rebuild_works(report)
     await _retract_episode_notes(worker, report)
+    await _retract_remapped_nonpaired(worker, report, remapped)
     await _retract_duplicate_holders(worker, report)
     await _resync_pairs(worker, report)
     log.info(

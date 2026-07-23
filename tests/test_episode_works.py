@@ -902,6 +902,62 @@ def test_repair_rebuilds_works_from_all_collections(settings):
         assert row is not None and row.work_key == "movie:tmdbId-1061474"
 
 
+def test_repair_retracts_published_nonpaired_records(settings):
+    """Legacy Notes outside the paired collections converge too: an
+    episode-bound one is retracted like any other, and a remapped one —
+    which the pair machinery can't re-derive — is retracted rather than
+    left referencing a deleted catalog work."""
+    _run(_ev("social.popfeed.feed.review", "mv1", MOVIE_REVIEW))  # mints the actor
+    ep_uri = f"at://{DID}/social.popfeed.feed.post/p1"
+    moved_uri = f"at://{DID}/social.popfeed.feed.post/p2"
+    with session_scope() as session:
+        session.add(
+            Record(
+                at_uri=ep_uri,
+                did=DID,
+                collection="social.popfeed.feed.post",
+                rkey="p1",
+                source_json=json.dumps({**EP_REVIEW, "$type": "social.popfeed.feed.post"}),
+                op="create",
+                work_key="tv_episode:tmdbId-7377127",
+                ap_object_json=json.dumps({"id": "https://bridge.test/users/x/posts/p1"}),
+                ap_activity_json="{}",
+            )
+        )
+        session.add(
+            Record(
+                at_uri=moved_uri,
+                did=DID,
+                collection="social.popfeed.feed.post",
+                rkey="p2",
+                source_json=json.dumps(
+                    {
+                        "$type": "social.popfeed.feed.post",
+                        "title": "Superman",
+                        "identifiers": {"tmdbId": "1061474"},
+                        "creativeWorkType": "movie",
+                    }
+                ),
+                op="create",
+                work_key="movie:tmdbId-999999",  # wrong merge; rebuild moves it
+                ap_object_json=json.dumps({"id": "https://bridge.test/users/x/posts/p2"}),
+                ap_activity_json="{}",
+            )
+        )
+
+    report = asyncio.run(repair(None))
+    assert report.retracted == 2
+
+    with session_scope() as session:
+        for uri in (ep_uri, moved_uri):
+            row = session.get(Record, uri)
+            assert row is not None and row.ap_object_json is None
+            assert row.ap_activity_json is not None
+            assert json.loads(row.ap_activity_json)["type"] == "Delete"
+        moved = session.get(Record, moved_uri)
+        assert moved is not None and moved.work_key == "movie:tmdbId-1061474"
+
+
 def test_repair_dry_run_changes_nothing(settings):
     ep_uri, _ = _seed_legacy_damage(settings)
     report = asyncio.run(repair(None, dry_run=True))
