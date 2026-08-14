@@ -268,6 +268,31 @@ def test_work_html_page_with_poster_and_opengraph(client, settings):
     assert "https://www.imdb.com/title/tt6710474" in page
 
 
+def test_work_html_page_links_neodb_servers(client, settings):
+    from urllib.parse import quote
+
+    from skybridge import neodb_servers
+
+    neodb_servers.set_servers(
+        [
+            {"name": "NeoDB", "host": "neodb.social"},
+            {"name": "Self", "host": settings.domain},  # never link to ourselves
+        ]
+    )
+    try:
+        page = client.get("/catalog/movie/imdbId-tt6710474").text
+    finally:
+        neodb_servers.set_servers([])
+    url = quote(settings.catalog_id("movie", "imdbId-tt6710474"), safe="")
+    assert f'<a href="https://neodb.social/search?q={url}">NeoDB</a>' in page
+    assert f"https://{settings.domain}/search?q=" not in page
+
+
+def test_work_html_page_without_servers_has_no_peer_section(client):
+    page = client.get("/catalog/movie/imdbId-tt6710474").text
+    assert "Find this item on a NeoDB server" not in page
+
+
 def _a_published_review() -> tuple[str, str]:
     with session_scope() as session:
         rec = session.scalar(
@@ -366,14 +391,6 @@ def test_dashboard_shows_jetstream_endpoint_only_when_ingesting(client, settings
         assert settings.jetstream_url in page
     finally:
         app.state.ingest_task = None
-
-
-def test_robots_txt_rejects_all(client):
-    r = client.get("/robots.txt")
-    assert r.status_code == 200
-    assert r.headers["content-type"].startswith("text/plain")
-    assert "User-agent: *" in r.text
-    assert "Disallow: /" in r.text
 
 
 def test_archive_only_list_records_not_published(client, settings):

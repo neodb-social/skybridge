@@ -34,6 +34,14 @@
       {% endfor %}
     </ul>
     {% endif %}
+    {% if peers %}
+    <p class="muted">Find this item on a NeoDB server:</p>
+    <ul>
+      {% for peer in peers %}
+      <li><a href="{{ peer.url }}">{{ peer.name }}</a></li>
+      {% endfor %}
+    </ul>
+    {% endif %}
   </div>
 </div>
 {% endblock %}

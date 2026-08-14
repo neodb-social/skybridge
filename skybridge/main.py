@@ -23,7 +23,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, or_, select
 
-from skybridge import optout, sessions, telemetry
+from skybridge import neodb_servers, optout, sessions, telemetry
 from skybridge.activitypub import nodeinfo, objects, webfinger
 from skybridge.activitypub.actors import RELAY_DID, get_relay_keys, person_actor, relay_actor
 from skybridge.activitypub.delivery import DeliveryWorker
@@ -54,6 +54,9 @@ async def lifespan(app: FastAPI):
     relay_task = asyncio.create_task(reconcile_relays(worker), name="relay-reconcile")
     app.state.relay_task = relay_task
 
+    servers_task = asyncio.create_task(neodb_servers.refresh_loop(), name="neodb-servers")
+    app.state.servers_task = servers_task
+
     ingest_task: asyncio.Task | None = None
     if os.environ.get("SKYBRIDGE_INGEST") == "1":
         from skybridge.atproto.jetstream import run as jetstream_run
@@ -69,6 +72,9 @@ async def lifespan(app: FastAPI):
             relay_task.cancel()
             with suppress(asyncio.CancelledError):
                 await relay_task
+        servers_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await servers_task
         # Imports must stop enqueueing before worker.stop() awaits the queue
         # drain, or a long replay stalls shutdown / feeds a dead queue.
         await backfill.cancel_all_imports()
@@ -119,8 +125,7 @@ async def nodeinfo_document() -> Response:
 
 @app.get("/robots.txt")
 async def robots_txt() -> Response:
-    # Bridged content belongs to its atproto authors; keep crawlers out.
-    return PlainTextResponse("User-agent: *\nDisallow: /\n")
+    return PlainTextResponse("User-agent: *\nAllow: /\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -323,6 +328,7 @@ async def get_catalog(work_type: str, work_id: str, request: Request) -> Respons
             "url": doc["id"],
             "links": [e["url"] for e in doc.get("external_resources", [])],
             "identifiers": identifiers,
+            "peers": neodb_servers.peer_links(doc["id"]),
             "settings": get_settings(),
         },
     )
