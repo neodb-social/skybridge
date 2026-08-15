@@ -227,6 +227,25 @@ def test_dashboard_and_archive_html(client):
     assert client.get("/catalog").status_code == 200
 
 
+def test_archive_detail_resolves_every_link_shape(client):
+    with session_scope() as session:
+        rec = session.scalar(select(Record))
+        assert rec is not None
+        at_uri, did, collection, rkey = rec.at_uri, rec.did, rec.collection, rec.rkey
+    # The link the archive/optout tables mint: plain path segments, so no
+    # proxy that normalises paths can collapse an "at://" into "at:/".
+    paths = [f"/archive/{did}/{collection}/{rkey}"]
+    # Links minted before that, and the collapsed form a normalising proxy
+    # (Cloudflare) turns them into on the way in.
+    paths += [f"/archive/{at_uri}", "/archive/" + at_uri.replace("at://", "at:/")]
+    for path in paths:
+        r = client.get(path)
+        assert r.status_code == 200, path
+        assert rkey in r.text
+
+    assert client.get(f"/archive/{did}/{collection}/no-such-rkey").status_code == 404
+
+
 def test_profile_html_page_with_avatar_and_opengraph(client, settings):
     handle = _a_bridged_handle()
     avatar_url = "https://cdn.example/avatar.jpg"

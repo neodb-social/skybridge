@@ -16,7 +16,6 @@ import secrets
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
 
 from fastapi import FastAPI, Form, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
@@ -561,6 +560,7 @@ def _record_rows(rows: list[Record]) -> list[dict[str, Any]]:
         out.append(
             {
                 "at_uri": r.at_uri,
+                "did": r.did,
                 "rkey": r.rkey,
                 "collection": r.collection,
                 "op": r.op,
@@ -609,9 +609,24 @@ async def archive(request: Request, q: str = "") -> Response:
     )
 
 
+def _archive_uri(path: str) -> str:
+    """Rebuild the ``at://`` URI addressed by an ``/archive/...`` path.
+
+    Links are minted as ``/archive/{did}/{collection}/{rkey}`` because a proxy
+    that normalises request paths (Cloudflare does) decodes the ``%3A`` of an
+    encoded ``at://`` URI and then collapses the ``//``, so the handler used to
+    look up an ``at:/…`` key that no row has. Links minted before that — and
+    the collapsed form they now arrive as — still resolve here.
+    """
+    path = path.lstrip("/")
+    if path.startswith("at:"):
+        path = path[3:].lstrip("/")
+    return f"at://{path}"
+
+
 @app.get("/archive/{at_uri:path}", response_class=HTMLResponse)
 async def archive_detail(request: Request, at_uri: str) -> Response:
-    at_uri = unquote(at_uri)
+    at_uri = _archive_uri(at_uri)
     with session_scope() as session:
         record = session.get(Record, at_uri)
         if record is None:

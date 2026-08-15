@@ -39,7 +39,7 @@
       <td class="muted">{{ r.updated_at.strftime("%Y-%m-%d %H:%M") }}</td>
       <td><span class="pill">{{ r.op }}</span> {{ r.collection.split(".")[-1] }}</td>
       <td>{{ r.title or r.rkey }}</td>
-      <td><a href="/archive/{{ r.at_uri | urlencode }}">view</a></td>
+      <td><a href="/archive/{{ r.did }}/{{ r.collection }}/{{ r.rkey | urlencode }}">view</a></td>
     </tr>
     {% endfor %}
   </table>
