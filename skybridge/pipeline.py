@@ -112,6 +112,16 @@ def _pair_has_other_holder(did: str, work_key: str, *, exclude_uri: str) -> bool
     return any(_contributes_row(collection, source_json) for collection, source_json in rows)
 
 
+def _stored_note_id(ap_object_json: str | None) -> str | None:
+    """The id of a stored Note: the one peers actually received.
+
+    Object ids are minted from the handle of the day, so they must be read
+    back rather than recomputed — the author may have been renamed since.
+    """
+    note = _source_dict(ap_object_json) if ap_object_json else None
+    return note.get("id") if note else None
+
+
 def _prior_state(at_uri: str) -> tuple[str | None, str | None]:
     """(published Note id, work_key) of the record before this event.
 
@@ -126,8 +136,7 @@ def _prior_state(at_uri: str) -> tuple[str | None, str | None]:
             return None, None
         work_key = row.work_key
         ap_object_json = row.ap_object_json
-    note = _source_dict(ap_object_json) if ap_object_json else None
-    return (note.get("id") if note else None), work_key
+    return _stored_note_id(ap_object_json), work_key
 
 
 def _contributes(collection: str, record: dict) -> bool:
@@ -360,6 +369,9 @@ async def process_event(
         operation=operation,
         time_us=time_us,
         ref=ref,
+        # Keep an already-published Note on its own id (None re-mints, which
+        # is what a never-published or revived row wants).
+        prior_object_id=_prior_state(at_uri)[0],
     )
     _persist(
         at_uri=at_uri,
@@ -490,6 +502,9 @@ def _derive_pair(*, did: str, work_key: str, handle: str, trigger_uri: str) -> D
         rkey=anchor.rkey,
         record=source,
         operation=operation,
+        # An anchor that already published keeps its id; a fresh anchor
+        # (operation == "create") mints one from the current handle.
+        prior_object_id=_stored_note_id(anchor.ap_object_json) if operation == "update" else None,
         time_us=None,
         ref=works.mint(source),
         shelf_status=shelf_status,
@@ -687,11 +702,11 @@ async def _process_delete(
         row_exists = row is not None
         had_note = row is not None and row.ap_object_json is not None
         work_key = row.work_key if row is not None else None
-        stored_note = _source_dict(row.ap_object_json) if had_note and row is not None else None
+        stored_id = _stored_note_id(row.ap_object_json) if row is not None else None
     # Name the object id peers actually received. Recomputing it from the
     # current handle would tombstone a URL that was never published once the
     # author has been renamed since (see identity.rename_actor).
-    prior_object_id = (stored_note or {}).get("id") or settings.post_id(handle, rkey)
+    prior_object_id = stored_id or settings.post_id(handle, rkey)
 
     if had_note or not row_exists:
         # The record anchored a published Note (or is unknown — retract

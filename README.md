@@ -74,6 +74,10 @@ strand every id already federated. Two rules keep them alive:
 - Object ids are never recomputed from the current handle. An `Update` or
   `Delete` names the id peers actually received, whatever handle minted it.
 
+`handle.invalid` (reported when a handle stops resolving back to its DID) is
+not treated as a rename: every account in that state reports the same value,
+so the actor keeps the last name we know it by until a real one arrives.
+
 A handle points at one DID at a time, so when a name moves to another account
 the previous holder is pushed onto its synthetic `<did-tail>.did` handle.
 Leaving two rows on one name would let one account's URL, WebFinger record and
