@@ -21,6 +21,7 @@ from fastapi import FastAPI, Form, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, or_, select
+from sqlalchemy.orm import Session
 
 from skybridge import neodb_servers, optout, sessions, telemetry
 from skybridge.activitypub import nodeinfo, objects, webfinger
@@ -28,7 +29,7 @@ from skybridge.activitypub.actors import RELAY_DID, get_relay_keys, person_actor
 from skybridge.activitypub.delivery import DeliveryWorker
 from skybridge.activitypub.inbox import handle_inbox
 from skybridge.activitypub.relays import reconcile_relays
-from skybridge.atproto import backfill, oauth
+from skybridge.atproto import backfill, identity, oauth
 from skybridge.config import get_settings
 from skybridge.db import init_db, session_scope
 from skybridge.models import BridgedActor, Record, Work
@@ -101,6 +102,27 @@ def _handle_of(did: str) -> str:
         return row.handle if row else did
 
 
+def _actor_for_ident(session: Session, ident: str) -> BridgedActor | None:
+    """Resolve a ``/users/<ident>`` path segment to a bridged (non-relay) actor.
+
+    Accepts the live handle, the DID, or a handle the author has since renamed
+    away from — every URL we ever published stays dereferenceable.
+    """
+    did = identity.did_for_ident(session, ident)
+    if did is None or did == RELAY_DID:
+        return None
+    return session.get(BridgedActor, did)
+
+
+def _stored_object_id(ap_object_json: str | None) -> str | None:
+    """The id of a stored ``Note``, or ``None`` when it can't be read."""
+    try:
+        obj = json.loads(ap_object_json or "")
+    except ValueError:
+        return None
+    return obj.get("id") if isinstance(obj, dict) else None
+
+
 # --------------------------------------------------------------------------- #
 # Discovery
 # --------------------------------------------------------------------------- #
@@ -150,12 +172,14 @@ async def relay_inbox(request: Request) -> Response:
 @app.get("/users/{ident}")
 async def get_user(ident: str, request: Request) -> Response:
     with session_scope() as session:
-        actor = session.scalar(
-            select(BridgedActor).where(BridgedActor.handle == ident, BridgedActor.did != RELAY_DID)
-        )
+        actor = _actor_for_ident(session, ident)
         # An opted-out actor is Gone: don't serve its profile.
         if actor is not None and actor.opted_out:
             return JSONResponse({"error": "gone"}, status_code=410)
+        # Reached under a retired handle: send callers to the canonical URL
+        # rather than serving one actor under two ids.
+        if actor is not None and ident != actor.handle:
+            return RedirectResponse(get_settings().actor_id(actor.handle), status_code=301)
         doc = person_actor(actor) if actor else None
         profile: dict[str, Any] | None = None
         if actor is not None:
@@ -189,9 +213,14 @@ async def get_user(ident: str, request: Request) -> Response:
 @app.post("/users/{ident}/inbox")
 async def user_inbox(ident: str, request: Request) -> Response:
     activity = await request.json()
+    # A POST can't be redirected safely, so a delivery addressed to a retired
+    # handle is accepted here and attributed to the canonical actor.
+    with session_scope() as session:
+        actor = _actor_for_ident(session, ident)
+        target = actor.handle if actor is not None else ident
     status = await handle_inbox(
         activity,
-        target_actor_id=get_settings().actor_id(ident),
+        target_actor_id=get_settings().actor_id(target),
         worker=getattr(app.state, "worker", None),
     )
     return Response(status_code=status)
@@ -200,7 +229,9 @@ async def user_inbox(ident: str, request: Request) -> Response:
 @app.get("/users/{ident}/followers")
 async def user_followers(ident: str) -> Response:
     settings = get_settings()
-    actor_id = settings.actor_id(ident)
+    with session_scope() as session:
+        actor = _actor_for_ident(session, ident)
+        actor_id = settings.actor_id(actor.handle if actor is not None else ident)
     return ap_response(
         {
             "@context": "https://www.w3.org/ns/activitystreams",
@@ -215,13 +246,13 @@ async def user_followers(ident: str) -> Response:
 @app.get("/users/{ident}/outbox")
 async def user_outbox(ident: str) -> Response:
     settings = get_settings()
-    actor_id = settings.actor_id(ident)
     with session_scope() as session:
-        actor = session.scalar(select(BridgedActor).where(BridgedActor.handle == ident))
+        actor = _actor_for_ident(session, ident)
+        actor_id = settings.actor_id(actor.handle if actor is not None else ident)
         items: list[str] = []
         if actor is not None:
             rows = session.execute(
-                select(Record.rkey)
+                select(Record.rkey, Record.ap_object_json)
                 .where(
                     Record.did == actor.did,
                     Record.deleted_at.is_(None),
@@ -230,7 +261,12 @@ async def user_outbox(ident: str) -> Response:
                 )
                 .order_by(Record.created_at.desc())
             ).all()
-            items = [settings.post_id(ident, r[0]) for r in rows]
+            # Prefer each Note's own id: posts minted before a rename keep the
+            # handle they were published under.
+            items = [
+                _stored_object_id(ap_object_json) or settings.post_id(actor.handle, rkey)
+                for rkey, ap_object_json in rows
+            ]
     return ap_response(
         {
             "@context": "https://www.w3.org/ns/activitystreams",

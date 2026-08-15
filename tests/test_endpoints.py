@@ -13,6 +13,7 @@ import json
 
 import pytest
 from fastapi.testclient import TestClient
+from skybridge.atproto import identity
 from skybridge.atproto.replay import replay_file
 from skybridge.db import session_scope
 from skybridge.main import app
@@ -121,6 +122,65 @@ def test_nodeinfo(client):
     assert doc["usage"]["users"]["total"] >= 1
     assert doc["metadata"]["nodeEnvironment"] == "production"
     assert "neodb" in doc["protocols"]
+
+
+# --- handle renames: everything already federated keeps resolving ----------
+
+
+def _rename(handle: str, new_handle: str) -> str:
+    """Rename the actor currently holding ``handle``; returns its DID."""
+    actor = identity.actor_by_ident(handle)
+    assert actor is not None
+    did = actor.did
+    assert identity.rename_actor(did, new_handle) is not None
+    return did
+
+
+def test_retired_handle_redirects_to_the_live_actor(client, settings):
+    handle = _a_bridged_handle()
+    _rename(handle, "renamed.test")
+
+    r = client.get(f"/users/{handle}", headers=AP, follow_redirects=False)
+
+    assert r.status_code == 301
+    assert r.headers["location"] == settings.actor_id("renamed.test")
+
+
+def test_retired_handle_still_dereferences_its_posts(client, settings):
+    with session_scope() as session:
+        rec = session.scalar(
+            select(Record).where(
+                Record.collection == "social.popfeed.feed.review",
+                Record.ap_object_json.isnot(None),
+            )
+        )
+        assert rec is not None and rec.ap_object_json is not None
+        actor = session.get(BridgedActor, rec.did)
+        assert actor is not None
+        handle, rkey = actor.handle, rec.rkey
+        published_id = json.loads(rec.ap_object_json)["id"]
+        did = rec.did
+
+    identity.rename_actor(did, "renamed.test")
+    r = client.get(f"/users/{handle}/posts/{rkey}", headers=AP)
+
+    assert r.status_code == 200
+    # The Note keeps the id peers already hold, under either handle.
+    assert r.json()["id"] == published_id
+    assert client.get(f"/users/renamed.test/posts/{rkey}", headers=AP).json()["id"] == published_id
+
+
+def test_webfinger_answers_a_retired_handle_with_the_live_one(client, settings):
+    handle = _a_bridged_handle()
+    _rename(handle, "renamed.test")
+
+    r = client.get("/.well-known/webfinger", params={"resource": settings.acct(handle)})
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["subject"] == settings.acct("renamed.test")
+    assert body["links"][0]["href"] == settings.actor_id("renamed.test")
+    assert settings.acct(handle) in body["aliases"]
 
 
 def test_review_object_dereferenceable(client, settings):

@@ -9,15 +9,20 @@ so ingestion never blocks.
 from __future__ import annotations
 
 import json
+import logging
 import urllib.request
 from dataclasses import dataclass
 
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from skybridge.config import get_settings
 from skybridge.crypto import generate_keypair
 from skybridge.db import session_scope
-from skybridge.models import BridgedActor, utcnow
+from skybridge.models import BridgedActor, HandleAlias, utcnow
+
+log = logging.getLogger("skybridge.identity")
 
 PLC_DIRECTORY = "https://plc.directory"
 _PROFILE_COLLECTION = "social.popfeed.actor.profile"
@@ -131,6 +136,28 @@ def resolve_remote(did: str) -> Identity:
     )
 
 
+def _claim_handle(session: Session, handle: str, *, did: str) -> None:
+    """Give ``handle`` exclusively to ``did`` inside this session.
+
+    A handle points at exactly one DID at a time on atproto, so anyone else
+    still holding it here is stale: we saw them under that name before it
+    moved. They are pushed onto their synthetic DID handle rather than left to
+    collide, because every actor lookup is ``where(handle == ...)`` — a
+    duplicate would let one account's URL, WebFinger record and HTTP signature
+    key id resolve to the other account's row.
+    """
+    stale = session.scalars(
+        select(BridgedActor).where(BridgedActor.handle == handle, BridgedActor.did != did)
+    ).all()
+    for row in stale:
+        row.handle = _fallback_handle(row.did)
+        log.warning(
+            "handle %s moved to %s; displaced actor %s to %s", handle, did, row.did, row.handle
+        )
+    # A live claim outranks any retired alias on the same name.
+    session.execute(sa_delete(HandleAlias).where(HandleAlias.handle == handle))
+
+
 def ensure_actor(did: str, *, allow_network: bool = True) -> Identity:
     """Return the bridged actor for ``did``, creating + persisting if needed.
 
@@ -145,6 +172,7 @@ def ensure_actor(did: str, *, allow_network: bool = True) -> Identity:
 
         ident = resolve_remote(did) if allow_network else Identity(did, _fallback_handle(did))
         private_pem, public_pem = generate_keypair()
+        _claim_handle(session, ident.handle, did=did)
         session.add(
             BridgedActor(
                 did=did,
@@ -156,6 +184,47 @@ def ensure_actor(did: str, *, allow_network: bool = True) -> Identity:
             )
         )
         return ident
+
+
+def rename_actor(did: str, handle: str) -> BridgedActor | None:
+    """Apply a handle change from a Jetstream ``identity`` event.
+
+    Returns the updated row, or ``None`` when there is nothing to do: an
+    identity event must never mint an actor (we bridge on content, not on
+    existence), and an unchanged handle is not worth an ``Update(Person)``.
+    The retired handle is kept as a :class:`HandleAlias` so already-federated
+    actor and object ids keep resolving.
+    """
+    if not handle:
+        return None
+    with session_scope() as session:
+        row = session.get(BridgedActor, did)
+        if row is None or row.handle == handle:
+            return None
+
+        retired = row.handle
+        _claim_handle(session, handle, did=did)
+        row.handle = handle
+        row.last_seen = utcnow()
+        session.merge(HandleAlias(handle=retired, did=did))
+        log.info("actor %s renamed %s -> %s", did, retired, handle)
+        return row
+
+
+def did_for_ident(session: Session, ident: str) -> str | None:
+    """Resolve a route identifier to a DID: DID, live handle, then retired handle.
+
+    Every handle-keyed lookup goes through this so a rename does not 404 the
+    URLs peers already hold.
+    """
+    if not ident:
+        return None
+    if ident.startswith("did:"):
+        return ident
+    did = session.scalar(select(BridgedActor.did).where(BridgedActor.handle == ident))
+    if did is not None:
+        return did
+    return session.scalar(select(HandleAlias.did).where(HandleAlias.handle == ident))
 
 
 def refresh_actor(
@@ -214,8 +283,7 @@ def actor_by_handle(handle: str) -> BridgedActor | None:
 
 
 def actor_by_ident(ident: str) -> BridgedActor | None:
-    """Look up a bridged actor by either its DID or its handle."""
+    """Look up a bridged actor by its DID, its handle, or a retired handle."""
     with session_scope() as session:
-        if ident.startswith("did:"):
-            return session.get(BridgedActor, ident)
-        return session.scalar(select(BridgedActor).where(BridgedActor.handle == ident))
+        did = did_for_ident(session, ident)
+        return session.get(BridgedActor, did) if did else None

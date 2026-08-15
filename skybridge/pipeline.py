@@ -20,7 +20,7 @@ from skybridge.activitypub.delivery import DeliveryWorker, fanout, fanout_actor_
 from skybridge.atproto import identity
 from skybridge.config import get_settings
 from skybridge.db import session_scope
-from skybridge.models import Record, utcnow
+from skybridge.models import BridgedActor, Record, utcnow
 from skybridge.translate import neodb, works
 
 log = logging.getLogger("skybridge.pipeline")
@@ -50,6 +50,11 @@ _PAIRED_COLLECTIONS = (_REVIEW_COLLECTION, _LIST_ITEM_COLLECTION)
 # followers. It carries no per-work content, so it never touches the Record
 # archive and never mints an actor of its own — see _process_profile.
 _PROFILE_COLLECTION = "social.popfeed.actor.profile"
+
+# Jetstream ``identity`` events (handle changes) carry no collection at all.
+# Reported on Processed.collection so /stats and logs can tell them apart from
+# a commit.
+_IDENTITY_KIND = "identity"
 
 
 @dataclass
@@ -138,7 +143,11 @@ async def process_event(
     worker: DeliveryWorker | None = None,
     allow_network: bool = True,
 ) -> Processed | None:
-    """Process one commit event. Returns ``None`` if filtered/ignored."""
+    """Process one commit or identity event. Returns ``None`` if filtered/ignored."""
+    if event.get("kind") == "identity":
+        # Handle change: no collection filter applies (Jetstream sends identity
+        # events for the whole network), so this branches before _wanted.
+        return await _process_identity(event, worker=worker)
     if event.get("kind") != "commit":
         return None
     commit = event.get("commit") or {}
@@ -605,6 +614,18 @@ async def _process_profile(
     if row is None:
         return None
 
+    activity, delivered = await _deliver_person_update(row, time_us=time_us, worker=worker)
+    return Processed(at_uri, operation, _PROFILE_COLLECTION, activity, delivered)
+
+
+async def _deliver_person_update(
+    row: BridgedActor, *, time_us: int | None, worker: DeliveryWorker | None
+) -> tuple[dict[str, Any], int]:
+    """Send an ``Update(Person)`` for a refreshed actor to its own followers.
+
+    Never relayed as an ``Announce``: identity metadata is only of interest to
+    servers that already follow this author.
+    """
     settings = get_settings()
     actor_id = settings.actor_id(row.handle)
     update_id = time_us or int(datetime.now(UTC).timestamp() * 1_000_000)
@@ -619,8 +640,37 @@ async def _process_profile(
     }
     delivered = 0
     if worker is not None:
-        delivered = await fanout_actor_update(worker, did=did, activity=activity)
-    return Processed(at_uri, operation, _PROFILE_COLLECTION, activity, delivered)
+        delivered = await fanout_actor_update(worker, did=row.did, activity=activity)
+    return activity, delivered
+
+
+async def _process_identity(
+    event: dict[str, Any], *, worker: DeliveryWorker | None
+) -> Processed | None:
+    """Apply a handle change to an actor we already bridge.
+
+    Like a profile edit, this never mints an actor: we bridge people because
+    of what they post, so an identity event for an unknown DID is not our
+    business. The retired handle stays resolvable (see identity.rename_actor),
+    and followers get an ``Update(Person)`` carrying the new
+    ``preferredUsername``.
+    """
+    payload = event.get("identity") or {}
+    did = event.get("did") or payload.get("did") or ""
+    handle = payload.get("handle") or ""
+    if not did or not handle:
+        return None
+    if optout.is_opted_out(did):
+        return None
+
+    row = identity.rename_actor(did, handle)
+    if row is None:
+        return None
+
+    activity, delivered = await _deliver_person_update(
+        row, time_us=event.get("time_us"), worker=worker
+    )
+    return Processed(f"at://{did}", "update", _IDENTITY_KIND, activity, delivered)
 
 
 async def _process_delete(
@@ -637,6 +687,11 @@ async def _process_delete(
         row_exists = row is not None
         had_note = row is not None and row.ap_object_json is not None
         work_key = row.work_key if row is not None else None
+        stored_note = _source_dict(row.ap_object_json) if had_note and row is not None else None
+    # Name the object id peers actually received. Recomputing it from the
+    # current handle would tombstone a URL that was never published once the
+    # author has been renamed since (see identity.rename_actor).
+    prior_object_id = (stored_note or {}).get("id") or settings.post_id(handle, rkey)
 
     if had_note or not row_exists:
         # The record anchored a published Note (or is unknown — retract
@@ -650,7 +705,7 @@ async def _process_delete(
             record=None,
             operation="delete",
             time_us=None,
-            prior_object_id=settings.post_id(handle, rkey),
+            prior_object_id=prior_object_id,
         )
         with session_scope() as session:
             row = session.get(Record, at_uri)

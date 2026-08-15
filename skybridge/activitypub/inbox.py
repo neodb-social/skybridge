@@ -32,6 +32,7 @@ from sqlalchemy import delete, select
 from skybridge.activitypub import objects, relays
 from skybridge.activitypub.actors import RELAY_DID, get_relay_keys
 from skybridge.activitypub.delivery import DeliveryWorker, Task, forward_to_relays, post_signed
+from skybridge.atproto import identity
 from skybridge.config import get_settings
 from skybridge.db import session_scope
 from skybridge.models import BridgedActor, Follow, Like, Record
@@ -88,13 +89,14 @@ def _person_handle_from_object(obj: Any) -> str | None:
 
 
 def _bridged_author(handle: str | None) -> BridgedActor | None:
-    """Look up a non-relay bridged author by handle, or ``None``."""
+    """Look up a non-relay bridged author by handle (live or retired), or ``None``."""
     if not handle:
         return None
     with session_scope() as session:
-        return session.scalar(
-            select(BridgedActor).where(BridgedActor.handle == handle, BridgedActor.did != RELAY_DID)
-        )
+        did = identity.did_for_ident(session, handle)
+        if did is None or did == RELAY_DID:
+            return None
+        return session.get(BridgedActor, did)
 
 
 def _local_post_record(object_id: str) -> Record | None:
@@ -187,11 +189,8 @@ async def _follow_person(
     worker: DeliveryWorker | None,
 ) -> int:
     with session_scope() as session:
-        author = session.scalar(
-            select(BridgedActor).where(
-                BridgedActor.handle == username, BridgedActor.did != RELAY_DID
-            )
-        )
+        did = identity.did_for_ident(session, username)
+        author = session.get(BridgedActor, did) if did and did != RELAY_DID else None
         if author is None:
             return 404
         existing = session.scalar(
