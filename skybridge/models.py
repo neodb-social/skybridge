@@ -42,6 +42,23 @@ class BridgedActor(Base):
     opted_out_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
 
+class HandleAlias(Base):
+    """A handle a bridged actor used to hold, kept resolvable after a rename.
+
+    Actor and post URLs are keyed on the handle (``/users/<handle>``), so a
+    rename would otherwise 404 every follower that stored the old actor id and
+    every object id already federated. Route lookups fall back to this table
+    and redirect to the live handle. An alias is dropped as soon as another DID
+    takes the name for real: on atproto a handle points at one DID at a time.
+    """
+
+    __tablename__ = "handle_alias"
+
+    handle: Mapped[str] = mapped_column(String, primary_key=True)
+    did: Mapped[str] = mapped_column(String, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class OptOut(Base):
     """A DID that has opted out of the bridge (after authenticating).
 

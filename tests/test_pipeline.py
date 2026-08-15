@@ -42,7 +42,14 @@ def test_replay_persists_records(settings, fixture_path):
     results = asyncio.run(replay_file(fixture_path, allow_network=False))
     processed, distinct_uris, n_deletes = _counts_from_fixture(fixture_path)
 
-    assert len(results) == processed  # noise (like, identity) filtered out
+    commits = [r for r in results if r.collection != "identity"]
+    renames = [r for r in results if r.collection == "identity"]
+    assert len(commits) == processed  # noise (like) filtered out
+    # The fixture renames its author once; the handle change is applied, and
+    # the handle it replaced stays resolvable.
+    assert len(renames) == 1
+    assert identity.actor_by_ident("someone.bsky.social") is not None
+    assert identity.actor_by_ident("i6k6scfcdaup4e2va33nkprb.did") is not None
 
     with session_scope() as session:
         total = session.scalar(select(func.count()).select_from(Record)) or 0
@@ -123,6 +130,77 @@ def test_list_delete_tombstones_without_activity(settings, fixture_path):
         assert row is not None
         assert row.deleted_at is not None
         assert row.ap_activity_json is None  # no Delete activity emitted
+
+
+# --- identity events: handle renames ---------------------------------------
+
+
+def _identity_event(did: str, handle: str) -> dict:
+    return {
+        "did": did,
+        "time_us": 1731900030000000,
+        "kind": "identity",
+        "identity": {"did": did, "handle": handle},
+    }
+
+
+def test_identity_event_never_mints_an_actor(settings):
+    result = asyncio.run(process_event(_identity_event("did:plc:nobody", "new.test")))
+
+    assert result is None
+    with session_scope() as session:
+        assert session.get(BridgedActor, "did:plc:nobody") is None
+
+
+def test_identity_event_is_ignored_for_opted_out_authors(settings):
+    did = "did:plc:optedout"
+    identity.ensure_actor(did, allow_network=False)
+    asyncio.run(optout.opt_out(did))
+
+    assert asyncio.run(process_event(_identity_event(did, "new.test"))) is None
+    actor = identity.actor_by_ident(did)
+    assert actor is not None and actor.handle != "new.test"
+
+
+def test_identity_event_emits_an_actor_update(settings):
+    did = "did:plc:renamed"
+    identity.ensure_actor(did, allow_network=False)
+
+    result = asyncio.run(process_event(_identity_event(did, "new.test")))
+
+    assert result is not None
+    assert result.activity["type"] == "Update"
+    assert result.activity["object"]["preferredUsername"] == "new.test"
+    assert result.activity["actor"] == settings.actor_id("new.test")
+
+
+def test_delete_after_a_rename_retracts_the_published_object_id(settings, fixture_path):
+    """A Delete must name the id peers received, not one rebuilt from the
+    handle the author happens to hold today."""
+    asyncio.run(replay_file(fixture_path, allow_network=False))
+    with session_scope() as session:
+        row = session.scalars(
+            select(Record).where(
+                Record.collection == "social.popfeed.feed.review",
+                Record.ap_object_json.isnot(None),
+                Record.deleted_at.is_(None),
+            )
+        ).first()
+        assert row is not None and row.ap_object_json is not None
+        did, rkey, collection = row.did, row.rkey, row.collection
+        published_id = json.loads(row.ap_object_json)["id"]
+
+    assert identity.rename_actor(did, "renamed.test") is not None
+    event = {
+        "did": did,
+        "kind": "commit",
+        "commit": {"operation": "delete", "collection": collection, "rkey": rkey},
+    }
+    result = asyncio.run(process_event(event, allow_network=False))
+
+    assert result is not None
+    assert result.activity["object"]["id"] == published_id
+    assert "renamed.test" not in published_id
 
 
 # --- review <-> listItem pairing: one AP Note per (author, work) -----------

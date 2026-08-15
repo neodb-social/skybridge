@@ -7,24 +7,25 @@ from typing import Any
 
 from sqlalchemy import select
 
+from skybridge.atproto import identity
 from skybridge.config import get_settings
 from skybridge.db import session_scope
-from skybridge.models import BridgedActor, Record, Work
+from skybridge.models import Record, Work
 from skybridge.translate import works
 from skybridge.translate.neodb import AP_CONTEXT
 from skybridge.translate.works import category_for
 
 
 def _record_for(ident: str, rkey: str) -> Record | None:
-    """Find the archived record for a bridged author's post by handle/did + rkey."""
+    """Find the archived record for a bridged author's post by handle/did + rkey.
+
+    ``ident`` may be a handle the author has since renamed away from: object
+    ids are minted from the handle of the day and stay federated forever.
+    """
     with session_scope() as session:
-        if ident.startswith("did:"):
-            did = ident
-        else:
-            author = session.scalar(select(BridgedActor).where(BridgedActor.handle == ident))
-            if author is None:
-                return None
-            did = author.did
+        did = identity.did_for_ident(session, ident)
+        if did is None:
+            return None
         return session.scalar(select(Record).where(Record.did == did, Record.rkey == rkey))
 
 
@@ -39,7 +40,10 @@ def get_post_object(ident: str, rkey: str) -> dict[str, Any] | None:
         # nothing to dereference and nothing to tombstone.
         return None
     settings = get_settings()
-    object_id = settings.post_id(ident, rkey)
+    stored = json.loads(record.ap_object_json) if record.ap_object_json else {}
+    # Serve the id peers hold, not one rebuilt from whatever handle the caller
+    # happened to use: post ids outlive the handle they were minted from.
+    object_id = stored.get("id") or settings.post_id(ident, rkey)
     if record.deleted_at is not None:
         return {
             "@context": "https://www.w3.org/ns/activitystreams",
@@ -50,11 +54,10 @@ def get_post_object(ident: str, rkey: str) -> dict[str, Any] | None:
         }
     if record.ap_object_json is None:
         return None
-    obj = json.loads(record.ap_object_json)
     # Serve the full extension context so JSON-LD-strict consumers keep the
     # neodb relatedWith terms when they re-fetch the Note.
-    obj.setdefault("@context", AP_CONTEXT)
-    return obj
+    stored.setdefault("@context", AP_CONTEXT)
+    return stored
 
 
 def get_work_object(work_type: str, work_id: str) -> dict[str, Any] | None:

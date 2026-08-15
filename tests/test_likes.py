@@ -8,6 +8,7 @@ from dataclasses import replace
 import pytest
 from skybridge.activitypub import inbox
 from skybridge.activitypub.delivery import DeliveryWorker
+from skybridge.atproto import identity
 from skybridge.atproto.replay import replay_file
 from skybridge.config import set_settings
 from skybridge.db import session_scope
@@ -252,6 +253,44 @@ def test_follow_of_bridged_person_via_shared_inbox_accepts(settings, local_post,
 
     assert status == 202
     assert captured["kind"] == "Accept"
+    with session_scope() as session:
+        row = session.scalar(
+            select(Follow).where(Follow.local_did == did, Follow.follower_actor_id == REMOTE_ACTOR)
+        )
+        assert row is not None
+
+
+def test_follow_addressed_to_a_retired_handle_still_accepts(settings, local_post, monkeypatch):
+    """A remote server holding the pre-rename actor id keeps delivering to the
+    old inbox URL. A POST can't be redirected, so it is attributed to the DID."""
+    handle, did, _rkey = local_post
+    stub_actor = {"id": REMOTE_ACTOR, "inbox": f"{REMOTE_ACTOR.rsplit('/', 1)[0]}/inbox"}
+    captured: dict = {}
+
+    async def fake_fetch_actor(actor_id):
+        return stub_actor
+
+    async def fake_send_follow_response(
+        *, kind, signer_actor, private_pem, follow, inbox, worker=None
+    ):
+        captured["kind"], captured["signer"] = kind, signer_actor
+
+    monkeypatch.setattr(inbox, "fetch_actor", fake_fetch_actor)
+    monkeypatch.setattr(inbox, "_send_follow_response", fake_send_follow_response)
+    assert identity.rename_actor(did, "renamed.test") is not None
+
+    follow = {
+        "id": f"{REMOTE_ACTOR}/activities/1",
+        "type": "Follow",
+        "actor": REMOTE_ACTOR,
+        "object": settings.actor_id(handle),
+    }
+    status = asyncio.run(inbox.handle_inbox(follow, target_actor_id=settings.actor_id(handle)))
+
+    assert status == 202
+    assert captured["kind"] == "Accept"
+    # The Accept is signed as the actor's current id, not the retired one.
+    assert captured["signer"] == settings.actor_id("renamed.test")
     with session_scope() as session:
         row = session.scalar(
             select(Follow).where(Follow.local_did == did, Follow.follower_actor_id == REMOTE_ACTOR)

@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from sqlalchemy import select
-
 from skybridge.activitypub.actors import RELAY_DID
+from skybridge.atproto import identity
 from skybridge.config import get_settings
 from skybridge.db import session_scope
 from skybridge.models import BridgedActor
@@ -53,15 +52,17 @@ def resolve(resource: str) -> dict | None:
         return _jrd(settings.acct(settings.relay_username), settings.relay_actor_id)
 
     with session_scope() as session:
-        actor = session.scalar(
-            select(BridgedActor).where(
-                BridgedActor.handle == username, BridgedActor.did != RELAY_DID
-            )
-        )
+        did = identity.did_for_ident(session, username)
+        actor = session.get(BridgedActor, did) if did and did != RELAY_DID else None
         if actor is None or actor.opted_out:
             return None
+        # Queried under a retired handle: answer with the canonical acct and
+        # keep the old one as an alias, the way a renamed Mastodon account does.
+        extra_aliases = [f"https://bsky.app/profile/{actor.did}"]
+        if username != actor.handle:
+            extra_aliases.append(settings.acct(username))
         return _jrd(
             settings.acct(actor.handle),
             settings.actor_id(actor.handle),
-            extra_aliases=[f"https://bsky.app/profile/{actor.did}"],
+            extra_aliases=extra_aliases,
         )

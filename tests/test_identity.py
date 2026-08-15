@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from skybridge.atproto import identity
+from skybridge.models import BridgedActor
 
 DID = "did:plc:test"
 PDS = "https://pds.example"
@@ -48,6 +49,69 @@ def _fake_http_json(responses: Mapping[str, dict | None], calls: list[str] | Non
         raise AssertionError(f"unexpected URL requested in test: {url}")
 
     return fake
+
+
+def _actor(ident: str) -> BridgedActor:
+    """The bridged actor for a DID or handle; fails the test if there is none."""
+    row = identity.actor_by_ident(ident)
+    assert row is not None
+    return row
+
+
+def test_rename_actor_keeps_the_retired_handle_resolvable(settings):
+    identity.ensure_actor(DID, allow_network=False)
+    retired = _actor(DID).handle
+
+    row = identity.rename_actor(DID, HANDLE)
+
+    assert row is not None and row.handle == HANDLE
+    assert _actor(HANDLE).did == DID
+    # Already-federated actor and object ids carry the old handle forever.
+    assert _actor(retired).did == DID
+
+
+def test_rename_actor_never_mints_an_actor(settings):
+    assert identity.rename_actor("did:plc:unknown", HANDLE) is None
+    assert identity.actor_by_ident("did:plc:unknown") is None
+
+
+def test_rename_actor_ignores_an_unchanged_handle(settings):
+    identity.ensure_actor(DID, allow_network=False)
+    identity.rename_actor(DID, HANDLE)
+
+    assert identity.rename_actor(DID, HANDLE) is None
+
+
+def test_handle_taken_by_another_did_displaces_the_stale_actor(settings):
+    """A handle points at one DID at a time, so the newcomer wins the name.
+
+    Leaving both rows on it would let one account's URL, WebFinger record and
+    signature key id resolve to the other's row.
+    """
+    other = "did:plc:other"
+    identity.ensure_actor(DID, allow_network=False)
+    identity.rename_actor(DID, HANDLE)
+    identity.ensure_actor(other, allow_network=False)
+
+    identity.rename_actor(other, HANDLE)
+
+    assert _actor(HANDLE).did == other
+    assert _actor(DID).handle == "test.did"
+
+
+def test_live_claim_outranks_a_retired_alias(settings):
+    identity.ensure_actor(DID, allow_network=False)
+    identity.rename_actor(DID, HANDLE)  # "test.did" becomes an alias of DID
+    retired = "test.did"
+
+    # Someone else takes the retired name for real.
+    newcomer = "did:plc:newcomer"
+    identity.ensure_actor(newcomer, allow_network=False)
+    identity.rename_actor(newcomer, retired)
+
+    assert _actor(retired).did == newcomer
+    # The first actor is still reachable, under the name it holds now.
+    assert _actor(HANDLE).did == DID
 
 
 def test_resolve_remote_falls_back_to_bsky_for_display_name_and_avatar(monkeypatch):

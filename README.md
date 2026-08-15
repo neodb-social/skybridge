@@ -59,6 +59,30 @@ never `Article`/titled `Review` objects.
 | `social.popfeed.feed.listItem` | on a shelf-type list: `Note` + a `Status` mark (`status` derived from `listType`, including compound types like `watched_movies`) `withRegardTo` the work — folded into the review's Note when the same author reviewed the same work (see below). On a status-less list: archived only (collection membership is not bridged) |
 | `social.popfeed.actor.profile` | no `Note`: refreshes the bridged actor's display name/avatar and emits an `Update(Person)` directly to that author's followers (never relayed as an `Announce`); not archived — it's identity metadata, not content |
 
+Jetstream `identity` events (handle changes) take the same path: the actor's
+handle is updated and an `Update(Person)` goes to its followers. Neither an
+identity event nor a profile edit ever *mints* an actor — we bridge people
+because of what they post.
+
+Because a handle is also the actor URL (`/users/<handle>`), a rename would
+strand every id already federated. Two rules keep them alive:
+
+- The retired handle is kept as an alias. `/users/<old>` (plus its inbox,
+  outbox, followers and WebFinger record) resolves to the same account and
+  `301`s to the live name; already-published post URLs under it keep
+  dereferencing.
+- Object ids are never recomputed from the current handle. An `Update` or
+  `Delete` names the id peers actually received, whatever handle minted it.
+
+A handle points at one DID at a time, so when a name moves to another account
+the previous holder is pushed onto its synthetic `<did-tail>.did` handle.
+Leaving two rows on one name would let one account's URL, WebFinger record and
+HTTP signature `key_id` resolve to the other's.
+
+Known limit: a renamed actor is not announced with a `Move`, so remote servers
+keep following the old id (which still works) instead of migrating to the new
+one.
+
 One popfeed action ("watched + rated") writes a review *and* a listItem; the
 bridge emits ONE AP `Note` per (author, work) carrying `Status` + `Rating` +
 `Comment` together. The Note id is anchored on whichever record publishes
