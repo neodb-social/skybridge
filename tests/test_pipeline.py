@@ -174,6 +174,45 @@ def test_identity_event_emits_an_actor_update(settings):
     assert result.activity["actor"] == settings.actor_id("new.test")
 
 
+def test_update_after_a_rename_keeps_the_published_object_id(settings, fixture_path):
+    """Peers hold the id minted under the old handle. Re-minting it from the
+    new one would orphan the published Note and update an id nobody has."""
+    asyncio.run(replay_file(fixture_path, allow_network=False))
+    with session_scope() as session:
+        row = session.scalars(
+            select(Record).where(
+                Record.collection == "social.popfeed.feed.review",
+                Record.ap_object_json.isnot(None),
+                Record.deleted_at.is_(None),
+            )
+        ).first()
+        assert row is not None and row.ap_object_json is not None
+        did, rkey, collection = row.did, row.rkey, row.collection
+        source = json.loads(row.source_json)
+        published_id = json.loads(row.ap_object_json)["id"]
+
+    assert identity.rename_actor(did, "renamed.test") is not None
+    event = {
+        "did": did,
+        "kind": "commit",
+        "commit": {
+            "operation": "update",
+            "collection": collection,
+            "rkey": rkey,
+            "record": source,
+        },
+    }
+    result = asyncio.run(process_event(event, allow_network=False))
+
+    assert result is not None
+    assert result.activity["object"]["id"] == published_id
+    # ...and the stored Note keeps it too, so a later Delete still names it.
+    with session_scope() as session:
+        stored = session.get(Record, f"at://{did}/{collection}/{rkey}")
+        assert stored is not None and stored.ap_object_json is not None
+        assert json.loads(stored.ap_object_json)["id"] == published_id
+
+
 def test_delete_after_a_rename_retracts_the_published_object_id(settings, fixture_path):
     """A Delete must name the id peers received, not one rebuilt from the
     handle the author happens to hold today."""

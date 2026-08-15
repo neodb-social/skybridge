@@ -25,6 +25,12 @@ from skybridge.models import BridgedActor, HandleAlias, utcnow
 log = logging.getLogger("skybridge.identity")
 
 PLC_DIRECTORY = "https://plc.directory"
+
+# Reported in place of a handle when it no longer resolves back to its DID
+# (https://atproto.com/specs/handle). It is a placeholder, not a name: every
+# account in that state reports the same one, so treating it as a rename would
+# make them all fight over a single /users/handle.invalid actor.
+INVALID_HANDLE = "handle.invalid"
 _PROFILE_COLLECTION = "social.popfeed.actor.profile"
 _BSKY_PROFILE_COLLECTION = "app.bsky.actor.profile"
 
@@ -193,9 +199,11 @@ def rename_actor(did: str, handle: str) -> BridgedActor | None:
     identity event must never mint an actor (we bridge on content, not on
     existence), and an unchanged handle is not worth an ``Update(Person)``.
     The retired handle is kept as a :class:`HandleAlias` so already-federated
-    actor and object ids keep resolving.
+    actor and object ids keep resolving. A handle that stopped resolving
+    (``INVALID_HANDLE``) is not a rename: the actor keeps the last name we
+    know it by until a real one arrives.
     """
-    if not handle:
+    if not handle or handle == INVALID_HANDLE:
         return None
     with session_scope() as session:
         row = session.get(BridgedActor, did)

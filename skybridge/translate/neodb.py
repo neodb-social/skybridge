@@ -235,16 +235,21 @@ def build_note(
     ref: works.WorkRef | None,
     shelf_status: str | None = None,
     operation: str = "create",
+    object_id: str | None = None,
 ) -> dict:
     """Build the AP ``Note`` for a popfeed record, including ``relatedWith``.
 
     ``shelf_status`` folds a companion listItem's shelf mark into a review's
     Note so one user action ("watched + rated") stays one AP post (see
     pipeline merge handling).
+
+    ``object_id`` pins the Note to the id peers already hold. Without it an
+    update re-mints the id from the *current* handle, so a rename would
+    orphan the published Note and update an id nobody ever received.
     """
     settings = get_settings()
     actor = settings.actor_id(handle)
-    object_id = settings.post_id(handle, rkey)
+    object_id = object_id or settings.post_id(handle, rkey)
     published = _published(record, time_us)
 
     note: dict[str, Any] = {
@@ -643,6 +648,7 @@ def translate(
         ref=ref,
         shelf_status=shelf_status,
         operation=operation,
+        object_id=prior_object_id,
     )
     activity = wrap_activity(note, handle=handle, op=operation)
     return note, activity

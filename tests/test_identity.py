@@ -82,6 +82,16 @@ def test_rename_actor_ignores_an_unchanged_handle(settings):
     assert identity.rename_actor(DID, HANDLE) is None
 
 
+def test_rename_actor_ignores_the_invalid_handle_placeholder(settings):
+    """Every account whose handle stops resolving reports "handle.invalid";
+    renaming to it would make them all fight over one actor URL."""
+    identity.ensure_actor(DID, allow_network=False)
+    identity.rename_actor(DID, HANDLE)
+
+    assert identity.rename_actor(DID, identity.INVALID_HANDLE) is None
+    assert _actor(DID).handle == HANDLE
+
+
 def test_handle_taken_by_another_did_displaces_the_stale_actor(settings):
     """A handle points at one DID at a time, so the newcomer wins the name.
 
