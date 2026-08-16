@@ -31,6 +31,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from random import uniform
+from time import monotonic
 from urllib.parse import urlencode
 
 import websockets
@@ -45,6 +47,13 @@ from skybridge.pipeline import process_event
 log = logging.getLogger("skybridge.jetstream")
 
 _MAX_BACKOFF = 60
+
+# How long (seconds) a connection has to stay up before it counts as healthy
+# and the backoff resets. Resetting on the handshake instead would defeat the
+# backoff against a host that accepts the upgrade and then drops the stream
+# straight away ("no close frame received or sent"): every cycle would reset to
+# one second, so a struggling host would be hammered once a second forever.
+_HEALTHY_AFTER = 30
 
 # v2 frames are JSON under this XRPC subprotocol; the server rejects the
 # upgrade without it.
@@ -129,11 +138,12 @@ async def run(worker: DeliveryWorker, *, stop_after: int | None = None) -> int:
     pending_cursor: int | None = None
     since_flush = 0
     while True:
+        opened: float | None = None
         try:
             url = _build_url()
             log.info("connecting to jetstream: %s", url)
             async with websockets.connect(url, max_size=None, subprotocols=subprotocols) as ws:
-                backoff = 1
+                opened = monotonic()
                 async for raw in ws:
                     event = json.loads(raw)
                     # v2 nests everything under `payload`; the cursor lives on
@@ -161,6 +171,19 @@ async def run(worker: DeliveryWorker, *, stop_after: int | None = None) -> int:
                 # resume from what we actually processed, not the last flush.
                 save_cursor(pending_cursor)
                 pending_cursor, since_flush = None, 0
-            log.warning("jetstream connection error: %s; reconnecting in %ss", exc, backoff)
-            await asyncio.sleep(backoff)
+            # A handshake that fails outright never opened, so it counts as
+            # zero uptime and keeps the backoff growing.
+            uptime = 0.0 if opened is None else monotonic() - opened
+            if uptime >= _HEALTHY_AFTER:
+                backoff = 1
+            # Jitter, so instances that restart together do not resynchronise
+            # on the host at every retry.
+            delay = uniform(backoff / 2, backoff)
+            log.warning(
+                "jetstream connection lost after %.1fs: %s; reconnecting in %.1fs",
+                uptime,
+                exc,
+                delay,
+            )
+            await asyncio.sleep(delay)
             backoff = min(backoff * 2, _MAX_BACKOFF)

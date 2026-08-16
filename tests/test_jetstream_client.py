@@ -1,10 +1,14 @@
-"""Endpoint/cursor handling across the two Jetstream dialects."""
+"""Endpoint/cursor handling across the two Jetstream dialects, plus reconnect
+backoff."""
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from urllib.parse import parse_qs, urlsplit
 
+import pytest
+from skybridge.activitypub.delivery import DeliveryWorker
 from skybridge.atproto import jetstream
 from skybridge.config import DEFAULT_JETSTREAM, Settings, set_settings
 from skybridge.db import session_scope
@@ -86,3 +90,67 @@ def test_v1_never_receives_a_seq_as_a_cursor(settings):
     _use(settings, V1_URL)
     assert jetstream.load_cursor() == 0
     assert "cursor" not in _query(jetstream._build_url())
+
+
+class _StopLoop(Exception):
+    """Escape hatch out of the endless reconnect loop, once enough retries ran.
+
+    Raised from inside the loop's ``except Exception`` handler, so the handler
+    that swallows transport errors cannot swallow this too.
+    """
+
+
+class _FlappingConnect:
+    """A host that accepts the upgrade, then drops with no close frame."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    async def __aenter__(self) -> _FlappingConnect:
+        return self
+
+    async def __aexit__(self, *exc_info) -> bool:
+        return False
+
+    def __aiter__(self) -> _FlappingConnect:
+        return self
+
+    async def __anext__(self):
+        raise ConnectionError("no close frame received or sent")
+
+
+def _run_until(monkeypatch, retries: int) -> list[float]:
+    """Reconnect ``retries`` times against a flapping host; return the delays.
+
+    Stubbing the jitter is what makes the sequence readable: it records the
+    nominal backoff and hands back a zero delay, so the test neither sleeps
+    nor has to reason about a random draw.
+    """
+    delays: list[float] = []
+
+    def fake_uniform(low: float, high: float) -> float:
+        delays.append(high)
+        if len(delays) >= retries:
+            raise _StopLoop
+        return 0.0
+
+    monkeypatch.setattr(jetstream.websockets, "connect", _FlappingConnect)
+    monkeypatch.setattr(jetstream, "uniform", fake_uniform)
+    with pytest.raises(_StopLoop):
+        asyncio.run(jetstream.run(DeliveryWorker()))
+    return delays
+
+
+def test_a_flapping_host_backs_off_to_one_retry_a_minute(settings, monkeypatch):
+    """A completed handshake is not health. A host that accepts the upgrade
+    and drops the stream at once must not be retried once a second forever."""
+    assert _run_until(monkeypatch, retries=8) == [1, 2, 4, 8, 16, 32, 60, 60]
+
+
+def test_a_healthy_connection_resets_the_backoff(settings, monkeypatch):
+    """A stream that ran for a while before dropping is an isolated blip, so
+    the next attempt starts from one second again rather than from the cap."""
+    # Each pass reads the clock twice: on open, then on the drop.
+    clock = iter([0.0, jetstream._HEALTHY_AFTER + 1] * 4)
+    monkeypatch.setattr(jetstream, "monotonic", lambda: next(clock))
+    assert _run_until(monkeypatch, retries=4) == [1, 1, 1, 1]
