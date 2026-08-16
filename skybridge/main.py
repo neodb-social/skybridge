@@ -23,16 +23,17 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from skybridge import neodb_servers, optout, sessions, telemetry
+from skybridge import admin, neodb_servers, optout, sessions, telemetry
 from skybridge.activitypub import nodeinfo, objects, webfinger
 from skybridge.activitypub.actors import RELAY_DID, get_relay_keys, person_actor, relay_actor
 from skybridge.activitypub.delivery import DeliveryWorker
 from skybridge.activitypub.inbox import handle_inbox
 from skybridge.activitypub.relays import reconcile_relays
-from skybridge.atproto import backfill, identity, oauth
+from skybridge.atproto import archive as archive_replay
+from skybridge.atproto import backfill, discover, identity, oauth
 from skybridge.config import get_settings
 from skybridge.db import init_db, session_scope
-from skybridge.models import BridgedActor, Record, Work
+from skybridge.models import BridgedActor, Cursor, Record, Work
 from skybridge.stats import collect_stats
 
 log = logging.getLogger("skybridge")
@@ -63,11 +64,29 @@ async def lifespan(app: FastAPI):
 
         ingest_task = asyncio.create_task(jetstream_run(worker), name="ingest")
     app.state.ingest_task = ingest_task
+
+    # Runs archive imports requested from the admin view or the CLI, and
+    # resumes one left unfinished by a restart.
+    archive_task = asyncio.create_task(
+        archive_replay.watch_jobs(worker=worker), name="archive-jobs"
+    )
+    app.state.archive_task = archive_task
+
+    # Keeps the resolved admin set warm off-thread, so is_admin() never has to
+    # do a blocking identity resolution inside a request.
+    admin_task = asyncio.create_task(admin.refresh_loop(), name="admin-refresh")
+    app.state.admin_task = admin_task
     try:
         yield
     finally:
         if ingest_task is not None:
             ingest_task.cancel()
+        archive_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await archive_task
+        admin_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await admin_task
         if not relay_task.done():
             relay_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -78,6 +97,7 @@ async def lifespan(app: FastAPI):
         # Imports must stop enqueueing before worker.stop() awaits the queue
         # drain, or a long replay stalls shutdown / feeds a dead queue.
         await backfill.cancel_all_imports()
+        await archive_replay.cancel()
         await worker.stop()
 
 
@@ -398,6 +418,25 @@ def _status_ctx(did: str, fallback_handle: str | None = None) -> dict[str, Any]:
     }
 
 
+def _admin_ctx(estimate: archive_replay.PlanEstimate | None = None) -> dict[str, Any]:
+    """Operational state for the admin panel (DB-only; no network calls)."""
+    settings = get_settings()
+    with session_scope() as db:
+        cursor = db.get(Cursor, 1)
+        cursor_seq = cursor.seq if cursor is not None else None
+    return {
+        "cursor_seq": cursor_seq,
+        "is_v2": settings.jetstream_is_v2,
+        "has_api_key": bool(settings.jetstream_api_key),
+        "can_import": settings.jetstream_is_v2 and bool(settings.jetstream_api_key),
+        "running": archive_replay.is_running(),
+        "job": archive_replay.current_job(),
+        "collections": discover.report(),
+        "wanted": set(settings.wanted_collections),
+        "estimate": estimate,
+    }
+
+
 def _optout_page(
     request: Request,
     *,
@@ -405,8 +444,10 @@ def _optout_page(
     message: str | None = None,
     q: str = "",
     status_code: int = 200,
+    estimate: archive_replay.PlanEstimate | None = None,
 ) -> Response:
     """Render the self-service page: sign-in form, or the account view."""
+    is_admin = session is not None and admin.is_admin(session.did)
     return _TEMPLATES.TemplateResponse(
         request,
         "optout.html",
@@ -417,6 +458,8 @@ def _optout_page(
             "status": _status_ctx(session.did, session.handle) if session else None,
             "csrf": session.csrf if session else None,
             "settings": get_settings(),
+            "is_admin": is_admin,
+            "admin": _admin_ctx(estimate) if is_admin else None,
         },
         status_code=status_code,
     )
@@ -514,6 +557,70 @@ async def optout_action_import(request: Request, csrf: str = Form("")) -> Respon
         msg = f"Importing recent activity for {session.handle} in the background."
     else:
         msg = f"An import for {session.handle} is already in progress."
+    return _optout_page(request, session=session, message=msg)
+
+
+def _admin_session(request: Request, csrf: str) -> sessions.Session | None:
+    """The caller's session, iff it passed CSRF *and* is an operator.
+
+    Authorisation is on the OAuth-verified DID; see :mod:`skybridge.admin` for
+    why the session's handle must not be used for this.
+    """
+    session = _action_session(request, csrf)
+    if session is None or not admin.is_admin(session.did):
+        return None
+    return session
+
+
+_NOT_ADMIN = "That account is not an operator of this relay."
+
+
+@app.post("/optout/admin/import/dry-run", response_class=HTMLResponse)
+async def admin_import_dry_run(
+    request: Request, csrf: str = Form(""), after_seq: int = Form(0)
+) -> Response:
+    """Plan the import without downloading, so its byte cost is known first."""
+    session = _admin_session(request, csrf)
+    if session is None:
+        return _optout_error(request, True, _NOT_ADMIN, "forbidden", 403)
+    try:
+        estimate = await archive_replay.estimate(after_seq=after_seq)
+    except archive_replay.ArchiveError as exc:
+        return _optout_page(request, session=session, message=str(exc))
+    msg = (
+        f"Planned {estimate.segments} segment(s) covering seq "
+        f"{estimate.after_seq} to {estimate.before_seq}."
+    )
+    return _optout_page(request, session=session, message=msg, estimate=estimate)
+
+
+@app.post("/optout/admin/import", response_class=HTMLResponse)
+async def admin_import_start(
+    request: Request, csrf: str = Form(""), after_seq: int = Form(0)
+) -> Response:
+    """Start the historical import in the background, on this process."""
+    session = _admin_session(request, csrf)
+    if session is None:
+        return _optout_error(request, True, _NOT_ADMIN, "forbidden", 403)
+    settings = get_settings()
+    if not settings.jetstream_is_v2 or not settings.jetstream_api_key:
+        msg = "Archive import needs a Jetstream v2 endpoint and SKYBRIDGE_JETSTREAM_API_KEY."
+    elif archive_replay.is_running():
+        msg = "An archive import is already running."
+    else:
+        job_id = archive_replay.create_job(after_seq=after_seq)
+        archive_replay.start(job_id, worker=getattr(app.state, "worker", None))
+        msg = f"Archive import #{job_id} started in the background."
+    return _optout_page(request, session=session, message=msg)
+
+
+@app.post("/optout/admin/import/cancel", response_class=HTMLResponse)
+async def admin_import_cancel(request: Request, csrf: str = Form("")) -> Response:
+    session = _admin_session(request, csrf)
+    if session is None:
+        return _optout_error(request, True, _NOT_ADMIN, "forbidden", 403)
+    cancelled = await archive_replay.cancel()
+    msg = "Archive import cancelled." if cancelled else "No archive import is running."
     return _optout_page(request, session=session, message=msg)
 
 

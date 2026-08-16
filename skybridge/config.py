@@ -56,7 +56,28 @@ WANTED_COLLECTIONS: tuple[str, ...] = (
 )
 
 # Default public Jetstream endpoint; only the collections above are requested.
-DEFAULT_JETSTREAM = "wss://jetstream2.us-east.bsky.network/subscribe"
+#
+# Jetstream v2 is a different wire protocol, not a version bump: the parameters
+# are renamed (wantedCollections -> collections), the commit payload is flat
+# rather than nested, ordering is by `seq` instead of `time_us`, and it adds
+# `account` (lifecycle) and `sync` event kinds plus an HTTP replay archive.
+# skybridge.atproto.events normalises both dialects, so pointing
+# SKYBRIDGE_JETSTREAM back at a v1 host still works.
+DEFAULT_JETSTREAM = (
+    "wss://jetstream.us-east.bsky.network/xrpc/network.bsky.jetstream.subscribeEvents"
+)
+
+# Event kinds we subscribe to on v2. `sync` is deliberately not requested: it
+# carries repo divergence markers with no record content to bridge, and it
+# streams network-wide. Note that `identity` and `account` ignore the
+# collection filter and arrive for every account on the network either way.
+WANTED_KINDS: tuple[str, ...] = ("commit", "identity", "account")
+
+# Namespace wildcards for the `discover` subcommand only (v2 accepts these in
+# `collections`). NOT used for ingestion: buzz.bookhive.* would pull in
+# high-volume catalogBook records carrying multi-KB author biographies that the
+# bridge has no use for. See WANTED_COLLECTIONS for what is actually ingested.
+DISCOVERY_COLLECTIONS: tuple[str, ...] = ("social.popfeed.*", "buzz.bookhive.*")
 
 
 @dataclass(frozen=True)
@@ -72,6 +93,18 @@ class Settings:
     db_path: str = "data/skybridge.db"
     jetstream_url: str = DEFAULT_JETSTREAM
     wanted_collections: tuple[str, ...] = WANTED_COLLECTIONS
+    # v2 only; v1 has no kinds filter and always sends commit + identity.
+    wanted_kinds: tuple[str, ...] = WANTED_KINDS
+    # Namespace wildcards surveyed by the `discover` subcommand (v2 only).
+    discovery_collections: tuple[str, ...] = DISCOVERY_COLLECTIONS
+    # Jetstream v2 archive (Network Replay) credential. Only the HTTP archive
+    # endpoints are authenticated and metered — the live WebSocket needs no key
+    # — so this stays unset on a deployment that only tails live.
+    jetstream_api_key: str | None = None
+    # Accounts allowed into the admin view on the self-service page: atproto
+    # handles and/or DIDs. Matching is on the OAuth-verified DID; see
+    # main.is_admin.
+    admins: tuple[str, ...] = ()
     # Relay actor identity.
     relay_username: str = "relay"
     relay_name: str = "Skybridge"
@@ -100,6 +133,30 @@ class Settings:
     # Optional Sentry DSN: enables error tracking + a per-collection ingest
     # counter metric. Unset (the default) keeps telemetry fully off.
     sentry_dsn: str | None = None
+
+    # --- Jetstream dialect -------------------------------------------------
+
+    @property
+    def jetstream_is_v2(self) -> bool:
+        """Is the configured endpoint a v2 host?
+
+        Keyed on the XRPC method path rather than the hostname so a self-hosted
+        Jetstream (see the project's self-host docs) is detected too.
+        """
+        return "/xrpc/network.bsky.jetstream." in self.jetstream_url
+
+    @property
+    def jetstream_http_base(self) -> str:
+        """HTTPS origin of the Jetstream host, for the replay archive calls.
+
+        The archive lives on the same host as the live socket, so this derives
+        from ``jetstream_url`` rather than being configured twice.
+        """
+        origin = self.jetstream_url.split("/xrpc/", 1)[0].rstrip("/")
+        for ws_scheme, http_scheme in (("wss://", "https://"), ("ws://", "http://")):
+            if origin.startswith(ws_scheme):
+                return http_scheme + origin[len(ws_scheme) :]
+        return origin
 
     # --- URL builders: the single source of truth for our identity ----------
 
@@ -131,8 +188,11 @@ class Settings:
         return f"acct:{handle}@{self.domain}"
 
 
-def _parse_relays(raw: str) -> tuple[str, ...]:
-    """Parse ``SKYBRIDGE_RELAYS``: comma/whitespace-separated, deduped, ordered."""
+def _parse_list(raw: str) -> tuple[str, ...]:
+    """Parse a list env var: comma/whitespace-separated, deduped, ordered.
+
+    Shared by ``SKYBRIDGE_RELAYS`` and ``SKYBRIDGE_ADMINS``.
+    """
     return tuple(dict.fromkeys(raw.replace(",", " ").split()))
 
 
@@ -169,7 +229,9 @@ def _from_env() -> Settings:
         jetstream_url=os.environ.get("SKYBRIDGE_JETSTREAM", DEFAULT_JETSTREAM),
         relay_key_pem=os.environ.get("SKYBRIDGE_RELAY_KEY") or None,
         relay_key_file=os.path.join(data_dir, "relay_key.pem"),
-        relays=_parse_relays(os.environ.get("SKYBRIDGE_RELAYS", "")),
+        relays=_parse_list(os.environ.get("SKYBRIDGE_RELAYS", "")),
+        jetstream_api_key=os.environ.get("SKYBRIDGE_JETSTREAM_API_KEY") or None,
+        admins=_parse_list(os.environ.get("SKYBRIDGE_ADMINS", "")),
         sentry_dsn=os.environ.get("SKYBRIDGE_SENTRY_DSN") or None,
         backfill_limit=_env_int("SKYBRIDGE_BACKFILL_LIMIT", 1000, minimum=1),
         backfill_days=_env_int("SKYBRIDGE_BACKFILL_DAYS", 7, minimum=0),

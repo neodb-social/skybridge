@@ -107,6 +107,60 @@ def _cmd_backfill(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_discover(args: argparse.Namespace) -> int:
+    from skybridge.atproto.discover import known_collections, report, run
+
+    init_db()
+    seen = asyncio.run(run(seconds=args.seconds, limit=args.limit))
+    known = known_collections()
+    print(f"observed {seen} event(s)")
+    for row in report():
+        mark = "bridged    " if row.nsid in known else "NOT BRIDGED"
+        print(f"  {mark} {row.nsid:38} events={row.event_count}")
+    return 0
+
+
+def _cmd_import(args: argparse.Namespace) -> int:
+    """Plan, or queue, a historical archive import.
+
+    Queuing writes a job row; the running server picks it up and executes it
+    in-process, which is what keeps opt-out able to cancel it. ``--run``
+    executes here instead. That is safe beside a running server — jobs are
+    claimed atomically, so only one process ever works one — but an
+    out-of-process run cannot be cancelled by an opt-out, so prefer queueing
+    when delivering.
+    """
+    from skybridge.atproto import archive
+
+    init_db()
+
+    async def _go() -> int:
+        if args.dry_run:
+            est = await archive.estimate(after_seq=args.after_seq, before_seq=args.before_seq)
+            gib = est.estimated_bytes / 1024**3
+            print(
+                f"seq {est.after_seq} to {est.before_seq}\n"
+                f"  segments      : {est.segments} ({est.whole_segments} whole-file)\n"
+                f"  blocks        : {est.blocks} in {est.block_ranges} range(s)\n"
+                f"  planner units : {est.planner_entries} "
+                f"(work units, NOT a record count)\n"
+                f"  download      : ~{gib:.1f} GiB (metered)"
+            )
+            return 0
+        job_id = archive.create_job(
+            after_seq=args.after_seq, before_seq=args.before_seq, deliver=args.deliver
+        )
+        if not args.run:
+            print(f"queued import job {job_id}; the running server will start it")
+            return 0
+        return await archive.run_import(job_id)
+
+    result = asyncio.run(_go())
+    if args.run and not args.dry_run:
+        print(f"applied {result} event(s)")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="skybridge", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -144,6 +198,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_backfill.add_argument("--deliver", action="store_true")
     p_backfill.set_defaults(func=_cmd_backfill)
+
+    p_discover = sub.add_parser(
+        "discover", help="survey collections published under the bridged namespaces"
+    )
+    p_discover.add_argument("--seconds", type=float, default=60.0, help="how long to watch")
+    p_discover.add_argument("--limit", type=int, default=None, help="stop after N events")
+    p_discover.set_defaults(func=_cmd_discover)
+
+    p_import = sub.add_parser("import", help="import history from the Jetstream v2 archive")
+    p_import.add_argument("--after-seq", type=int, default=0, help="start sequence (default: 0)")
+    p_import.add_argument(
+        "--before-seq",
+        type=int,
+        default=None,
+        help="end sequence (default: the live ingest cursor, so the import "
+        "never covers what the live tail already has)",
+    )
+    p_import.add_argument(
+        "--dry-run", action="store_true", help="plan only; print the estimated byte cost"
+    )
+    p_import.add_argument(
+        "--run",
+        action="store_true",
+        help="execute here instead of queueing for the running server. Safe to "
+        "run alongside one — a job is claimed atomically, so only one process "
+        "ever works it — but prefer queueing when combined with --deliver, "
+        "since only an in-process import can be cancelled by an opt-out",
+    )
+    p_import.add_argument(
+        "--deliver", action="store_true", help="fan imported records out to peers (off by default)"
+    )
+    p_import.set_defaults(func=_cmd_import)
 
     return parser
 

@@ -66,8 +66,15 @@ def lookup_status(did: str, *, recent_limit: int = 200) -> BridgeStatus:
         )
 
 
-async def opt_out(did: str, *, worker: DeliveryWorker | None = None) -> int:
-    """Opt ``did`` out. Returns the number of bridged records tombstoned.
+async def purge_did(did: str, *, worker: DeliveryWorker | None = None, mark_opt_out: bool) -> int:
+    """Tombstone everything bridged for ``did``; returns the count retracted.
+
+    Shared by the user-initiated opt-out and by account deletion on the
+    firehose (see ``pipeline._process_account``), which need the same
+    retraction but differ in one respect: only an opt-out records an
+    :class:`OptOut` row, because that is a standing choice by the account
+    holder. A deleted account is simply gone, and re-recording it as an
+    opt-out would wrongly suppress a DID that later returns.
 
     If a delivery ``worker`` is supplied, ``Delete`` activities are fanned out
     to subscribers and the actor's followers.
@@ -79,20 +86,28 @@ async def opt_out(did: str, *, worker: DeliveryWorker | None = None) -> int:
     # This guards IN-PROCESS imports only — a `backfill --deliver` running
     # in a separate process delivers through its own queue and can still
     # race the purge; don't run one concurrently with live opt-outs.
-    from skybridge.atproto import backfill
+    from skybridge.atproto import archive, backfill
 
     await backfill.cancel_import(did)
+
+    # Same hazard from the historical archive import, which is not per-DID.
+    # Only a *delivering* import can leak past the purge; a normal one
+    # federates nothing, and its per-event opt-out check stops it writing
+    # anything more for this DID. Cancelling is cheap because the job is
+    # resumable: it is left `paused` and archive.watch_jobs picks it up again,
+    # this time with the opt-out in force.
+    await archive.cancel_if_delivering()
 
     settings = get_settings()
     pending: list[tuple[str, dict]] = []
 
     with session_scope() as session:
-        if session.get(OptOut, did) is None:
+        if mark_opt_out and session.get(OptOut, did) is None:
             session.add(OptOut(did=did))
 
         actor = session.get(BridgedActor, did)
         handle = actor.handle if actor is not None else did
-        if actor is not None:
+        if actor is not None and mark_opt_out:
             actor.opted_out = True
             actor.opted_out_at = utcnow()
 
@@ -115,7 +130,7 @@ async def opt_out(did: str, *, worker: DeliveryWorker | None = None) -> int:
                 rkey=row.rkey,
                 record=None,
                 operation="delete",
-                time_us=None,
+                event_time=None,
                 prior_object_id=settings.post_id(handle, row.rkey),
             )
             row.ap_activity_json = json.dumps(activity)
@@ -125,8 +140,18 @@ async def opt_out(did: str, *, worker: DeliveryWorker | None = None) -> int:
         for at_uri, activity in pending:
             await fanout(worker, record_uri=at_uri, did=did, activity=activity)
 
-    log.info("opted out %s; tombstoned %d record(s)", did, len(pending))
+    log.info(
+        "%s %s; tombstoned %d record(s)",
+        "opted out" if mark_opt_out else "purged deleted account",
+        did,
+        len(pending),
+    )
     return len(pending)
+
+
+async def opt_out(did: str, *, worker: DeliveryWorker | None = None) -> int:
+    """Opt ``did`` out and retract everything already bridged for it."""
+    return await purge_did(did, worker=worker, mark_opt_out=True)
 
 
 def opt_in(did: str) -> bool:

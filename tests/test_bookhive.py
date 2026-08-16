@@ -45,7 +45,7 @@ def _translate(record, *, operation="create", rkey="bk1"):
         rkey=rkey,
         record=record,
         operation=operation,
-        time_us=None,
+        event_time=None,
         ref=ref,
     )
 

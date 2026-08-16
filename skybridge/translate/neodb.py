@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import re
 from datetime import UTC, datetime
 from typing import Any
@@ -29,6 +30,8 @@ from skybridge.config import get_settings
 from skybridge.db import session_scope
 from skybridge.models import Record
 from skybridge.translate import bookhive, works
+
+log = logging.getLogger("skybridge.translate")
 
 PUBLIC = "https://www.w3.org/ns/activitystreams#Public"
 
@@ -129,17 +132,26 @@ def list_item_status(record: dict) -> str | None:
     return status
 
 
-def _published(record: dict, time_us: int | None) -> str:
+def _published(record: dict, event_time: str | None) -> str:
     """Best-effort ISO-8601 published timestamp.
 
     popfeed records sometimes carry ``createdAt`` as an empty object; fall back
-    to the firehose ``time_us`` and finally to *now*.
+    to the firehose event time and finally to *now*.
+
+    The firehose value arrives as ISO-8601 already (Jetstream v2 sends it that
+    way, and the v1/archive adapters render their epoch microseconds before
+    handing it over), so it is only re-parsed to normalise the format — no
+    integer/float round trip, which at ~1.8e15 microseconds sat close enough
+    to float64's exact-integer limit to risk a microsecond of drift.
     """
     created = record.get("createdAt") or record.get("addedAt")
     if isinstance(created, str) and created:
         return created
-    if time_us:
-        return datetime.fromtimestamp(time_us / 1_000_000, tz=UTC).isoformat()
+    if event_time:
+        try:
+            return datetime.fromisoformat(event_time).astimezone(UTC).isoformat()
+        except ValueError:
+            log.debug("unparseable event time: %r", event_time)
     return datetime.now(UTC).isoformat()
 
 
@@ -231,7 +243,7 @@ def build_note(
     collection: str,
     rkey: str,
     record: dict,
-    time_us: int | None,
+    event_time: str | None,
     ref: works.WorkRef | None,
     shelf_status: str | None = None,
     operation: str = "create",
@@ -250,7 +262,7 @@ def build_note(
     settings = get_settings()
     actor = settings.actor_id(handle)
     object_id = object_id or settings.post_id(handle, rkey)
-    published = _published(record, time_us)
+    published = _published(record, event_time)
 
     note: dict[str, Any] = {
         "id": object_id,
@@ -625,7 +637,7 @@ def translate(
     rkey: str,
     record: dict | None,
     operation: str,
-    time_us: int | None,
+    event_time: str | None,
     ref: works.WorkRef | None = None,
     prior_object_id: str | None = None,
     shelf_status: str | None = None,
@@ -644,7 +656,7 @@ def translate(
         collection=collection,
         rkey=rkey,
         record=record,
-        time_us=time_us,
+        event_time=event_time,
         ref=ref,
         shelf_status=shelf_status,
         operation=operation,

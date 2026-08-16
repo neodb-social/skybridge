@@ -17,7 +17,7 @@ from sqlalchemy import select
 from skybridge import optout, telemetry
 from skybridge.activitypub import actors
 from skybridge.activitypub.delivery import DeliveryWorker, fanout, fanout_actor_update
-from skybridge.atproto import identity
+from skybridge.atproto import events, identity
 from skybridge.config import get_settings
 from skybridge.db import session_scope
 from skybridge.models import BridgedActor, Record, utcnow
@@ -56,6 +56,17 @@ _PROFILE_COLLECTION = "social.popfeed.actor.profile"
 # a commit.
 _IDENTITY_KIND = "identity"
 
+# Jetstream v2 ``account`` events report atproto account lifecycle. Like
+# identity events they carry no collection and arrive for the whole network.
+_ACCOUNT_KIND = "account"
+
+# The only status we treat as permanent. A deleted repo is gone, so everything
+# bridged from it is retracted. Every other inactive status
+# (deactivated/suspended/takendown) is reversible, so it gates ingestion
+# without retracting: a user who deactivates for a week and returns should
+# find their federated history intact rather than destroyed.
+_ACCOUNT_DELETED = "deleted"
+
 
 @dataclass
 class Processed:
@@ -64,6 +75,31 @@ class Processed:
     collection: str
     activity: dict[str, Any]
     delivered: int = 0
+
+
+def _is_stale(at_uri: str, seq: int | None, *, from_archive: bool) -> bool:
+    """Would applying this event move a record backwards in time?
+
+    Jetstream orders events by a monotonic ``seq`` and delivers at-least-once,
+    so the same event can arrive twice (an inclusive-cursor reconnect) and a
+    replayed archive event can arrive long after the live tail has moved on.
+    Comparing against the row's high-water mark makes both harmless.
+
+    A row with no ``last_seq`` predates v2 ingestion, so there is nothing to
+    compare against: a live event is current by definition and applies, while
+    an archive event is rejected — an import is bounded strictly below the live
+    cursor (see :mod:`skybridge.atproto.archive`), so anything the live path
+    already wrote is necessarily newer.
+    """
+    if seq is None:
+        return False
+    with session_scope() as session:
+        row = session.get(Record, at_uri)
+        if row is None:
+            return False
+        if row.last_seq is None:
+            return from_archive
+        return seq <= row.last_seq
 
 
 def _at_uri(did: str, collection: str, rkey: str) -> str:
@@ -151,24 +187,44 @@ async def process_event(
     *,
     worker: DeliveryWorker | None = None,
     allow_network: bool = True,
+    from_archive: bool = False,
 ) -> Processed | None:
-    """Process one commit or identity event. Returns ``None`` if filtered/ignored."""
-    if event.get("kind") == "identity":
+    """Process one commit or identity event. Returns ``None`` if filtered/ignored.
+
+    ``from_archive`` marks events replayed from the Jetstream archive rather
+    than read live; it only relaxes/tightens the staleness rule (see
+    :func:`_is_stale`) and never changes how a record translates.
+    """
+    # Accept either Jetstream dialect: v2 envelopes are mapped onto the v1
+    # shape the rest of this module (and the fixtures) are written against.
+    normalized = events.normalize(event)
+    if normalized is None:
+        return None
+    event = normalized
+    if event.get("kind") == _IDENTITY_KIND:
         # Handle change: no collection filter applies (Jetstream sends identity
         # events for the whole network), so this branches before _wanted.
         return await _process_identity(event, worker=worker)
+    if event.get("kind") == _ACCOUNT_KIND:
+        # Account lifecycle, likewise network-wide and collection-less.
+        return await _process_account(event, worker=worker)
     if event.get("kind") != "commit":
         return None
-    commit = event.get("commit") or {}
-    collection = commit.get("collection", "")
+    collection = event.get("collection", "")
     if not _wanted(collection):
         return None
 
     did = event["did"]
-    operation = commit.get("operation", "create")
+    operation = event.get("operation", "create")
 
     # Honour opt-outs before creating any actor or persisting anything.
     if optout.is_opted_out(did):
+        return None
+
+    # An account currently deactivated/suspended/taken down is gated: its
+    # records stay as they are, but nothing new is bridged until it is active
+    # again (see _process_account).
+    if _is_gated(did):
         return None
 
     # Ingest-volume metric: ticks for every wanted commit event from non-opted-out
@@ -176,9 +232,16 @@ async def process_event(
     # merge, ...).
     telemetry.record_ingested(collection, operation)
 
-    rkey = commit.get("rkey", "")
-    time_us = event.get("time_us")
+    rkey = event.get("rkey", "")
+    event_time = event.get("time")
+    seq = event.get("seq")
     at_uri = _at_uri(did, collection, rkey)
+
+    if _is_stale(at_uri, seq, from_archive=from_archive):
+        # A redelivered or archive-replayed event for a record that has since
+        # moved on. Dropping it here keeps a stale Create from resurrecting a
+        # tombstoned Note on peers.
+        return None
 
     if collection == _PROFILE_COLLECTION:
         # A profile edit only ever refreshes an existing actor (see
@@ -188,8 +251,9 @@ async def process_event(
             at_uri=at_uri,
             did=did,
             operation=operation,
-            record=commit.get("record") or {},
-            time_us=time_us,
+            record=event.get("record") or {},
+            event_time=event_time,
+            seq=seq,
             worker=worker,
             allow_network=allow_network,
         )
@@ -198,12 +262,12 @@ async def process_event(
     handle = ident.handle
 
     if collection in ARCHIVE_ONLY_COLLECTIONS:
-        return _process_archive_only(at_uri, did, collection, rkey, commit, operation)
+        return _process_archive_only(at_uri, did, collection, rkey, event, operation, seq)
 
     if operation == "delete":
-        return await _process_delete(at_uri, did, collection, rkey, handle, worker)
+        return await _process_delete(at_uri, did, collection, rkey, handle, worker, seq)
 
-    record = commit.get("record") or {}
+    record = event.get("record") or {}
     ref = works.mint(record)
 
     is_episode_work = ref is not None and ref.work_type == works.EPISODE_TYPE
@@ -231,7 +295,7 @@ async def process_event(
                 rkey=rkey,
                 record=None,
                 operation="delete",
-                time_us=None,
+                event_time=None,
                 prior_object_id=note_id,
             )
         new_key = ref.work_key if ref is not None else None
@@ -240,7 +304,8 @@ async def process_event(
             did=did,
             collection=collection,
             rkey=rkey,
-            cid=commit.get("cid"),
+            seq=seq,
+            cid=event.get("cid"),
             source=record,
             note=None,
             activity=retraction,
@@ -283,7 +348,8 @@ async def process_event(
             did=did,
             collection=collection,
             rkey=rkey,
-            cid=commit.get("cid"),
+            seq=seq,
+            cid=event.get("cid"),
             source=record,
             note=None,
             activity=None,
@@ -313,7 +379,7 @@ async def process_event(
                 rkey=rkey,
                 record=None,
                 operation="delete",
-                time_us=None,
+                event_time=None,
                 prior_object_id=note_id,
             )
         _persist(
@@ -321,7 +387,8 @@ async def process_event(
             did=did,
             collection=collection,
             rkey=rkey,
-            cid=commit.get("cid"),
+            seq=seq,
+            cid=event.get("cid"),
             source=record,
             note=None,
             activity=retraction,
@@ -367,7 +434,7 @@ async def process_event(
         rkey=rkey,
         record=record,
         operation=operation,
-        time_us=time_us,
+        event_time=event_time,
         ref=ref,
         # Keep an already-published Note on its own id (None re-mints, which
         # is what a never-published or revived row wants).
@@ -378,7 +445,8 @@ async def process_event(
         did=did,
         collection=collection,
         rkey=rkey,
-        cid=commit.get("cid"),
+        seq=seq,
+        cid=event.get("cid"),
         source=record,
         note=note,
         activity=activity,
@@ -505,7 +573,7 @@ def _derive_pair(*, did: str, work_key: str, handle: str, trigger_uri: str) -> D
         # An anchor that already published keeps its id; a fresh anchor
         # (operation == "create") mints one from the current handle.
         prior_object_id=_stored_note_id(anchor.ap_object_json) if operation == "update" else None,
-        time_us=None,
+        event_time=None,
         ref=works.mint(source),
         shelf_status=shelf_status,
     )
@@ -576,8 +644,9 @@ def _process_archive_only(
     did: str,
     collection: str,
     rkey: str,
-    commit: dict[str, Any],
+    event: dict[str, Any],
     operation: str,
+    seq: int | None = None,
 ) -> Processed:
     """Persist (or tombstone) the record without any AP translation/delivery."""
     if operation == "delete":
@@ -587,14 +656,16 @@ def _process_archive_only(
                 row.op = "delete"
                 row.deleted_at = utcnow()
                 row.updated_at = utcnow()
+                _mark_seq(row, seq)
         return Processed(at_uri, "delete", collection, {})
     _persist(
         at_uri=at_uri,
         did=did,
         collection=collection,
         rkey=rkey,
-        cid=commit.get("cid"),
-        source=commit.get("record") or {},
+        seq=seq,
+        cid=event.get("cid"),
+        source=event.get("record") or {},
         note=None,
         activity=None,
         operation=operation,
@@ -609,7 +680,8 @@ async def _process_profile(
     did: str,
     operation: str,
     record: dict[str, Any],
-    time_us: int | None,
+    event_time: str | None,
+    seq: int | None,
     worker: DeliveryWorker | None,
     allow_network: bool,
 ) -> Processed | None:
@@ -625,16 +697,20 @@ async def _process_profile(
         # data remains authoritative on the next refresh.
         return None
 
+    if _profile_seen(did, seq):
+        return None
+
     row = identity.refresh_actor(did, record, allow_network=allow_network)
     if row is None:
         return None
 
-    activity, delivered = await _deliver_person_update(row, time_us=time_us, worker=worker)
+    _mark_profile_seq(did, seq)
+    activity, delivered = await _deliver_person_update(row, seq=seq, worker=worker)
     return Processed(at_uri, operation, _PROFILE_COLLECTION, activity, delivered)
 
 
 async def _deliver_person_update(
-    row: BridgedActor, *, time_us: int | None, worker: DeliveryWorker | None
+    row: BridgedActor, *, seq: int | None, worker: DeliveryWorker | None
 ) -> tuple[dict[str, Any], int]:
     """Send an ``Update(Person)`` for a refreshed actor to its own followers.
 
@@ -643,7 +719,7 @@ async def _deliver_person_update(
     """
     settings = get_settings()
     actor_id = settings.actor_id(row.handle)
-    update_id = time_us or int(datetime.now(UTC).timestamp() * 1_000_000)
+    update_id = seq or int(datetime.now(UTC).timestamp() * 1_000_000)
     activity = {
         "@context": [actors.AS_CONTEXT, actors.SECURITY_CONTEXT],
         "id": f"{actor_id}#updates/{update_id}",
@@ -657,6 +733,98 @@ async def _deliver_person_update(
     if worker is not None:
         delivered = await fanout_actor_update(worker, did=row.did, activity=activity)
     return activity, delivered
+
+
+def _profile_seen(did: str, seq: int | None) -> bool:
+    """Has this profile commit (or a newer one) already been applied?
+
+    The Record-based staleness guard can't cover profile edits — they are
+    never archived as records — so the mark lives on the actor instead.
+    """
+    if seq is None:
+        return False
+    with session_scope() as session:
+        actor = session.get(BridgedActor, did)
+        return (
+            actor is not None
+            and actor.last_profile_seq is not None
+            and (seq <= actor.last_profile_seq)
+        )
+
+
+def _mark_profile_seq(did: str, seq: int | None) -> None:
+    if seq is None:
+        return
+    with session_scope() as session:
+        actor = session.get(BridgedActor, did)
+        if actor is not None:
+            actor.last_profile_seq = max(actor.last_profile_seq or 0, seq)
+
+
+def _is_gated(did: str) -> bool:
+    """Is this DID currently inactive (not deleted) on atproto?"""
+    with session_scope() as session:
+        actor = session.get(BridgedActor, did)
+        return actor is not None and actor.inactive_status is not None
+
+
+async def _process_account(
+    event: dict[str, Any], *, worker: DeliveryWorker | None
+) -> Processed | None:
+    """Apply an atproto account lifecycle change to an actor we already bridge.
+
+    Like identity events, these arrive for every account on the network, so
+    the cheap "do we know this DID at all" test comes first — the vast
+    majority are for accounts we have never bridged and cost one indexed
+    lookup each.
+
+    A ``deleted`` account is purged: everything bridged from it is retracted,
+    since the source repo no longer exists. Every other inactive status is a
+    reversible gate — nothing is retracted and ingestion resumes when the
+    account goes active again. This never mints an actor: we bridge people
+    because of what they post, so lifecycle news about an unknown DID is not
+    our business.
+    """
+    payload = event.get(_ACCOUNT_KIND) or {}
+    did = event.get("did") or payload.get("did") or ""
+    if not did or not _is_bridged(did):
+        return None
+
+    active = payload.get("active")
+    status = payload.get("status") or ""
+
+    if active is False and status == _ACCOUNT_DELETED:
+        # Not recorded as an opt-out: the DID is gone, not opting out, and a
+        # standing OptOut row would wrongly suppress it if it ever returned.
+        purged = await optout.purge_did(did, worker=worker, mark_opt_out=False)
+        _set_gate(did, None)
+        log.info("account deleted %s; retracted %d record(s)", did, purged)
+        return Processed(f"at://{did}", "delete", _ACCOUNT_KIND, {}, purged)
+
+    if active is False:
+        _set_gate(did, status or "inactive")
+        log.info("account %s gated (%s)", did, status or "inactive")
+        return Processed(f"at://{did}", "update", _ACCOUNT_KIND, {})
+
+    if active is True and _is_gated(did):
+        _set_gate(did, None)
+        log.info("account %s active again; resuming", did)
+        return Processed(f"at://{did}", "update", _ACCOUNT_KIND, {})
+
+    return None
+
+
+def _is_bridged(did: str) -> bool:
+    with session_scope() as session:
+        return session.get(BridgedActor, did) is not None
+
+
+def _set_gate(did: str, status: str | None) -> None:
+    with session_scope() as session:
+        actor = session.get(BridgedActor, did)
+        if actor is not None:
+            actor.inactive_status = status
+            actor.inactive_at = utcnow() if status else None
 
 
 async def _process_identity(
@@ -682,10 +850,19 @@ async def _process_identity(
     if row is None:
         return None
 
-    activity, delivered = await _deliver_person_update(
-        row, time_us=event.get("time_us"), worker=worker
-    )
+    activity, delivered = await _deliver_person_update(row, seq=event.get("seq"), worker=worker)
     return Processed(f"at://{did}", "update", _IDENTITY_KIND, activity, delivered)
+
+
+def _mark_seq(row: Record | None, seq: int | None) -> None:
+    """Advance a row's high-water mark on a path that doesn't call _persist.
+
+    Tombstoning must move the mark too: otherwise a later archive replay of an
+    event newer than the record's *create* but older than its *delete* would
+    pass the staleness test and resurrect a record peers already dropped.
+    """
+    if row is not None and seq is not None:
+        row.last_seq = max(row.last_seq or 0, seq)
 
 
 async def _process_delete(
@@ -695,6 +872,7 @@ async def _process_delete(
     rkey: str,
     handle: str,
     worker: DeliveryWorker | None,
+    seq: int | None = None,
 ) -> Processed:
     settings = get_settings()
     with session_scope() as session:
@@ -719,7 +897,7 @@ async def _process_delete(
             rkey=rkey,
             record=None,
             operation="delete",
-            time_us=None,
+            event_time=None,
             prior_object_id=prior_object_id,
         )
         with session_scope() as session:
@@ -729,6 +907,7 @@ async def _process_delete(
                 row.deleted_at = utcnow()
                 row.updated_at = utcnow()
                 row.ap_activity_json = json.dumps(activity)
+                _mark_seq(row, seq)
         delivered = 0
         if worker is not None:
             delivered = await fanout(worker, record_uri=at_uri, did=did, activity=activity)
@@ -744,6 +923,7 @@ async def _process_delete(
             row.op = "delete"
             row.deleted_at = utcnow()
             row.updated_at = utcnow()
+            _mark_seq(row, seq)
     pair = None
     if collection in _PAIRED_COLLECTIONS and work_key and _contributes(collection, source):
         pair = _sync_pair(did=did, work_key=work_key, handle=handle, trigger_uri=at_uri)
@@ -769,6 +949,7 @@ def _persist(
     activity: dict | None,
     operation: str,
     work_key: str | None,
+    seq: int | None = None,
     preserve_ap: bool = False,
 ) -> None:
     with session_scope() as session:
@@ -776,6 +957,11 @@ def _persist(
         if row is None:
             row = Record(at_uri=at_uri, did=did, collection=collection, rkey=rkey)
             session.add(row)
+        if seq is not None:
+            # Monotonic: _is_stale already rejected anything older, but a
+            # max() keeps the mark correct if a caller ever persists twice
+            # for one event (e.g. a retraction followed by a pair re-derive).
+            row.last_seq = max(row.last_seq or 0, seq)
         row.cid = cid
         row.source_json = json.dumps(source)
         # preserve_ap keeps the stored AP forms — except when reviving a

@@ -40,6 +40,18 @@ class BridgedActor(Base):
     # Set when the underlying atproto user opts out (see OptOut + optout.py).
     opted_out: Mapped[bool] = mapped_column(Boolean, default=False)
     opted_out_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    # Set from a Jetstream `account` event reporting active: false with a
+    # status other than "deleted" (deactivated / suspended / takendown). A
+    # reversible gate: ingestion skips the DID while it is set and nothing is
+    # retracted, so the account resumes cleanly if it comes back. A true
+    # deletion purges instead — see pipeline._process_account.
+    inactive_status: Mapped[str | None] = mapped_column(String, default=None)
+    inactive_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    # High-water mark for profile commits. Profile edits are identity metadata
+    # and deliberately never land in the Record archive, so they have no row to
+    # carry Record.last_seq — without this a replayed profile event would
+    # re-emit Update(Person) to every follower on each import.
+    last_profile_seq: Mapped[int | None] = mapped_column(Integer, default=None)
 
 
 class HandleAlias(Base):
@@ -172,6 +184,11 @@ class Record(Base):
     ap_activity_json: Mapped[str | None] = mapped_column(Text, default=None)
     op: Mapped[str] = mapped_column(String, default="create")  # create|update|delete
     work_key: Mapped[str | None] = mapped_column(String, index=True, default=None)
+    # Highest Jetstream v2 `seq` applied to this row: the high-water mark that
+    # keeps a replayed archive event from overwriting newer live state, and
+    # makes the live tail's at-least-once redelivery idempotent. NULL on rows
+    # written before v2 ingestion (see pipeline._is_stale).
+    last_seq: Mapped[int | None] = mapped_column(Integer, index=True, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
@@ -194,10 +211,75 @@ class Delivery(Base):
 
 
 class Cursor(Base):
-    """Single-row Jetstream ``time_us`` cursor for resumable ingestion."""
+    """Single-row Jetstream cursor for resumable ingestion.
+
+    ``time_us`` is the v1 unit (microseconds since the epoch); ``seq`` is v2's
+    monotonic event counter. Both are kept because a v2 host accepts either —
+    it tells them apart by magnitude — so an existing deployment upgrading to
+    v2 resumes from its stored ``time_us`` and starts recording ``seq``.
+    """
 
     __tablename__ = "cursor"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    seq: Mapped[int | None] = mapped_column(Integer, default=None)
     time_us: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SeenCollection(Base):
+    """An atproto collection observed under a bridged namespace wildcard.
+
+    Populated by ``python -m skybridge discover`` (see
+    :mod:`skybridge.atproto.discover`), which subscribes to
+    ``social.popfeed.*``/``buzz.bookhive.*`` rather than the explicit ingest
+    list. Lets a new collection announce itself instead of being noticed by
+    hand — the maintenance problem the commentary above WANTED_COLLECTIONS
+    describes.
+    """
+
+    __tablename__ = "seen_collection"
+
+    nsid: Mapped[str] = mapped_column(String, primary_key=True)
+    event_count: Mapped[int] = mapped_column(Integer, default=0)
+    # One representative record, so the shape can be judged without a re-run.
+    sample_json: Mapped[str | None] = mapped_column(Text, default=None)
+    first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ImportJob(Base):
+    """A historical archive import (Jetstream v2 Network Replay).
+
+    One row per requested import, kept across restarts so a run interrupted by
+    a metering 429 or a redeploy resumes from where it stopped rather than
+    re-downloading (and re-paying for) what it already has.
+    """
+
+    __tablename__ = "import_job"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # pending|running|paused|done|cancelled|failed
+    state: Mapped[str] = mapped_column(String, default="pending", index=True)
+    after_seq: Mapped[int] = mapped_column(Integer, default=0)
+    # Upper bound, pinned at request time to the live cursor so the import can
+    # never contend with the live tail for the same events.
+    before_seq: Mapped[int] = mapped_column(Integer, default=0)
+    # Planner progress: resume the plan loop from here (see archive.py).
+    planned_through_seq: Mapped[int] = mapped_column(Integer, default=0)
+    sealed_tip_seq: Mapped[int] = mapped_column(Integer, default=0)
+    last_applied_seq: Mapped[int] = mapped_column(Integer, default=0)
+    segments_done: Mapped[int] = mapped_column(Integer, default=0)
+    # Name of the last segment fully applied. planned_through_seq only moves
+    # when an entire plan page completes, and a page can hold the whole
+    # archive — so without this a failure at 84% would restart from zero.
+    last_segment: Mapped[str | None] = mapped_column(String, default=None)
+    segments_total: Mapped[int] = mapped_column(Integer, default=0)
+    events_applied: Mapped[int] = mapped_column(Integer, default=0)
+    bytes_downloaded: Mapped[int] = mapped_column(Integer, default=0)
+    # Whether to fan the imported records out to peers. Off by default:
+    # replaying years of history would flood every subscriber with Creates.
+    deliver: Mapped[bool] = mapped_column(Boolean, default=False)
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

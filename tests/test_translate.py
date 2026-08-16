@@ -82,7 +82,7 @@ def test_review_facets_render_as_links(settings):
         rkey="rv9",
         record=record,
         operation="create",
-        time_us=None,
+        event_time=None,
         ref=ref,
     )
     assert note is not None
@@ -113,7 +113,7 @@ def test_review_facet_with_unsafe_scheme_is_not_linked(settings):
         rkey="rv10",
         record=record,
         operation="create",
-        time_us=None,
+        event_time=None,
         ref=ref,
     )
     assert note is not None
@@ -129,7 +129,7 @@ def test_list_becomes_shelf(settings):
         rkey="l1",
         record=LIST,
         operation="create",
-        time_us=None,
+        event_time=None,
         ref=None,
     )
     assert note is not None
@@ -148,7 +148,7 @@ def test_list_item_status_mark(settings):
         rkey="i1",
         record=LIST_ITEM,
         operation="create",
-        time_us=None,
+        event_time=None,
         ref=ref,
     )
     assert note is not None
@@ -185,7 +185,7 @@ def test_list_item_content_uses_archived_list_name(settings):
         rkey="i1",
         record=record,
         operation="create",
-        time_us=None,
+        event_time=None,
         ref=ref,
     )
     assert note is not None
@@ -214,7 +214,7 @@ def test_list_item_content_uses_description_when_list_unnamed(settings):
         rkey="i1",
         record=record,
         operation="create",
-        time_us=None,
+        event_time=None,
         ref=ref,
     )
     assert note is not None
@@ -236,7 +236,7 @@ def test_list_item_falls_back_when_list_not_archived(settings, monkeypatch):
         rkey="i1",
         record=record,
         operation="create",
-        time_us=None,
+        event_time=None,
         ref=ref,
     )
     assert note is not None
@@ -270,7 +270,7 @@ def _translate_list_item(record, *, rkey="i1"):
         rkey=rkey,
         record=record,
         operation="create",
-        time_us=None,
+        event_time=None,
         ref=ref,
     )
 
@@ -357,7 +357,7 @@ def test_review_becomes_rating_and_comment(settings):
         rkey="rv1",
         record=REVIEW,
         operation="create",
-        time_us=None,
+        event_time=None,
         ref=ref,
     )
     assert note is not None
@@ -416,7 +416,7 @@ def test_review_content_link_carries_neodb_marker_but_tag_href_does_not(settings
         rkey="rv1",
         record=REVIEW,
         operation="create",
-        time_us=None,
+        event_time=None,
         ref=ref,
     )
     assert note is not None
@@ -437,7 +437,7 @@ def test_rating_only_review_has_no_review_object(settings):
         rkey="rv2",
         record=record,
         operation="create",
-        time_us=None,
+        event_time=None,
         ref=ref,
     )
     assert note is not None

@@ -69,6 +69,94 @@
     <button type="submit">Sign out</button>
   </form>
 </div>
+
+{% if is_admin %}
+<h3>Operator</h3>
+<div class="card">
+  <p>
+    <span class="pill">admin</span>
+    Ingest cursor <code>{{ admin.cursor_seq or "—" }}</code>
+    {% if not admin.is_v2 %}
+    — <strong>Jetstream v1 endpoint</strong>: archive import and collection
+    discovery need v2.
+    {% elif not admin.has_api_key %}
+    — <strong>no SKYBRIDGE_JETSTREAM_API_KEY</strong>: live ingest is fine
+    (it needs no key), but the archive import does.
+    {% endif %}
+  </p>
+
+  {% if admin.job %}
+  <p>
+    Import #{{ admin.job.id }} <span class="pill">{{ admin.job.state }}</span>
+    seq {{ admin.job.after_seq }}–{{ admin.job.before_seq }},
+    segments {{ admin.job.segments_done }}/{{ admin.job.segments_total }},
+    {{ admin.job.events_applied }} event(s) applied,
+    {{ "%.1f"|format(admin.job.bytes_downloaded / 1048576) }} MiB downloaded
+    {%- if admin.job.deliver %}, delivering{% endif %}.
+  </p>
+  {% if admin.job.error %}
+  <p class="muted">{{ admin.job.error }}</p>
+  {% endif %}
+  {% else %}
+  <p class="muted">No archive import has been run.</p>
+  {% endif %}
+
+  {% if admin.estimate %}
+  <p>
+    Estimate for seq {{ admin.estimate.after_seq }}–{{ admin.estimate.before_seq }}:
+    {{ admin.estimate.segments }} segment(s)
+    ({{ admin.estimate.whole_segments }} whole-file),
+    {{ admin.estimate.blocks }} block(s),
+    {{ admin.estimate.planner_entries }} planner work unit(s),
+    <strong>~{{ "%.1f"|format(admin.estimate.estimated_bytes / 1073741824) }} GiB</strong>
+    to download.
+  </p>
+  {% endif %}
+
+  {% if admin.collections %}
+  <p class="muted">Collections seen under the bridged namespaces:</p>
+  <table>
+    <tr><th>Collection</th><th>Seen</th><th>Events</th></tr>
+    {% for c in admin.collections %}
+    <tr>
+      <td>{{ c.nsid }}</td>
+      <td><span class="pill">{{ "bridged" if c.nsid in admin.wanted else "not bridged" }}</span></td>
+      <td>{{ c.event_count }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+</div>
+
+<div>
+  <form method="post" action="/optout/admin/import/dry-run" style="display:inline">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit"{% if not admin.can_import %} disabled{% endif %}>Estimate import</button>
+  </form>
+  <form method="post" action="/optout/admin/import" style="display:inline">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label class="muted">from seq
+      <input name="after_seq" value="0" size="12" inputmode="numeric">
+    </label>
+    <button type="submit"{% if not admin.can_import or admin.running %} disabled{% endif %}>
+      Start import
+    </button>
+  </form>
+  <form method="post" action="/optout/admin/import/cancel" style="display:inline">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit"{% if not admin.running %} disabled{% endif %}>Cancel import</button>
+  </form>
+</div>
+<p class="muted">
+  The import replays history from the Jetstream v2 archive up to the live
+  ingest cursor, so it can run while the bridge is live and can never overwrite
+  newer data. It does <strong>not</strong> deliver to peers — records are
+  archived only, since replaying years of history would flood every subscriber.
+  Opted-out accounts are skipped. Estimate first: the archive is billed by
+  bytes downloaded, and the planner works from bloom filters, so it fetches
+  considerably more of the archive than actually holds records we want.
+</p>
+{% endif %}
 <p class="muted">
   Opting out stops mirroring your activity and asks remote servers to delete
   what was already federated; opting back in bridges future activity again

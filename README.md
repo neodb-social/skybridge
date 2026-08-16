@@ -16,7 +16,8 @@ following individually.
 ## How it works
 
 ```
-Jetstream (atproto firehose)  ─┐
+Jetstream v2 (atproto firehose)┐
+  live tail / archive replay   │
    or replayed fixtures        │   ┌───────────── translate ─────────────┐
                                ▼   │ popfeed record → NeoDB AP object    │
   filter popfeed collections   ├──►│  (one Note per author+work, with    │
@@ -116,6 +117,13 @@ Known but not bridged:
   stream every profile edit network-wide); it's instead re-fetched as a
   fallback whenever a `social.popfeed.actor.profile` event arrives.
 
+`uv run python -m skybridge discover` keeps this list honest: it subscribes to
+`social.popfeed.*` / `buzz.bookhive.*` (Jetstream v2 accepts namespace
+wildcards) and reports every collection seen, flagging the ones we don't
+bridge. Ingestion itself still asks for the explicit list — a wildcard
+subscription would also pull in `buzz.bookhive.catalogBook`, whose records
+carry multi-KB author biographies we have no use for.
+
 ### BookHive
 
 [BookHive](https://github.com/nperez0111/bookhive) is a separate atproto app —
@@ -143,6 +151,62 @@ Known but not bridged:
 - the `cover` blob (a PDS blob, not a URL): no poster is derived yet, so the
   Note relies on the catalog-item tag for imagery
 
+### Account lifecycle
+
+Jetstream v2 reports atproto account state, which the bridge acts on. Only a
+`deleted` account is permanent: everything bridged from it is retracted, the
+same way an opt-out is, but *without* recording an opt-out — the DID is gone,
+not making a standing choice, and a stored opt-out would wrongly suppress it
+if it ever returned.
+
+Every other inactive status (`deactivated`, `suspended`, `takendown`) is
+treated as reversible: ingestion stops for that account and **nothing is
+retracted**, so someone who deactivates for a week and comes back finds their
+federated history intact. Ingestion resumes when the account goes active
+again.
+
+### Importing history
+
+The live socket only reaches back a bounded window (36 hours on Bluesky's
+instances). Jetstream v2 additionally serves its whole archive over HTTP, so
+history can be imported without crawling every PDS. This is what
+`SKYBRIDGE_JETSTREAM_API_KEY` is for — nothing else needs it.
+
+An import is designed to run on a live server:
+
+- **It cannot overwrite newer data.** Each record keeps the highest `seq`
+  applied to it, and an import is bounded above by the live ingest cursor, so
+  an archived event can never regress a record the live tail has moved past.
+  The same mark makes Jetstream's at-least-once redelivery idempotent.
+- **It honours opt-out.** Opted-out DIDs are skipped, and because the import
+  runs *inside the server process* an opt-out mid-import can cancel it. An
+  out-of-process import could not be stopped.
+- **It does not deliver by default.** Replaying history would flood every
+  subscriber with `Create` activities, so imported records are archived
+  silently unless delivery is explicitly requested.
+- **It is resumable.** Progress is persisted per segment, so a metering `429`
+  or a restart continues rather than re-downloading.
+
+Cost is dominated by how much of the archive gets fetched, and two things keep
+that down for a rare collection:
+
+- The planner works from bloom filters, so it over-selects. Where it asks for a
+  whole segment (`mode: "segment"`), the importer instead Range-fetches the
+  file header and the segment's **collection index**, which names the blocks
+  holding each NSID, and downloads only those — orders of magnitude less than
+  the whole file. A segment whose index can't be read falls back to the full
+  download.
+- Blocks are fetched with bounded concurrency and applied in index order, since
+  the run is a chain of round trips rather than a bandwidth problem.
+
+Run an estimate first, and read it carefully: the plan's `planner_entries`
+counts the planner's own work units, **not** records, and understates the
+records recovered by a wide margin. `estimated_bytes` is the number to judge.
+
+Start, watch and cancel an import from the admin panel on `/optout` (visible
+to accounts listed in `SKYBRIDGE_ADMINS` after signing in), or queue one from
+the CLI with `python -m skybridge import`.
+
 ---
 
 ## Configuration
@@ -153,7 +217,9 @@ Known but not bridged:
 | `SKYBRIDGE_SCHEME` | `https` (`http` for localhost) | URL scheme |
 | `SKYBRIDGE_DATA` | `./data` | Folder for all mutable state (`skybridge.db`, `relay_key.pem`); under compose it is the host folder bind-mounted to the container's `/data` |
 | `SKYBRIDGE_PORT` | `8000` | Host port docker compose publishes the server on (compose-only) |
-| `SKYBRIDGE_JETSTREAM` | public jetstream2 us-east | Jetstream WebSocket endpoint |
+| `SKYBRIDGE_JETSTREAM` | public Jetstream **v2** us-east | Jetstream WebSocket endpoint; a v1 endpoint still works, but import/discovery are v2-only |
+| `SKYBRIDGE_JETSTREAM_API_KEY` | unset | Jetstream v2 archive key, for importing history. Not needed for normal operation — the live socket takes no key |
+| `SKYBRIDGE_ADMINS` | unset | Comma/space-separated DIDs and/or handles that get the admin panel on `/optout`. Prefer DIDs: handles are transferable |
 | `SKYBRIDGE_RELAY_KEY` | **required** | Service actor private key (PEM); alternatively place a PEM at `$SKYBRIDGE_DATA/relay_key.pem` |
 | `SKYBRIDGE_RELAYS` | unset | Comma/space-separated relay inbox URLs to publish through (Mastodon-style); empty = pure normal-server mode |
 
@@ -186,7 +252,7 @@ Requires [uv](https://docs.astral.sh/uv/).
 uv sync            # create .venv and install runtime + dev deps from uv.lock
 ```
 
-The CLI has four subcommands (run them via `uv run`):
+The CLI has six subcommands (run them via `uv run`):
 
 ```bash
 # Serve the ActivityPub endpoints + dashboard (set SKYBRIDGE_INGEST=1 to also
@@ -205,6 +271,15 @@ uv run python -m skybridge backfill did:plc:i6k6scfcdaup4e2va33nkprb
 
 # Replay a captured JSONL fixture through the full pipeline (offline).
 uv run python -m skybridge replay fixtures/jetstream_sample.jsonl --reset
+
+# Survey which collections are being published under the bridged namespaces.
+uv run python -m skybridge discover --seconds 120
+
+# Import history from the Jetstream v2 archive. ALWAYS estimate first — the
+# archive is billed by bytes downloaded, and a rare collection plans far more
+# of it than the matching-record count suggests.
+uv run python -m skybridge import --dry-run
+uv run python -m skybridge import            # queues it; the server runs it
 ```
 
 ### Docker
