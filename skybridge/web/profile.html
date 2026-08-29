@@ -1,6 +1,12 @@
 {% extends "base.html" %}
 {% block title %}{{ name }} (@{{ handle }}) · Skybridge{% endblock %}
 {% block head %}
+{# The author asked Bluesky to hide their posts from logged-out readers, and
+   this page has no sign-in. Keep it out of search indexes and out of link
+   previews, and show identity only — the same shape Bluesky serves. #}
+{% if no_unauthenticated %}
+<meta name="robots" content="noindex, nofollow" />
+{% else %}
 <meta property="og:type" content="profile" />
 <meta property="og:site_name" content="Skybridge" />
 <meta property="og:title" content="{{ name }} (@{{ handle }})" />
@@ -10,6 +16,7 @@
 <meta property="og:image" content="{{ avatar }}" />
 <meta name="twitter:card" content="summary" />
 <meta name="twitter:image" content="{{ avatar }}" />
+{% endif %}
 {% endif %}
 {% endblock %}
 {% block content %}
@@ -26,7 +33,16 @@
       Bridged from Atmosphere. Original account:
       <a href="https://bsky.app/profile/{{ did }}" rel="me">{{ handle }}</a>
     </p>
+    {% if no_unauthenticated %}
+    <p class="muted">
+      This account asked that its posts are not shown to signed-out readers,
+      so they are not listed here. Follow
+      <code>@{{ handle }}@{{ settings.domain }}</code> from your own server to
+      receive them.
+    </p>
+    {% else %}
     <p class="muted">{{ post_count }} bridged post(s)</p>
+    {% endif %}
   </div>
 </div>
 <p class="muted">ActivityPub actor: <code>{{ actor_id }}</code></p>

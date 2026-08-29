@@ -1,6 +1,12 @@
 {% extends "base.html" %}
-{% block title %}{{ og_title }} · Skybridge{% endblock %}
+{% block title %}{% if no_unauthenticated %}Post by @{{ handle }}{% else %}{{ og_title }}{% endif %} · Skybridge{% endblock %}
 {% block head %}
+{# The author asked Bluesky to hide their posts from logged-out readers, and
+   this page has no sign-in: no content, no link preview, no search index.
+   The AP object at the same URL is unaffected. #}
+{% if no_unauthenticated %}
+<meta name="robots" content="noindex, nofollow" />
+{% else %}
 <meta property="og:type" content="article" />
 <meta property="og:site_name" content="Skybridge" />
 <meta property="og:title" content="{{ og_title }}" />
@@ -11,8 +17,25 @@
 <meta name="twitter:card" content="summary" />
 <meta name="twitter:image" content="{{ work.image }}" />
 {% endif %}
+{% endif %}
 {% endblock %}
 {% block content %}
+{% if no_unauthenticated %}
+<div class="hero">
+  <div>
+    <p>
+      <a href="{{ author_url }}"><strong>{{ handle }}</strong></a>
+      <span class="muted">· @{{ handle }}@{{ settings.domain }}</span>
+    </p>
+    <p>
+      This author asked that their posts are not shown to signed-out readers,
+      so this one is not displayed here. Follow
+      <code>@{{ handle }}@{{ settings.domain }}</code> from your own server to
+      receive it.
+    </p>
+  </div>
+</div>
+{% else %}
 <div class="hero">
   {% if work %}
   {% if work.image %}
@@ -46,5 +69,6 @@
     </p>
   </div>
 </div>
+{% endif %}
 <p class="muted">ActivityPub object: <code>{{ url }}</code></p>
 {% endblock %}

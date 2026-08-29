@@ -52,6 +52,21 @@ class BridgedActor(Base):
     # carry Record.last_seq — without this a replayed profile event would
     # re-emit Update(Person) to every follower on each import.
     last_profile_seq: Mapped[int | None] = mapped_column(Integer, default=None)
+    # Bluesky's two public visibility preferences, mirrored here so the actor
+    # document and the web pages can honour them. Both are read from the
+    # atproto account, never set on this side — see atproto/identity.py.
+    #
+    #   hide_from_recommendations — the app.bsky.actor.contentVisibilityDeclaration
+    #     record (rkey `self`, field `hideFromAlgorithmicRecommendations`). The
+    #     lexicon says a missing record means false.
+    #   no_unauthenticated — the `!no-unauthenticated` self-label on the
+    #     app.bsky.actor.profile record ("hide my posts from logged-out users").
+    hide_from_recommendations: Mapped[bool] = mapped_column(Boolean, default=False)
+    no_unauthenticated: Mapped[bool] = mapped_column(Boolean, default=False)
+    # High-water mark for contentVisibilityDeclaration commits, for the same
+    # reason as last_profile_seq: the declaration is identity metadata and is
+    # never archived as a Record, so it has no row to carry Record.last_seq.
+    last_visibility_seq: Mapped[int | None] = mapped_column(Integer, default=None)
 
 
 class HandleAlias(Base):

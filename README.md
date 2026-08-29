@@ -88,6 +88,61 @@ Known limit: a renamed actor is not announced with a `Move`, so remote servers
 keep following the old id (which still works) instead of migrating to the new
 one.
 
+### Visibility preferences
+
+Bluesky publishes two "speech is not reach" toggles that a bridge is expected
+to honour. Both are read off the atproto account and never set on this side.
+
+**Hide from algorithmic recommendations.** The
+`app.bsky.actor.contentVisibilityDeclaration` record (rkey `self`, field
+`hideFromAlgorithmicRecommendations`; a missing record means false, per the
+lexicon). It becomes `discoverable: false` on the bridged `Person` — which on
+Mastodon drops the account from the profile directory, from follow
+recommendations and from trends, and on NeoDB also withholds consent to being
+featured in someone's collection (FEP-7aa9). Watched on Jetstream, so a toggle
+publishes an `Update(Person)` to that author's followers straight away.
+
+The flag is written under *both* `discoverable` and `toot:discoverable`,
+because the two receivers read it in incompatible ways: Mastodon never compacts
+a fetched actor and reads the raw key, while NeoDB/takahe compacts against the
+document's own context and then reads `toot:discoverable`. Our `@context`
+declares the `toot` prefix but not the `discoverable` alias, which is what
+keeps the two keys from folding into one array. Nothing is emitted when the
+preference is unset: both receivers already default to permissive, and
+volunteering `discoverable: true` would opt every bridged author into
+directories nobody asked for.
+
+**Hide from logged-out users.** The `!no-unauthenticated` self-label on the
+`app.bsky.actor.profile` record. ActivityPub cannot say "signed-in readers
+only" while staying publicly federated, so this is honoured as far as it can
+be, and no further:
+
+- Our own web pages carry `noindex, nofollow`, drop their link-preview tags,
+  and show identity only. `/archive` and its detail pages hide the author's
+  records entirely. The AP representation at the same URLs is untouched — a
+  peer that follows the author is exactly the audience the label still allows.
+- Posts are addressed unlisted (`to: [followers]`, `cc: [as:Public]`), which
+  keeps them out of the public, local, federated and hashtag timelines and out
+  of trends. Delivery is unaffected: neodb-relay redistributes on `to` *or*
+  `cc`, and takahe files a `cc`-public post as unlisted rather than dropping
+  it.
+- The actor also gets `indexable: false`.
+
+Not honoured: a permalink on a Mastodon-family peer stays readable by anyone,
+signed in or not. Note that NeoDB peers already hide every remote author's
+marks from logged-out visitors, since they create remote identities with
+`anonymous_viewable=False`.
+
+This label is not watched on Jetstream (it rides on `app.bsky.actor.profile`,
+which we deliberately do not tail). It is read when an actor is minted and
+re-read whenever the actor is refreshed, so a toggle lands on the next refresh
+rather than at once. Neither preference is ever *cleared* by a refresh — a
+failed fetch and a preference turned off both arrive as an empty record, and
+the two must not be confused when one of them means "publish this person more
+widely again". Clearing has exact signals of its own: the declaration's own
+Jetstream commit (a delete and a `false` both mean false), and a profile record
+that comes back without the label.
+
 One popfeed action ("watched + rated") writes a review *and* a listItem; the
 bridge emits ONE AP `Note` per (author, work) carrying `Status` + `Rating` +
 `Comment` together. The Note id is anchored on whichever record publishes
@@ -114,8 +169,13 @@ Known but not bridged:
 - `social.popfeed.feed.reaction` (emoji reactions; maybe later `Like`/`EmojiReact` in AP)
 - per-episode `watchedEpisodes` array on tv listItems.
 - `app.bsky.actor.profile` on Jetstream (deliberately not watched — that would
-  stream every profile edit network-wide); it's instead re-fetched as a
-  fallback whenever a `social.popfeed.actor.profile` event arrives.
+  stream every profile edit network-wide); it's instead re-fetched whenever a
+  `social.popfeed.actor.profile` event arrives, both as a name/avatar fallback
+  and to re-read the `!no-unauthenticated` label.
+
+`app.bsky.actor.contentVisibilityDeclaration` *is* watched network-wide (see
+Visibility preferences above): unlike a profile edit it is a rare, low-volume
+record, and like one it only ever updates an actor we already bridge.
 
 `uv run python -m skybridge discover` keeps this list honest: it subscribes to
 `social.popfeed.*` / `buzz.bookhive.*` (Jetstream v2 accepts namespace

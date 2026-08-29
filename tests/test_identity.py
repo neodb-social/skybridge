@@ -131,6 +131,7 @@ def test_resolve_remote_falls_back_to_bsky_for_display_name_and_avatar(monkeypat
             "value": {"$type": "social.popfeed.actor.profile", "displayName": "", "bannerUrl": ""}
         },
         "collection=app.bsky.actor.profile": BSKY_PROFILE_WITH_AVATAR,
+        "collection=app.bsky.actor.contentVisibilityDeclaration": None,
     }
     monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
 
@@ -148,6 +149,7 @@ def test_resolve_remote_prefers_popfeed_display_name_over_bsky(monkeypatch):
             "value": {"$type": "social.popfeed.actor.profile", "displayName": "Pop Alice"}
         },
         "collection=app.bsky.actor.profile": BSKY_PROFILE_WITH_AVATAR,
+        "collection=app.bsky.actor.contentVisibilityDeclaration": None,
     }
     monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
 
@@ -166,6 +168,7 @@ def test_resolve_remote_avatar_none_when_bsky_fetch_fails(monkeypatch):
         # Simulates a network failure: _http_json swallows exceptions and
         # returns None, which must never propagate as an exception here.
         "collection=app.bsky.actor.profile": None,
+        "collection=app.bsky.actor.contentVisibilityDeclaration": None,
     }
     monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
 
@@ -175,7 +178,12 @@ def test_resolve_remote_avatar_none_when_bsky_fetch_fails(monkeypatch):
     assert ident.handle == HANDLE
 
 
-def test_resolve_remote_skips_bsky_fetch_when_popfeed_has_everything(monkeypatch):
+def test_resolve_remote_still_reads_bsky_when_popfeed_has_everything(monkeypatch):
+    """Popfeed values still win, but the bsky record is fetched regardless.
+
+    It carries the ``!no-unauthenticated`` self-label, which has to be known
+    even for an author whose popfeed profile supplied both name and avatar.
+    """
     calls: list[str] = []
     responses = {
         "plc.directory": PLC_DOC,
@@ -186,7 +194,8 @@ def test_resolve_remote_skips_bsky_fetch_when_popfeed_has_everything(monkeypatch
                 "avatar": {"ref": {"$link": AVATAR_CID}, "$type": "blob"},
             }
         },
-        # No entry for app.bsky.actor.profile: the fake raises if it's hit.
+        "collection=app.bsky.actor.profile": {"value": {"displayName": "Bsky Alice"}},
+        "collection=app.bsky.actor.contentVisibilityDeclaration": None,
     }
     monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses, calls))
 
@@ -194,7 +203,145 @@ def test_resolve_remote_skips_bsky_fetch_when_popfeed_has_everything(monkeypatch
 
     assert ident.display_name == "Pop Alice"
     assert ident.avatar == AVATAR_URL
+    assert ident.no_unauthenticated is False
 
     # Verify exactly ONE URL contains "plc.directory" (no duplicate fetch).
     plc_calls = [url for url in calls if "plc.directory" in url]
     assert len(plc_calls) == 1
+    assert sum("collection=app.bsky.actor.profile" in url for url in calls) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Bluesky visibility preferences
+# --------------------------------------------------------------------------- #
+_NO_UNAUTH_PROFILE = {
+    "value": {
+        "$type": "app.bsky.actor.profile",
+        "displayName": "Alice",
+        "labels": {
+            "$type": "com.atproto.label.defs#selfLabels",
+            "values": [{"val": "!no-unauthenticated"}],
+        },
+    }
+}
+
+
+def test_resolve_remote_reads_both_visibility_preferences(monkeypatch):
+    responses = {
+        "plc.directory": PLC_DOC,
+        "collection=social.popfeed.actor.profile": {"value": {"displayName": "Alice"}},
+        "collection=app.bsky.actor.profile": _NO_UNAUTH_PROFILE,
+        "collection=app.bsky.actor.contentVisibilityDeclaration": {
+            "value": {"hideFromAlgorithmicRecommendations": True}
+        },
+    }
+    monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
+
+    ident = identity.resolve_remote(DID)
+
+    assert ident.hide_from_recommendations is True
+    assert ident.no_unauthenticated is True
+
+
+def test_missing_declaration_record_means_false(monkeypatch):
+    """The lexicon: "Consumers must treat a missing record as false.\""""
+    responses = {
+        "plc.directory": PLC_DOC,
+        "collection=social.popfeed.actor.profile": {"value": {"displayName": "Alice"}},
+        "collection=app.bsky.actor.profile": {"value": {"displayName": "Alice"}},
+        "collection=app.bsky.actor.contentVisibilityDeclaration": None,
+    }
+    monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
+
+    ident = identity.resolve_remote(DID)
+
+    assert ident.hide_from_recommendations is False
+    assert ident.no_unauthenticated is False
+
+
+def test_ensure_actor_persists_visibility_preferences(settings, monkeypatch):
+    responses = {
+        "plc.directory": PLC_DOC,
+        "collection=social.popfeed.actor.profile": {"value": {"displayName": "Alice"}},
+        "collection=app.bsky.actor.profile": _NO_UNAUTH_PROFILE,
+        "collection=app.bsky.actor.contentVisibilityDeclaration": {
+            "value": {"hideFromAlgorithmicRecommendations": True}
+        },
+    }
+    monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
+
+    identity.ensure_actor(DID, allow_network=True)
+
+    row = _actor(DID)
+    assert row.hide_from_recommendations is True
+    assert row.no_unauthenticated is True
+
+
+def test_has_self_label_tolerates_malformed_labels():
+    assert identity.has_self_label({}, "!no-unauthenticated") is False
+    assert identity.has_self_label({"labels": []}, "!no-unauthenticated") is False
+    assert identity.has_self_label({"labels": {"values": "x"}}, "!no-unauthenticated") is False
+    assert identity.has_self_label({"labels": {"values": [None]}}, "!no-unauthenticated") is False
+
+
+def test_set_hide_from_recommendations_never_mints_an_actor(settings):
+    assert identity.set_hide_from_recommendations("did:plc:unknown", True) is None
+    assert identity.actor_by_ident("did:plc:unknown") is None
+
+
+def test_set_hide_from_recommendations_is_a_no_op_when_unchanged(settings):
+    identity.ensure_actor(DID, allow_network=False)
+
+    # Nothing to publish for a value that did not move.
+    assert identity.set_hide_from_recommendations(DID, False) is None
+    assert identity.set_hide_from_recommendations(DID, True) is not None
+    assert identity.set_hide_from_recommendations(DID, True) is None
+    assert _actor(DID).hide_from_recommendations is True
+
+
+def test_refresh_never_clears_a_preference_on_a_failed_fetch(settings, monkeypatch):
+    """A fetch that failed and a preference turned off look the same here.
+
+    Both arrive as an empty record, so refresh only ever raises the flags.
+    Turning them off has exact signals of its own: the declaration's own
+    Jetstream commit, and a profile record that comes back without the label.
+    """
+    identity.ensure_actor(DID, allow_network=False)
+    with identity.session_scope() as session:
+        row = session.get(BridgedActor, DID)
+        assert row is not None
+        row.hide_from_recommendations = True
+        row.no_unauthenticated = True
+
+    responses = {
+        "plc.directory": PLC_DOC,
+        # The PDS is answering for nothing right now.
+        "collection=app.bsky.actor.profile": None,
+        "collection=app.bsky.actor.contentVisibilityDeclaration": None,
+    }
+    monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
+
+    identity.refresh_actor(DID, {"displayName": "Alice"}, allow_network=True)
+
+    row = _actor(DID)
+    assert row.hide_from_recommendations is True
+    assert row.no_unauthenticated is True
+
+
+def test_refresh_clears_the_label_once_the_profile_comes_back_without_it(settings, monkeypatch):
+    identity.ensure_actor(DID, allow_network=False)
+    with identity.session_scope() as session:
+        row = session.get(BridgedActor, DID)
+        assert row is not None
+        row.no_unauthenticated = True
+
+    responses = {
+        "plc.directory": PLC_DOC,
+        "collection=app.bsky.actor.profile": {"value": {"displayName": "Alice"}},
+        "collection=app.bsky.actor.contentVisibilityDeclaration": None,
+    }
+    monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
+
+    identity.refresh_actor(DID, {"displayName": "Alice"}, allow_network=True)
+
+    assert _actor(DID).no_unauthenticated is False

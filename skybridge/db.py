@@ -33,6 +33,12 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("bridged_actor", "inactive_at", "DATETIME"),
     ("bridged_actor", "last_profile_seq", "INTEGER"),
     ("import_job", "last_segment", "VARCHAR"),
+    # Booleans carry an explicit NOT NULL DEFAULT so existing rows read as
+    # "not set" instead of NULL: both flags gate what we publish, and a NULL
+    # third state would only invite a wrong `is False` test somewhere.
+    ("bridged_actor", "hide_from_recommendations", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("bridged_actor", "no_unauthenticated", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("bridged_actor", "last_visibility_seq", "INTEGER"),
 )
 
 

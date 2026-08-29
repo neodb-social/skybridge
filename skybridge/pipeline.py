@@ -51,6 +51,11 @@ _PAIRED_COLLECTIONS = (_REVIEW_COLLECTION, _LIST_ITEM_COLLECTION)
 # archive and never mints an actor of its own — see _process_profile.
 _PROFILE_COLLECTION = "social.popfeed.actor.profile"
 
+# Bluesky's "hide my posts from algorithmic recommendations" declaration. Takes
+# the same path as a profile edit — never archived, never mints an actor, emits
+# an Update(Person) to that author's own followers — see _process_visibility.
+_VISIBILITY_COLLECTION = identity.VISIBILITY_COLLECTION
+
 # Jetstream ``identity`` events (handle changes) carry no collection at all.
 # Reported on Processed.collection so /stats and logs can tell them apart from
 # a commit.
@@ -104,6 +109,19 @@ def _is_stale(at_uri: str, seq: int | None, *, from_archive: bool) -> bool:
 
 def _at_uri(did: str, collection: str, rkey: str) -> str:
     return f"at://{did}/{collection}/{rkey}"
+
+
+def _unlisted(did: str) -> bool:
+    """Should this author's posts be addressed unlisted rather than public?
+
+    True for an author carrying Bluesky's ``!no-unauthenticated`` label. Read
+    per translation rather than threaded through the call chain: the flag can
+    change between two events for the same author, and every one of these
+    paths is already several queries deep.
+    """
+    with session_scope() as session:
+        actor = session.get(BridgedActor, did)
+        return actor is not None and bool(actor.no_unauthenticated)
 
 
 def _wanted(collection: str) -> bool:
@@ -258,6 +276,20 @@ async def process_event(
             allow_network=allow_network,
         )
 
+    if collection == _VISIBILITY_COLLECTION:
+        # Same rule as a profile edit, and for the same reason: a preference
+        # is not content, so it branches before ensure_actor. This one arrives
+        # for the whole network, so most events land on a DID we do not bridge
+        # and stop inside _process_visibility.
+        return await _process_visibility(
+            at_uri=at_uri,
+            did=did,
+            operation=operation,
+            record=event.get("record") or {},
+            seq=seq,
+            worker=worker,
+        )
+
     ident = identity.ensure_actor(did, allow_network=allow_network)
     handle = ident.handle
 
@@ -290,6 +322,7 @@ async def process_event(
         if note_id is not None:
             _, retraction = neodb.translate(
                 did=did,
+                unlisted=_unlisted(did),
                 handle=handle,
                 collection=collection,
                 rkey=rkey,
@@ -374,6 +407,7 @@ async def process_event(
             # destination's existing holder absorbs the contribution below.
             _, retraction = neodb.translate(
                 did=did,
+                unlisted=_unlisted(did),
                 handle=handle,
                 collection=collection,
                 rkey=rkey,
@@ -429,6 +463,7 @@ async def process_event(
 
     note, activity = neodb.translate(
         did=did,
+        unlisted=_unlisted(did),
         handle=handle,
         collection=collection,
         rkey=rkey,
@@ -565,6 +600,7 @@ def _derive_pair(*, did: str, work_key: str, handle: str, trigger_uri: str) -> D
 
     note, activity = neodb.translate(
         did=did,
+        unlisted=_unlisted(did),
         handle=handle,
         collection=collection,
         rkey=anchor.rkey,
@@ -709,6 +745,40 @@ async def _process_profile(
     return Processed(at_uri, operation, _PROFILE_COLLECTION, activity, delivered)
 
 
+async def _process_visibility(
+    *,
+    at_uri: str,
+    did: str,
+    operation: str,
+    record: dict[str, Any],
+    seq: int | None,
+    worker: DeliveryWorker | None,
+) -> Processed | None:
+    """Apply an ``app.bsky.actor.contentVisibilityDeclaration`` commit.
+
+    The flag rides onto the fediverse as ``discoverable: false`` on the bridged
+    ``Person``, so a change is published the same way a renamed handle is: an
+    ``Update(Person)`` direct to that author's own followers.
+
+    Deleting the record and setting the field to false are the same statement —
+    the lexicon requires a missing record to read as false — so both paths land
+    on ``hide=False`` rather than being treated as "no opinion".
+    """
+    if _visibility_seen(did, seq):
+        return None
+
+    hide = False if operation == "delete" else bool(record.get(identity.HIDE_FIELD))
+    row = identity.set_hide_from_recommendations(did, hide)
+    _mark_visibility_seq(did, seq)
+    if row is None:
+        # Not a DID we bridge, or the value did not move. Either way there is
+        # nothing to tell anyone about.
+        return None
+
+    activity, delivered = await _deliver_person_update(row, seq=seq, worker=worker)
+    return Processed(at_uri, operation, _VISIBILITY_COLLECTION, activity, delivered)
+
+
 async def _deliver_person_update(
     row: BridgedActor, *, seq: int | None, worker: DeliveryWorker | None
 ) -> tuple[dict[str, Any], int]:
@@ -721,7 +791,11 @@ async def _deliver_person_update(
     actor_id = settings.actor_id(row.handle)
     update_id = seq or int(datetime.now(UTC).timestamp() * 1_000_000)
     activity = {
-        "@context": [actors.AS_CONTEXT, actors.SECURITY_CONTEXT],
+        # The toot prefix belongs on the ACTIVITY, not just on the Person it
+        # carries: a receiver compacting an inbound activity uses the outer
+        # context, so without it the embedded actor's `toot:discoverable`
+        # compacts to a full-IRI key and the preference is read as unset.
+        "@context": [actors.AS_CONTEXT, actors.SECURITY_CONTEXT, actors.TOOT_TERMS],
         "id": f"{actor_id}#updates/{update_id}",
         "type": "Update",
         "actor": actor_id,
@@ -759,6 +833,33 @@ def _mark_profile_seq(did: str, seq: int | None) -> None:
         actor = session.get(BridgedActor, did)
         if actor is not None:
             actor.last_profile_seq = max(actor.last_profile_seq or 0, seq)
+
+
+def _visibility_seen(did: str, seq: int | None) -> bool:
+    """Has this contentVisibilityDeclaration commit already been applied?
+
+    Its own mark rather than ``last_profile_seq``: the two records change
+    independently, and sharing one high-water mark would let whichever moved
+    last suppress the other.
+    """
+    if seq is None:
+        return False
+    with session_scope() as session:
+        actor = session.get(BridgedActor, did)
+        return (
+            actor is not None
+            and actor.last_visibility_seq is not None
+            and (seq <= actor.last_visibility_seq)
+        )
+
+
+def _mark_visibility_seq(did: str, seq: int | None) -> None:
+    if seq is None:
+        return
+    with session_scope() as session:
+        actor = session.get(BridgedActor, did)
+        if actor is not None:
+            actor.last_visibility_seq = max(actor.last_visibility_seq or 0, seq)
 
 
 def _is_gated(did: str) -> bool:
@@ -892,6 +993,7 @@ async def _process_delete(
         # until its own next event re-publishes it under its own rkey.
         _, activity = neodb.translate(
             did=did,
+            unlisted=_unlisted(did),
             handle=handle,
             collection=collection,
             rkey=rkey,

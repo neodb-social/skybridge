@@ -107,6 +107,8 @@ async def purge_did(did: str, *, worker: DeliveryWorker | None = None, mark_opt_
 
         actor = session.get(BridgedActor, did)
         handle = actor.handle if actor is not None else did
+        # Retractions are addressed the same way the posts they retract were.
+        unlisted = actor is not None and bool(actor.no_unauthenticated)
         if actor is not None and mark_opt_out:
             actor.opted_out = True
             actor.opted_out_at = utcnow()
@@ -132,6 +134,7 @@ async def purge_did(did: str, *, worker: DeliveryWorker | None = None, mark_opt_
                 operation="delete",
                 event_time=None,
                 prior_object_id=settings.post_id(handle, row.rkey),
+                unlisted=unlisted,
             )
             row.ap_activity_json = json.dumps(activity)
             pending.append((row.at_uri, activity))

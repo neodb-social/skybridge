@@ -236,6 +236,24 @@ def _related(note: dict, kind: str, work_url: str, extra: dict | None = None) ->
     return obj
 
 
+def _addressing(actor: str, *, unlisted: bool) -> tuple[list[str], list[str]]:
+    """``(to, cc)`` for a bridged post. Public unless ``unlisted``.
+
+    Unlisted is the AP spelling of Mastodon's "unlisted" visibility: the
+    author's followers are the primary audience and ``as:Public`` appears only
+    in ``cc``. Receiving servers still accept and file the post — takahe reads
+    ``cc``-public as unlisted, and neodb-relay redistributes on either field —
+    but Mastodon-family peers keep it out of the public, local, federated and
+    hashtag timelines, and out of trends.
+
+    Used for an author carrying Bluesky's ``!no-unauthenticated`` label. It
+    reduces reach; it is not a privacy boundary, because ActivityPub has no
+    way to say "signed-in readers only" while staying publicly federated.
+    """
+    followers = f"{actor}/followers"
+    return ([followers], [PUBLIC]) if unlisted else ([PUBLIC], [followers])
+
+
 def build_note(
     *,
     did: str,
@@ -248,6 +266,7 @@ def build_note(
     shelf_status: str | None = None,
     operation: str = "create",
     object_id: str | None = None,
+    unlisted: bool = False,
 ) -> dict:
     """Build the AP ``Note`` for a popfeed record, including ``relatedWith``.
 
@@ -258,19 +277,22 @@ def build_note(
     ``object_id`` pins the Note to the id peers already hold. Without it an
     update re-mints the id from the *current* handle, so a rename would
     orphan the published Note and update an id nobody ever received.
+
+    ``unlisted`` drops the post out of the public timelines; see _addressing.
     """
     settings = get_settings()
     actor = settings.actor_id(handle)
     object_id = object_id or settings.post_id(handle, rkey)
     published = _published(record, event_time)
+    to, cc = _addressing(actor, unlisted=unlisted)
 
     note: dict[str, Any] = {
         "id": object_id,
         "type": "Note",
         "attributedTo": actor,
         "published": published,
-        "to": [PUBLIC],
-        "cc": [f"{actor}/followers"],
+        "to": to,
+        "cc": cc,
         "url": object_id,
         "tag": [],
         "relatedWith": [],
@@ -589,7 +611,14 @@ def _populate_list_item(note: dict, record: dict, ref: works.WorkRef | None) -> 
         # without AP emission (Collections aren't bridged yet), so no facet.
 
 
-def wrap_activity(note: dict, *, handle: str, op: str, prior_object_id: str | None = None) -> dict:
+def wrap_activity(
+    note: dict,
+    *,
+    handle: str,
+    op: str,
+    prior_object_id: str | None = None,
+    unlisted: bool = False,
+) -> dict:
     """Wrap a ``Note`` (or a tombstone, for deletes) in a C/U/D activity."""
     settings = get_settings()
     actor = settings.actor_id(handle)
@@ -617,14 +646,15 @@ def wrap_activity(note: dict, *, handle: str, op: str, prior_object_id: str | No
     else:
         activity_id = f"{object_id}#{op}"
 
+    to, cc = _addressing(actor, unlisted=unlisted)
     return {
         "@context": AP_CONTEXT,
         "id": activity_id,
         "type": activity_type,
         "actor": actor,
         "published": (note or {}).get("published") or datetime.now(UTC).isoformat(),
-        "to": [PUBLIC],
-        "cc": [f"{actor}/followers"],
+        "to": to,
+        "cc": cc,
         "object": obj,
     }
 
@@ -641,14 +671,25 @@ def translate(
     ref: works.WorkRef | None = None,
     prior_object_id: str | None = None,
     shelf_status: str | None = None,
+    unlisted: bool = False,
 ) -> tuple[dict | None, dict]:
     """Translate one record op into ``(note, activity)``.
 
     For deletes ``record`` is ``None`` and ``note`` is ``None``; the activity is
     a ``Delete`` referencing the prior object's id (a ``Tombstone``).
+
+    ``unlisted`` reflects the author's atproto visibility preference; see
+    _addressing. A ``Delete`` carries it too, so a retraction is addressed the
+    same way as the post it retracts.
     """
     if operation == "delete" or record is None:
-        activity = wrap_activity({}, handle=handle, op="delete", prior_object_id=prior_object_id)
+        activity = wrap_activity(
+            {},
+            handle=handle,
+            op="delete",
+            prior_object_id=prior_object_id,
+            unlisted=unlisted,
+        )
         return None, activity
     note = build_note(
         did=did,
@@ -661,6 +702,7 @@ def translate(
         shelf_status=shelf_status,
         operation=operation,
         object_id=prior_object_id,
+        unlisted=unlisted,
     )
-    activity = wrap_activity(note, handle=handle, op=operation)
+    activity = wrap_activity(note, handle=handle, op=operation, unlisted=unlisted)
     return note, activity

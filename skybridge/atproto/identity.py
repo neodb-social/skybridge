@@ -34,6 +34,16 @@ INVALID_HANDLE = "handle.invalid"
 _PROFILE_COLLECTION = "social.popfeed.actor.profile"
 _BSKY_PROFILE_COLLECTION = "app.bsky.actor.profile"
 
+# Bluesky's "Ask apps to hide my posts from algorithmic recommendations"
+# toggle. A public record, rkey `self`, whose only field is a boolean; the
+# lexicon requires consumers to read a MISSING record as false.
+VISIBILITY_COLLECTION = "app.bsky.actor.contentVisibilityDeclaration"
+HIDE_FIELD = "hideFromAlgorithmicRecommendations"
+
+# Bluesky's "hide my posts from logged-out users" toggle, which rides as a
+# self-label on the bsky profile record rather than as a record of its own.
+NO_UNAUTHENTICATED = "!no-unauthenticated"
+
 
 @dataclass
 class Identity:
@@ -41,6 +51,9 @@ class Identity:
     handle: str
     display_name: str | None = None
     avatar: str | None = None
+    # Visibility preferences read off the atproto account; see BridgedActor.
+    hide_from_recommendations: bool = False
+    no_unauthenticated: bool = False
 
 
 def _http_json(url: str, timeout: float = 8.0) -> dict | None:
@@ -63,6 +76,33 @@ def _profile_record(pds: str, did: str, collection: str) -> dict:
         f"{pds}/xrpc/com.atproto.repo.getRecord?repo={did}&collection={collection}&rkey=self"
     )
     return (prof or {}).get("value", {}) if isinstance(prof, dict) else {}
+
+
+def has_self_label(bsky_value: dict, label: str) -> bool:
+    """Is ``label`` among the self-labels on an ``app.bsky.actor.profile`` record?
+
+    Shape is ``labels: {$type: com.atproto.label.defs#selfLabels, values:
+    [{val: ...}]}``. Defensive throughout: an account with no labels at all is
+    the common case, and a malformed one must read as "not labelled" rather
+    than raise in the middle of identity resolution.
+    """
+    labels = bsky_value.get("labels")
+    values = labels.get("values") if isinstance(labels, dict) else None
+    if not isinstance(values, list):
+        return False
+    return any(isinstance(v, dict) and v.get("val") == label for v in values)
+
+
+def _hide_from_recommendations(pds: str, did: str) -> bool:
+    """The contentVisibilityDeclaration flag for ``did``.
+
+    An absent record reads as ``False``, which the lexicon requires:
+    "Consumers must treat a missing record as false." A fetch that failed is
+    indistinguishable here and reads as ``False`` too, which is why the
+    callers only ever *raise* the stored flag on this value — see
+    ``refresh_actor``.
+    """
+    return bool(_profile_record(pds, did, VISIBILITY_COLLECTION).get(HIDE_FIELD))
 
 
 def _avatar_url(value: dict, *, did: str, pds: str) -> str | None:
@@ -113,6 +153,12 @@ def resolve_remote(did: str) -> Identity:
     in practice the only real source of an avatar. Popfeed values win over the
     bsky fallback whenever present. Avatars are blobs served off the PDS via
     the ``com.atproto.sync.getBlob`` endpoint, not plain URLs.
+
+    The bsky profile record is now read unconditionally, because it also
+    carries the ``!no-unauthenticated`` self-label, which has to be known
+    whether or not popfeed supplied a name and avatar. In practice this costs
+    nothing: popfeed profiles carry no avatar, so the fallback already fired
+    on almost every account.
     """
     doc = _http_json(f"{PLC_DIRECTORY}/{did}")
     handle: str | None = None
@@ -124,21 +170,26 @@ def resolve_remote(did: str) -> Identity:
     pds = _pds_from_doc(doc) if doc else None
     display_name: str | None = None
     avatar: str | None = None
+    hide_from_recommendations = False
+    no_unauthenticated = False
     if pds:
         val = _profile_record(pds, did, _PROFILE_COLLECTION)
         display_name = val.get("displayName") or val.get("name") or None
         avatar = _avatar_url(val, did=did, pds=pds)
-        if not display_name or not avatar:
-            bsky_val = _profile_record(pds, did, _BSKY_PROFILE_COLLECTION)
-            if not display_name:
-                display_name = bsky_val.get("displayName") or bsky_val.get("name") or None
-            if not avatar:
-                avatar = _avatar_url(bsky_val, did=did, pds=pds)
+        bsky_val = _profile_record(pds, did, _BSKY_PROFILE_COLLECTION)
+        if not display_name:
+            display_name = bsky_val.get("displayName") or bsky_val.get("name") or None
+        if not avatar:
+            avatar = _avatar_url(bsky_val, did=did, pds=pds)
+        no_unauthenticated = has_self_label(bsky_val, NO_UNAUTHENTICATED)
+        hide_from_recommendations = _hide_from_recommendations(pds, did)
     return Identity(
         did=did,
         handle=handle or _fallback_handle(did),
         display_name=display_name,
         avatar=avatar,
+        hide_from_recommendations=hide_from_recommendations,
+        no_unauthenticated=no_unauthenticated,
     )
 
 
@@ -174,7 +225,14 @@ def ensure_actor(did: str, *, allow_network: bool = True) -> Identity:
         row = session.get(BridgedActor, did)
         if row is not None:
             row.last_seen = utcnow()
-            return Identity(row.did, row.handle, row.display_name, row.avatar)
+            return Identity(
+                row.did,
+                row.handle,
+                row.display_name,
+                row.avatar,
+                hide_from_recommendations=bool(row.hide_from_recommendations),
+                no_unauthenticated=bool(row.no_unauthenticated),
+            )
 
         ident = resolve_remote(did) if allow_network else Identity(did, _fallback_handle(did))
         private_pem, public_pem = generate_keypair()
@@ -185,6 +243,8 @@ def ensure_actor(did: str, *, allow_network: bool = True) -> Identity:
                 handle=ident.handle,
                 display_name=ident.display_name,
                 avatar=ident.avatar,
+                hide_from_recommendations=ident.hide_from_recommendations,
+                no_unauthenticated=ident.no_unauthenticated,
                 private_key_pem=private_pem,
                 public_key_pem=public_pem,
             )
@@ -219,6 +279,24 @@ def rename_actor(did: str, handle: str) -> BridgedActor | None:
         return row
 
 
+def set_hide_from_recommendations(did: str, hide: bool) -> BridgedActor | None:
+    """Apply a contentVisibilityDeclaration commit to an actor we already bridge.
+
+    Returns the updated row, or ``None`` when there is nothing to do. Like a
+    handle change, a declaration must never mint an actor — we bridge people
+    because of what they post, not because they set a preference — and a value
+    that did not move is not worth an ``Update(Person)`` to every follower.
+    """
+    with session_scope() as session:
+        row = session.get(BridgedActor, did)
+        if row is None or bool(row.hide_from_recommendations) == hide:
+            return None
+        row.hide_from_recommendations = hide
+        row.last_seen = utcnow()
+        log.info("actor %s hide_from_recommendations -> %s", did, hide)
+        return row
+
+
 def did_for_ident(session: Session, ident: str) -> str | None:
     """Resolve a route identifier to a DID: DID, live handle, then retired handle.
 
@@ -246,6 +324,11 @@ def refresh_actor(
     the popfeed value (already in hand from the firehose event) wins, falling
     back to the ``app.bsky.actor.profile`` record on the same PDS when either
     field is still missing, network permitting.
+
+    Also the point at which ``!no-unauthenticated`` is re-read: that label
+    lives on the bsky profile record, and we deliberately do not tail
+    ``app.bsky.actor.profile`` on Jetstream (see config.WANTED_COLLECTIONS),
+    so a toggle lands here rather than the moment it is made.
     """
     with session_scope() as session:
         row = session.get(BridgedActor, did)
@@ -257,13 +340,30 @@ def refresh_actor(
         pds = resolve_pds(did) if allow_network else None
         if pds:
             avatar = _avatar_url(popfeed_value, did=did, pds=pds)
-
-        if pds and (not display_name or not avatar):
+            # Unconditional now, unlike the name/avatar fallback it also
+            # serves: the self-label has to be read even when popfeed already
+            # supplied both fields.
             bsky_val = _profile_record(pds, did, _BSKY_PROFILE_COLLECTION)
             if not display_name:
                 display_name = bsky_val.get("displayName") or bsky_val.get("name") or None
             if not avatar:
                 avatar = _avatar_url(bsky_val, did=did, pds=pds)
+            # Visibility preferences are only ever RAISED here, never cleared,
+            # for the same reason the avatar is never cleared below: a failed
+            # fetch and a preference the user turned off both arrive as an
+            # empty record, and the two must not be confused when one of them
+            # means "keep publishing this person more widely again".
+            #
+            # Clearing has an exact signal of its own and does not need this
+            # path: hide_from_recommendations is cleared by the declaration's
+            # own Jetstream commit (pipeline._process_visibility, where a
+            # delete and a false both mean false), and no_unauthenticated by a
+            # bsky profile record that came back and no longer carries the
+            # label.
+            if bsky_val:
+                row.no_unauthenticated = has_self_label(bsky_val, NO_UNAUTHENTICATED)
+            if _hide_from_recommendations(pds, did):
+                row.hide_from_recommendations = True
 
         if pds:
             # Both popfeed and the bsky fallback were consulted and neither

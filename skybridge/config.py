@@ -53,6 +53,12 @@ WANTED_COLLECTIONS: tuple[str, ...] = (
     # (comments, like popfeed reactions) and buzz.bookhive.hiveBook /
     # buzz.bookhive.catalogBook (the app's catalog, not user activity).
     "buzz.bookhive.book",
+    # Bluesky's "hide my posts from algorithmic recommendations" declaration
+    # (rkey `self`). Carried onto the bridged Person as `discoverable: false`.
+    # Watched network-wide, unlike app.bsky.actor.profile above, because it is
+    # a rare low-volume record rather than every profile edit on atproto —
+    # and, like a profile edit, it only ever updates an actor we already have.
+    "app.bsky.actor.contentVisibilityDeclaration",
 )
 
 # Default public Jetstream endpoint; only the collections above are requested.

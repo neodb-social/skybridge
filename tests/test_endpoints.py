@@ -82,7 +82,14 @@ def test_person_actor_document(client, settings):
     assert doc["preferredUsername"] == handle
     assert "publicKey" in doc
     assert doc["alsoKnownAs"] == [f"at://{did}", f"https://bsky.app/profile/{did}"]
-    assert {"alsoKnownAs": {"@id": "as:alsoKnownAs", "@type": "@id"}} in doc["@context"]
+    assert {
+        "alsoKnownAs": {"@id": "as:alsoKnownAs", "@type": "@id"},
+        "toot": "http://joinmastodon.org/ns#",
+    } in doc["@context"]
+    # No visibility preference set: say nothing rather than volunteer a
+    # permissive `discoverable: true` nobody asked for.
+    assert "discoverable" not in doc
+    assert "toot:discoverable" not in doc
     assert 'rel="me"' in doc["attachment"][0]["value"]
     assert 'rel="me"' in doc["summary"]
 

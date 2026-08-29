@@ -218,6 +218,7 @@ async def get_user(ident: str, request: Request) -> Response:
                 "did": actor.did,
                 "avatar": actor.avatar,
                 "post_count": post_count or 0,
+                "no_unauthenticated": bool(actor.no_unauthenticated),
             }
     if doc is None or profile is None:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -344,6 +345,18 @@ def _post_page_ctx(obj: dict[str, Any], ident: str) -> dict[str, Any]:
     }
 
 
+def _hides_from_anonymous(ident: str) -> bool:
+    """Does this author carry Bluesky's ``!no-unauthenticated`` label?
+
+    These pages have no sign-in, so "hidden from logged-out readers" can only
+    mean hidden from everyone here. It gates the HTML views alone — the AP
+    representation is unchanged, because a peer that already follows the
+    author is exactly the audience the label still allows.
+    """
+    actor = identity.actor_by_ident(ident)
+    return actor is not None and bool(actor.no_unauthenticated)
+
+
 @app.get("/users/{ident}/posts/{rkey}")
 async def get_post(ident: str, rkey: str, request: Request) -> Response:
     obj = objects.get_post_object(ident, rkey)
@@ -357,7 +370,9 @@ async def get_post(ident: str, rkey: str, request: Request) -> Response:
         return ap_response(obj, status=status)
     if obj.get("type") == "Tombstone":
         return HTMLResponse("<h1>410</h1><p>This post was deleted.</p>", status_code=410)
-    return _TEMPLATES.TemplateResponse(request, "post.html", _post_page_ctx(obj, ident))
+    ctx = _post_page_ctx(obj, ident)
+    ctx["no_unauthenticated"] = _hides_from_anonymous(ident)
+    return _TEMPLATES.TemplateResponse(request, "post.html", ctx)
 
 
 @app.get("/objects/{ident}/{rkey}")
@@ -731,10 +746,25 @@ async def dashboard(request: Request) -> Response:
     )
 
 
+def _anonymous_hidden_dids() -> Any:
+    """Subquery of the DIDs whose records these pages must not show.
+
+    The archive views render the raw source record, so an author carrying
+    ``!no-unauthenticated`` has to be filtered out of them as well as out of
+    the profile and post pages. The author's own view of their archive is on
+    the opt-out page, which is behind an atproto sign-in.
+    """
+    return select(BridgedActor.did).where(BridgedActor.no_unauthenticated.is_(True))
+
+
 @app.get("/archive", response_class=HTMLResponse)
 async def archive(request: Request, q: str = "") -> Response:
     with session_scope() as session:
-        stmt = select(Record).order_by(Record.updated_at.desc())
+        stmt = (
+            select(Record)
+            .where(Record.did.not_in(_anonymous_hidden_dids()))
+            .order_by(Record.updated_at.desc())
+        )
         if q:
             like = f"%{q}%"
             stmt = stmt.where(
@@ -773,6 +803,11 @@ async def archive_detail(request: Request, at_uri: str) -> Response:
     with session_scope() as session:
         record = session.get(Record, at_uri)
         if record is None:
+            return HTMLResponse("<h1>404</h1><p>No such record.</p>", status_code=404)
+        author = session.get(BridgedActor, record.did)
+        if author is not None and author.no_unauthenticated:
+            # Same answer as a record we do not hold: this page shows the raw
+            # source record, and there is no signed-in reader to show it to.
             return HTMLResponse("<h1>404</h1><p>No such record.</p>", status_code=404)
         handle = _handle_of(record.did)
         work = None
