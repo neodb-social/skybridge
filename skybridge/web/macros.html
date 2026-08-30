@@ -24,6 +24,9 @@
       {% else %}
       {{ r.title or r.rkey }}
       {% endif %}
+      {# Shown wherever a rating is aggregated, so the catalog item's
+         schema.org aggregateRating describes what the page displays. #}
+      {% if r.rating %}<span class="pill">{{ r.rating }}</span>{% endif %}
     </td>
     {% if show_raw %}
     <td><a href="/archive/{{ r.did }}/{{ r.collection }}/{{ r.rkey | urlencode }}">record</a></td>

@@ -228,7 +228,11 @@ async def get_user(ident: str, request: Request) -> Response:
         return ap_response(doc)
     # An author hiding from signed-out readers gets the identity-only page:
     # don't list their posts on it (see _hides_from_anonymous).
-    posts = [] if profile["no_unauthenticated"] else _recent_post_rows(Record.did == profile["did"])
+    posts = (
+        []
+        if profile["no_unauthenticated"]
+        else _record_rows(_recent_posts(Record.did == profile["did"]))
+    )
     return _TEMPLATES.TemplateResponse(
         request,
         "profile.html",
@@ -340,29 +344,63 @@ def _facets(obj: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return out
 
 
-def _review_schema(
-    obj: dict[str, Any],
-    ctx: dict[str, Any],
-    facets: dict[str, dict[str, Any]],
-) -> dict[str, Any] | None:
-    """A schema.org ``Review`` for the post, or ``None`` when it carries neither
-    a rating nor review text.
+def _rating_value(facet: dict[str, Any] | None) -> float | None:
+    """The numeric score of a ``Rating`` facet, if it holds one.
 
-    The same facts the AP ``Note`` states in NeoDB's vocabulary, restated in the
-    one search engines and unfurlers read.
+    Stored Notes are re-read years after they were written, so the shape is
+    checked rather than trusted (a bool is an int in Python, and is not a score).
     """
-    rating = facets.get("Rating")
-    comment = facets.get("Comment")
+    value = facet.get("value") if facet else None
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _review_doc(note: dict[str, Any], handle: str) -> dict[str, Any] | None:
+    """A schema.org ``Review`` for a bridged Note, or ``None`` when the Note
+    states neither a rating nor review text.
+
+    The same facts the ``Note`` carries in NeoDB's vocabulary, restated in the
+    one search engines and unfurlers read. ``itemReviewed`` is left to the
+    caller: a post page names the work, an item page nests the review inside it.
+    """
+    facets = _facets(note)
+    rating, comment = facets.get("Rating"), facets.get("Comment")
     if rating is None and comment is None:
         return None
+    published = note.get("published") or ""
     doc: dict[str, Any] = {
-        "@context": "https://schema.org",
         "@type": "Review",
-        "url": ctx["url"],
-        "datePublished": ctx["published"],
-        "dateModified": ctx["updated"] or ctx["published"],
-        "author": {"@type": "Person", "name": ctx["handle"], "url": ctx["author_url"]},
+        "url": note.get("id"),
+        "datePublished": published,
+        "dateModified": note.get("updated") or published,
+        "author": {"@type": "Person", "name": handle, "url": get_settings().actor_id(handle)},
     }
+    value = _rating_value(rating)
+    if rating is not None and value is not None:
+        doc["reviewRating"] = {
+            "@type": "Rating",
+            "ratingValue": value,
+            # Every facet the translator writes carries both bounds; the
+            # defaults only cover a Note stored malformed.
+            "bestRating": rating.get("best", 10),
+            "worstRating": rating.get("worst", 1),
+        }
+    # Spoiler-marked text stays behind the page's disclosure control, so it is
+    # not restated in the machine-readable copy.
+    if comment is not None and not note.get("sensitive"):
+        body = _plain_text(str(comment.get("content") or ""))
+        if body:
+            doc["reviewBody"] = body
+    return doc
+
+
+def _review_schema(obj: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any] | None:
+    """The post page's standalone ``Review``: :func:`_review_doc`, plus the work
+    it is about and its own JSON-LD context."""
+    doc = _review_doc(obj, ctx["handle"])
+    if doc is None:
+        return None
     work = ctx["work"]
     if work is not None and work.get("name"):
         item: dict[str, Any] = {
@@ -374,21 +412,61 @@ def _review_schema(
         if work.get("image"):
             item["image"] = work["image"]
         doc["itemReviewed"] = item
-    value = rating.get("value") if rating else None
-    if isinstance(value, int | float) and not isinstance(value, bool):
-        doc["reviewRating"] = {
-            "@type": "Rating",
-            "ratingValue": value,
-            "bestRating": rating.get("best", 10) if rating else 10,
-            "worstRating": rating.get("worst", 1) if rating else 1,
+    return {"@context": "https://schema.org", **doc}
+
+
+def _work_schema(
+    doc: dict[str, Any], records: list[Record], handles: dict[str, str]
+) -> dict[str, Any]:
+    """schema.org description of a catalog item and the marks bridged for it.
+
+    The AP catalog object at the same URL says this in NeoDB's vocabulary, which
+    only NeoDB peers read. Only the posts the page itself lists are described,
+    and each rating it aggregates is shown in that listing.
+    """
+    item: dict[str, Any] = {
+        "@context": "https://schema.org",
+        "@type": works.schema_type_for_ap_type(doc.get("type")),
+        "@id": doc["id"],
+        "url": doc["id"],
+        "name": doc["name"],
+    }
+    if doc.get("cover_image_url"):
+        item["image"] = doc["cover_image_url"]
+    # The identifier URLs that let a NeoDB peer merge this work also tell a
+    # search engine which known thing it is.
+    same_as = [e["url"] for e in doc.get("external_resources") or [] if e.get("url")]
+    if same_as:
+        item["sameAs"] = same_as
+    if doc.get("isbn"):
+        item["isbn"] = doc["isbn"]
+
+    reviews: list[dict[str, Any]] = []
+    scores: list[float] = []
+    best, worst = 10, 1
+    for record in records:
+        note = json.loads(record.ap_object_json or "{}")
+        review = _review_doc(note, handles.get(record.did, record.did))
+        if review is None:
+            continue
+        reviews.append(review)
+        if (given := review.get("reviewRating")) is not None:
+            scores.append(given["ratingValue"])
+            best, worst = given["bestRating"], given["worstRating"]
+    if scores:
+        mean = round(sum(scores) / len(scores), 1)
+        item["aggregateRating"] = {
+            "@type": "AggregateRating",
+            # A whole number stays whole: "8" reads better than "8.0", and
+            # nothing downstream distinguishes them.
+            "ratingValue": int(mean) if mean == int(mean) else mean,
+            "ratingCount": len(scores),
+            "bestRating": best,
+            "worstRating": worst,
         }
-    # Spoiler-marked text stays behind the page's disclosure control, so it is
-    # not restated in the machine-readable copy.
-    if comment is not None and not ctx["sensitive"]:
-        body = _plain_text(str(comment.get("content") or ""))
-        if body:
-            doc["reviewBody"] = body
-    return doc
+    if reviews:
+        item["review"] = reviews
+    return item
 
 
 def _post_page_ctx(obj: dict[str, Any], ident: str, at_uri: str) -> dict[str, Any]:
@@ -433,7 +511,7 @@ def _post_page_ctx(obj: dict[str, Any], ident: str, at_uri: str) -> dict[str, An
         "description": description,
         "settings": get_settings(),
     }
-    ctx["schema"] = _review_schema(obj, ctx, _facets(obj))
+    ctx["schema"] = _review_schema(obj, ctx)
     return ctx
 
 
@@ -482,8 +560,8 @@ async def get_catalog(work_type: str, work_id: str, request: Request) -> Respons
         return ap_response(doc)
     identifiers = [(k, doc[key]) for k, key in (("IMDb", "imdb"), ("ISBN", "isbn")) if doc.get(key)]
     # This page is public, so authors hiding from signed-out readers stay out
-    # of the listing just as they do on /archive.
-    posts = _recent_post_rows(
+    # of the listing — and so out of the schema.org aggregate built from it.
+    records = _recent_posts(
         Record.work_key == f"{work_type}:{work_id}",
         Record.did.not_in(_anonymous_hidden_dids()),
     )
@@ -498,7 +576,8 @@ async def get_catalog(work_type: str, work_id: str, request: Request) -> Respons
             "links": [e["url"] for e in doc.get("external_resources", [])],
             "identifiers": identifiers,
             "peers": neodb_servers.peer_links(doc["id"]),
-            "posts": posts,
+            "posts": _record_rows(records),
+            "schema": _work_schema(doc, records, _handles_for(records)),
             "settings": get_settings(),
         },
     )
@@ -828,19 +907,30 @@ def _work_name(obj: dict[str, Any]) -> str | None:
     return None
 
 
-def _record_rows(rows: list[Record]) -> list[dict[str, Any]]:
-    handles = {}
+def _handles_for(rows: list[Record]) -> dict[str, str]:
+    """did -> live handle, for the authors of ``rows``."""
+    handles: dict[str, str] = {}
     with session_scope() as session:
         for did in {r.did for r in rows}:
-            row = session.get(BridgedActor, did)
-            handles[did] = row.handle if row else did
+            actor = session.get(BridgedActor, did)
+            handles[did] = actor.handle if actor else did
+    return handles
+
+
+def _record_rows(rows: list[Record]) -> list[dict[str, Any]]:
+    handles = _handles_for(rows)
     out = []
     for r in rows:
         title = None
         post_url = None
+        rating = None
         if r.ap_object_json:
             obj = json.loads(r.ap_object_json)
             title = obj.get("name") or _work_name(obj)
+            facet = _facets(obj).get("Rating")
+            score = _rating_value(facet)
+            if facet is not None and score is not None:
+                rating = f"{score:g}/{facet.get('best', 10):g}"
             # Link to the id peers hold rather than one rebuilt from the
             # author's current handle: post ids outlive a rename. Archive-only
             # rows have no post page and a deleted one only tombstones, so
@@ -858,6 +948,7 @@ def _record_rows(rows: list[Record]) -> list[dict[str, Any]]:
                 "handle": handles.get(r.did, r.did),
                 "title": title,
                 "post_url": post_url,
+                "rating": rating,
             }
         )
     return out
@@ -867,7 +958,7 @@ def _record_rows(rows: list[Record]) -> list[dict[str, Any]]:
 RECENT_POSTS = 100
 
 
-def _recent_post_rows(*where: Any) -> list[dict[str, Any]]:
+def _recent_posts(*where: Any) -> list[Record]:
     """The most recently bridged live posts matching ``where``, newest first.
 
     Restricted to records that were actually published to AP and are not
@@ -876,7 +967,7 @@ def _recent_post_rows(*where: Any) -> list[dict[str, Any]]:
     the same posts.
     """
     with session_scope() as session:
-        rows = list(
+        return list(
             session.scalars(
                 select(Record)
                 .where(
@@ -888,7 +979,6 @@ def _recent_post_rows(*where: Any) -> list[dict[str, Any]]:
                 .limit(RECENT_POSTS)
             )
         )
-    return _record_rows(rows)
 
 
 @app.get("/", response_class=HTMLResponse)

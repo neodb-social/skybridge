@@ -636,6 +636,61 @@ def test_schema_org_withholds_a_spoiler_review_body(client):
     assert doc["reviewRating"]["ratingValue"] == 10
 
 
+def test_catalog_item_embeds_schema_org(client, settings):
+    page = client.get("/catalog/movie/imdbId-tt6710474").text
+    doc = _schema_of(page)
+    assert doc["@context"] == "https://schema.org"
+    # NeoDB's catalog type ("Movie") maps onto schema.org's.
+    assert doc["@type"] == "Movie"
+    assert doc["@id"] == settings.catalog_id("movie", "imdbId-tt6710474")
+    assert doc["url"] == doc["@id"]
+    assert doc["name"] == "Everything Everywhere All at Once"
+    assert doc["image"].startswith("https://")
+    # The same identifier URLs a NeoDB peer merges on tell a search engine
+    # which known thing this is.
+    assert "https://www.imdb.com/title/tt6710474" in doc["sameAs"]
+    assert "https://www.themoviedb.org/movie/545611" in doc["sameAs"]
+
+
+def test_catalog_item_aggregates_the_ratings_it_lists(client):
+    _handle, _at_uri, _rkey, post_url = _the_review()
+    page = client.get("/catalog/movie/imdbId-tt6710474").text
+    doc = _schema_of(page)
+    assert doc["aggregateRating"] == {
+        "@type": "AggregateRating",
+        "ratingValue": 10,
+        "ratingCount": 1,
+        "bestRating": 10,
+        "worstRating": 1,
+    }
+    # Every aggregated rating is shown on the page it describes.
+    assert '<span class="pill">10/10</span>' in page
+    (review,) = doc["review"]
+    assert review["url"] == post_url
+    assert review["reviewBody"] == "even better on second thought"
+    # Nested in the item it is about, so it does not repeat itemReviewed.
+    assert "itemReviewed" not in review
+
+
+def test_catalog_item_without_ratings_has_no_aggregate(client):
+    """An item nobody rated is still describable; there is just nothing to
+    aggregate."""
+    _handle, at_uri, _rkey, _post_url = _the_review()
+    _patch_note(at_uri, relatedWith=[{"type": "Status", "status": "complete"}])
+    doc = _schema_of(client.get("/catalog/movie/imdbId-tt6710474").text)
+    assert doc["@type"] == "Movie"
+    assert "aggregateRating" not in doc
+    assert "review" not in doc
+
+
+def test_catalog_item_withholds_a_spoiler_review_body(client):
+    _handle, at_uri, _rkey, _post_url = _the_review()
+    _patch_note(at_uri, sensitive=True, summary="Spoilers: a movie")
+    (review,) = _schema_of(client.get("/catalog/movie/imdbId-tt6710474").text)["review"]
+    assert "reviewBody" not in review
+    assert review["reviewRating"]["ratingValue"] == 10
+
+
 def test_schema_org_cannot_break_out_of_the_script_element(client):
     handle, at_uri, rkey, _post_url = _the_review()
     _patch_note(

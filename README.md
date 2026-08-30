@@ -397,10 +397,16 @@ Each of these URLs serves ActivityPub to a peer (`Accept: application/activity+j
 and HTML to a browser. The HTML views cross-link: the profile and catalog item
 pages list the 100 most recently bridged posts, `/archive` links each published
 row to its post page, and a post page names both its ActivityPub id and the
-`at://` record behind it. A post carrying a rating or review text also embeds a
-schema.org `Review` as JSON-LD — the same facts the `Note` states in NeoDB's
-vocabulary, restated in the one search engines and unfurlers read. Spoiler-marked
-review text is left out of it, as it is out of the link-preview tags.
+`at://` record behind it.
+
+The HTML also carries schema.org JSON-LD, saying what the ActivityPub document
+at the same URL says in NeoDB's vocabulary, in the one search engines and
+unfurlers read. A post carrying a rating or review text embeds a `Review`; a
+catalog item embeds the work itself (`Movie` / `Book` / `VideoGame` / …, with
+its identifier URLs as `sameAs`), plus an `aggregateRating` and the individual
+reviews built from the marks it lists — every rating counted is shown on the
+page. Spoiler-marked review text is left out of both, as it is out of the
+link-preview tags.
 - Manage (self-service opt-out / import): `GET /manage` (sign-in form; the
   account view once signed in),
   `POST /manage` (starts the sign-in), `GET /oauth/client-metadata.json`,

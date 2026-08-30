@@ -408,15 +408,22 @@ def test_the_profile_post_list_goes_with_the_content(client, settings):
 
 
 def test_catalog_item_listing_drops_a_labelled_author(client, settings):
-    """The catalog page is public, so a hidden author's marks stay off it."""
+    """The catalog page is public, so a hidden author's marks stay off it —
+    out of the listing, and so out of the schema.org aggregate built from it."""
     _handle, did, at_uri = _bridged_row()
     item = "/catalog/movie/imdbId-tt6710474"
     rkey = at_uri.rsplit("/", 1)[-1]
-    assert f"/posts/{rkey}" in client.get(item).text
+    before = client.get(item).text
+    assert f"/posts/{rkey}" in before
+    assert "aggregateRating" in before
 
     _label(did)
 
-    assert f"/posts/{rkey}" not in client.get(item).text
+    after = client.get(item).text
+    assert f"/posts/{rkey}" not in after
+    assert "aggregateRating" not in after
+    # The item itself is still described.
+    assert '"@type": "Movie"' in after
 
 
 def test_the_post_page_withholds_the_source_record(client, settings):

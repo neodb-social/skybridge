@@ -12,6 +12,10 @@
 <meta name="twitter:card" content="summary" />
 <meta name="twitter:image" content="{{ poster }}" />
 {% endif %}
+{# The item, and the marks bridged for it, in the vocabulary search engines
+   read — the AP object at this URL says the same in NeoDB's. tojson escapes
+   the HTML specials, so it cannot break out of the script element. #}
+<script type="application/ld+json">{{ schema | tojson }}</script>
 {% endblock %}
 {% block content %}
 <div class="hero">
