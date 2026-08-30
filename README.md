@@ -120,9 +120,11 @@ be, and no further:
 - Our own web pages carry `noindex, nofollow`, drop their link-preview tags
   and their schema.org JSON-LD, and show identity only — no post list on the
   profile, no source record on the post page. `/archive`, its detail pages and
-  the catalog item pages hide the author's records entirely. The AP
-  representation at the same URLs is untouched — a peer that follows the
-  author is exactly the audience the label still allows.
+  the catalog item listings hide the author's records entirely. The one thing
+  that still counts them is a catalog item's rating average, which names and
+  quotes nobody (see Endpoints). The AP representation at the same URLs is
+  untouched — a peer that follows the author is exactly the audience the label
+  still allows.
 - Posts are addressed unlisted (`to: [followers]`, `cc: [as:Public]`), which
   keeps them out of the public, local, federated and hashtag timelines and out
   of trends. Delivery is unaffected: neodb-relay redistributes on `to` *or*
@@ -403,10 +405,16 @@ The HTML also carries schema.org JSON-LD, saying what the ActivityPub document
 at the same URL says in NeoDB's vocabulary, in the one search engines and
 unfurlers read. A post carrying a rating or review text embeds a `Review`; a
 catalog item embeds the work itself (`Movie` / `Book` / `VideoGame` / …, with
-its identifier URLs as `sameAs`), plus an `aggregateRating` and the individual
-reviews built from the marks it lists — every rating counted is shown on the
-page. Spoiler-marked review text is left out of both, as it is out of the
-link-preview tags.
+its identifier URLs as `sameAs`), plus the reviews it lists and an
+`aggregateRating`, which is also shown on the page. Spoiler-marked review text
+is left out of both, as it is out of the link-preview tags.
+
+The average counts **every** rating bridged for the item, including from
+authors carrying `!no-unauthenticated`, whose posts are not listed on the page
+and whose reviews are not embedded. The label hides an author's posts, not the
+existence of a score: an average names nobody and quotes nobody. A retracted
+record does drop out of it — an opt-out tombstones the data rather than hiding
+it.
 - Manage (self-service opt-out / import): `GET /manage` (sign-in form; the
   account view once signed in),
   `POST /manage` (starts the sign-in), `GET /oauth/client-metadata.json`,

@@ -652,7 +652,7 @@ def test_catalog_item_embeds_schema_org(client, settings):
     assert "https://www.themoviedb.org/movie/545611" in doc["sameAs"]
 
 
-def test_catalog_item_aggregates_the_ratings_it_lists(client):
+def test_catalog_item_aggregates_its_ratings(client):
     _handle, _at_uri, _rkey, post_url = _the_review()
     page = client.get("/catalog/movie/imdbId-tt6710474").text
     doc = _schema_of(page)
@@ -663,8 +663,9 @@ def test_catalog_item_aggregates_the_ratings_it_lists(client):
         "bestRating": 10,
         "worstRating": 1,
     }
-    # Every aggregated rating is shown on the page it describes.
-    assert '<span class="pill">10/10</span>' in page
+    # The page shows the average it marks up, and the rating behind it.
+    assert "10/10" in page
+    assert "1 bridged rating" in page
     (review,) = doc["review"]
     assert review["url"] == post_url
     assert review["reviewBody"] == "even better on second thought"

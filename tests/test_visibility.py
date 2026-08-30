@@ -12,6 +12,7 @@ Two toggles, read off the atproto account and never set on this side:
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from fastapi.testclient import TestClient
@@ -341,6 +342,12 @@ def _bridged_row() -> tuple[str, str, str]:
         return actor.handle, actor.did, record.at_uri
 
 
+def _ld_json(page: str) -> str:
+    marker = '<script type="application/ld+json">'
+    assert marker in page
+    return page.split(marker, 1)[1].split("</script>", 1)[0]
+
+
 def _label(did: str) -> None:
     with session_scope() as session:
         row = session.get(BridgedActor, did)
@@ -408,22 +415,35 @@ def test_the_profile_post_list_goes_with_the_content(client, settings):
 
 
 def test_catalog_item_listing_drops_a_labelled_author(client, settings):
-    """The catalog page is public, so a hidden author's marks stay off it —
-    out of the listing, and so out of the schema.org aggregate built from it."""
+    """The catalog page is public, so a hidden author's marks stay off it."""
     _handle, did, at_uri = _bridged_row()
     item = "/catalog/movie/imdbId-tt6710474"
     rkey = at_uri.rsplit("/", 1)[-1]
-    before = client.get(item).text
-    assert f"/posts/{rkey}" in before
-    assert "aggregateRating" in before
+    assert f"/posts/{rkey}" in client.get(item).text
 
     _label(did)
 
     after = client.get(item).text
     assert f"/posts/{rkey}" not in after
-    assert "aggregateRating" not in after
-    # The item itself is still described.
-    assert '"@type": "Movie"' in after
+    # Their review is not restated either: it names them and quotes them.
+    assert "even better on second thought" not in after
+    assert '"@type": "Movie"' in after  # the item itself is still described
+
+
+def test_a_labelled_author_still_counts_toward_the_rating(client, settings):
+    """The label hides an author's posts, not the existence of their score. An
+    average attributes nothing to anyone, so every rating counts."""
+    _handle, did, _at_uri = _bridged_row()
+    item = "/catalog/movie/imdbId-tt6710474"
+    before = json.loads(_ld_json(client.get(item).text))["aggregateRating"]
+
+    _label(did)
+
+    after = json.loads(_ld_json(client.get(item).text))["aggregateRating"]
+    assert after == before
+    assert after["ratingCount"] == 1
+    # ...and the page shows the average it marks up.
+    assert "1 bridged rating" in client.get(item).text
 
 
 def test_the_post_page_withholds_the_source_record(client, settings):

@@ -415,14 +415,53 @@ def _review_schema(obj: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any] |
     return {"@context": "https://schema.org", **doc}
 
 
+def _aggregate_rating(work_key: str) -> dict[str, Any] | None:
+    """The mean of every rating bridged for a work, or ``None`` if it has none.
+
+    Deliberately unfiltered and uncapped, unlike the listing beside it: an
+    average is a statistic over all the ratings, and it attributes no score to
+    anyone, so an author hiding their posts from signed-out readers is still
+    counted here. Only a retracted record drops out — an opt-out tombstones the
+    data rather than hiding it.
+    """
+    with session_scope() as session:
+        notes = session.scalars(
+            select(Record.ap_object_json).where(
+                Record.work_key == work_key,
+                Record.deleted_at.is_(None),
+                Record.ap_object_json.isnot(None),
+            )
+        )
+        facets = [_facets(json.loads(note)).get("Rating") for note in notes if note]
+    scored = [(facet, _rating_value(facet)) for facet in facets if facet is not None]
+    scores = [value for _facet, value in scored if value is not None]
+    if not scores:
+        return None
+    mean = round(sum(scores) / len(scores), 1)
+    first = scored[0][0]
+    return {
+        "@type": "AggregateRating",
+        # A whole number stays whole: "8" reads better than "8.0", and nothing
+        # downstream distinguishes them.
+        "ratingValue": int(mean) if mean == int(mean) else mean,
+        "ratingCount": len(scores),
+        "bestRating": first.get("best", 10),
+        "worstRating": first.get("worst", 1),
+    }
+
+
 def _work_schema(
-    doc: dict[str, Any], records: list[Record], handles: dict[str, str]
+    doc: dict[str, Any],
+    records: list[Record],
+    handles: dict[str, str],
+    aggregate: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """schema.org description of a catalog item and the marks bridged for it.
 
     The AP catalog object at the same URL says this in NeoDB's vocabulary, which
-    only NeoDB peers read. Only the posts the page itself lists are described,
-    and each rating it aggregates is shown in that listing.
+    only NeoDB peers read. The nested reviews are the posts the page itself
+    lists; ``aggregate`` counts every rating (see :func:`_aggregate_rating`) and
+    is shown on the page in its own right.
     """
     item: dict[str, Any] = {
         "@context": "https://schema.org",
@@ -440,30 +479,15 @@ def _work_schema(
         item["sameAs"] = same_as
     if doc.get("isbn"):
         item["isbn"] = doc["isbn"]
+    if aggregate is not None:
+        item["aggregateRating"] = aggregate
 
-    reviews: list[dict[str, Any]] = []
-    scores: list[float] = []
-    best, worst = 10, 1
+    reviews = []
     for record in records:
         note = json.loads(record.ap_object_json or "{}")
         review = _review_doc(note, handles.get(record.did, record.did))
-        if review is None:
-            continue
-        reviews.append(review)
-        if (given := review.get("reviewRating")) is not None:
-            scores.append(given["ratingValue"])
-            best, worst = given["bestRating"], given["worstRating"]
-    if scores:
-        mean = round(sum(scores) / len(scores), 1)
-        item["aggregateRating"] = {
-            "@type": "AggregateRating",
-            # A whole number stays whole: "8" reads better than "8.0", and
-            # nothing downstream distinguishes them.
-            "ratingValue": int(mean) if mean == int(mean) else mean,
-            "ratingCount": len(scores),
-            "bestRating": best,
-            "worstRating": worst,
-        }
+        if review is not None:
+            reviews.append(review)
     if reviews:
         item["review"] = reviews
     return item
@@ -559,12 +583,15 @@ async def get_catalog(work_type: str, work_id: str, request: Request) -> Respons
     if _wants_ap(request):
         return ap_response(doc)
     identifiers = [(k, doc[key]) for k, key in (("IMDb", "imdb"), ("ISBN", "isbn")) if doc.get(key)]
+    work_key = f"{work_type}:{work_id}"
     # This page is public, so authors hiding from signed-out readers stay out
-    # of the listing — and so out of the schema.org aggregate built from it.
+    # of the listing. The rating average counts them all the same: see
+    # _aggregate_rating.
     records = _recent_posts(
-        Record.work_key == f"{work_type}:{work_id}",
+        Record.work_key == work_key,
         Record.did.not_in(_anonymous_hidden_dids()),
     )
+    aggregate = _aggregate_rating(work_key)
     return _TEMPLATES.TemplateResponse(
         request,
         "work.html",
@@ -577,7 +604,10 @@ async def get_catalog(work_type: str, work_id: str, request: Request) -> Respons
             "identifiers": identifiers,
             "peers": neodb_servers.peer_links(doc["id"]),
             "posts": _record_rows(records),
-            "schema": _work_schema(doc, records, _handles_for(records)),
+            # The template reads the JSON-LD object itself, so what the page
+            # shows and what it marks up cannot drift apart.
+            "rating": aggregate,
+            "schema": _work_schema(doc, records, _handles_for(records), aggregate),
             "settings": get_settings(),
         },
     )

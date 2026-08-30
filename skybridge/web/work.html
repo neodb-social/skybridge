@@ -26,7 +26,17 @@
   {% endif %}
   <div>
     <h2>{{ title }}</h2>
-    <p><span class="pill">{{ category }}</span></p>
+    <p>
+      <span class="pill">{{ category }}</span>
+      {# Every bridged rating, including from authors whose posts are not
+         listed below: an average attributes no score to anyone. #}
+      {% if rating %}
+      <strong>{{ rating.ratingValue }}/{{ rating.bestRating }}</strong>
+      <span class="muted">
+        from {{ rating.ratingCount }} bridged rating{{ "" if rating.ratingCount == 1 else "s" }}
+      </span>
+      {% endif %}
+    </p>
     {% if identifiers %}
     <p class="muted">
       {% for name, value in identifiers %}{{ name }}: <code>{{ value }}</code>{% if not loop.last %} · {% endif %}{% endfor %}
