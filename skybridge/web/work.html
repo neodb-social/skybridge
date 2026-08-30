@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "macros.html" import record_table %}
 {% block title %}{{ title }} · Skybridge{% endblock %}
 {% block head %}
 <meta property="og:type" content="website" />
@@ -44,4 +45,9 @@
     {% endif %}
   </div>
 </div>
+{% if posts %}
+<h3>Recent posts</h3>
+<p class="muted">{{ posts | length }} most recent bridged post(s) about this item (up to 100).</p>
+{{ record_table(posts, show_author=True) }}
+{% endif %}
 {% endblock %}

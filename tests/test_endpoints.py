@@ -299,7 +299,7 @@ def test_archive_detail_resolves_every_link_shape(client):
         rec = session.scalar(select(Record))
         assert rec is not None
         at_uri, did, collection, rkey = rec.at_uri, rec.did, rec.collection, rec.rkey
-    # The link the archive/optout tables mint: plain path segments, so no
+    # The link the archive/manage tables mint: plain path segments, so no
     # proxy that normalises paths can collapse an "at://" into "at:/".
     paths = [f"/archive/{did}/{collection}/{rkey}"]
     # Links minted before that, and the collapsed form a normalising proxy
@@ -495,3 +495,156 @@ def test_archive_only_list_records_not_published(client, settings):
     assert outbox["type"] == "OrderedCollection"
     assert settings.post_id(handle, rkey) not in outbox["orderedItems"]
     assert outbox["totalItems"] > 0
+
+
+# --------------------------------------------------------------------------- #
+# Post pages: listings that link to them, and what one shows
+# --------------------------------------------------------------------------- #
+def _the_review() -> tuple[str, str, str, str]:
+    """(handle, at_uri, rkey, post_url) of the fixture's published review."""
+    with session_scope() as session:
+        record = session.scalar(
+            select(Record).where(Record.collection == "social.popfeed.feed.review")
+        )
+        assert record is not None and record.ap_object_json is not None
+        actor = session.get(BridgedActor, record.did)
+        assert actor is not None
+        post_url = json.loads(record.ap_object_json)["id"]
+        return actor.handle, record.at_uri, record.rkey, post_url
+
+
+def _patch_note(at_uri: str, **changes) -> None:
+    """Rewrite fields on a stored Note, to reach a shape the fixture lacks."""
+    with session_scope() as session:
+        record = session.get(Record, at_uri)
+        assert record is not None and record.ap_object_json is not None
+        note = json.loads(record.ap_object_json)
+        note.update(changes)
+        record.ap_object_json = json.dumps(note)
+
+
+def test_archive_rows_link_to_the_post_page(client):
+    _handle, _at_uri, _rkey, post_url = _the_review()
+    page = client.get("/archive").text
+    # The published review is reachable as a post...
+    assert f'<a href="{post_url}">' in page
+    # ...and every row still offers the raw record.
+    assert "/archive/did:plc:" in page
+
+
+def test_archive_rows_for_unpublished_records_have_no_post_link(client):
+    """An archive-only record has no post page, so its row must not claim one."""
+    with session_scope() as session:
+        record = session.scalar(select(Record).where(Record.ap_object_json.is_(None)))
+        assert record is not None
+        rkey, did, collection = record.rkey, record.did, record.collection
+    page = client.get("/archive").text
+    assert f"/archive/{did}/{collection}/{rkey}" in page
+    assert f"/posts/{rkey}" not in page
+
+
+def test_profile_lists_recent_posts(client):
+    handle, _at_uri, _rkey, post_url = _the_review()
+    page = client.get(f"/users/{handle}").text
+    assert "Recent posts" in page
+    assert f'<a href="{post_url}">' in page
+    # Titled by the work it marks: marks and reviews are untitled Notes.
+    assert "Everything Everywhere All at Once" in page
+
+
+def test_catalog_item_lists_recent_posts(client):
+    _handle, _at_uri, _rkey, post_url = _the_review()
+    page = client.get("/catalog/movie/imdbId-tt6710474").text
+    assert "Recent posts" in page
+    assert f'<a href="{post_url}">' in page
+
+
+def test_post_page_shows_the_atproto_uri(client):
+    handle, at_uri, rkey, _post_url = _the_review()
+    page = client.get(f"/users/{handle}/posts/{rkey}").text
+    assert at_uri.startswith("at://")
+    assert f"<code>{at_uri}</code>" in page
+
+
+def test_post_page_shows_published_and_last_modified(client):
+    handle, at_uri, rkey, _post_url = _the_review()
+    _patch_note(
+        at_uri,
+        published="2026-07-03T17:16:24.038Z",
+        updated="2026-08-01T09:30:00+00:00",
+    )
+    page = client.get(f"/users/{handle}/posts/{rkey}").text
+    assert '<time datetime="2026-07-03T17:16:24.038Z">2026-07-03 17:16 UTC</time>' in page
+    assert "last modified" in page
+    assert '<time datetime="2026-08-01T09:30:00+00:00">2026-08-01 09:30 UTC</time>' in page
+
+
+def test_a_post_never_edited_is_last_modified_when_published(client):
+    handle, at_uri, rkey, _post_url = _the_review()
+    _patch_note(at_uri, published="2026-07-03T17:16:24.038Z", updated=None)
+    page = client.get(f"/users/{handle}/posts/{rkey}").text
+    assert page.count('<time datetime="2026-07-03T17:16:24.038Z">2026-07-03 17:16 UTC</time>') == 2
+
+
+def _schema_of(page: str) -> dict:
+    marker = '<script type="application/ld+json">'
+    assert marker in page
+    body = page.split(marker, 1)[1].split("</script>", 1)[0]
+    return json.loads(body)
+
+
+def test_post_page_embeds_a_schema_org_review(client, settings):
+    handle, _at_uri, rkey, post_url = _the_review()
+    doc = _schema_of(client.get(f"/users/{handle}/posts/{rkey}").text)
+    assert doc["@context"] == "https://schema.org"
+    assert doc["@type"] == "Review"
+    assert doc["url"] == post_url
+    assert doc["author"] == {
+        "@type": "Person",
+        "name": handle,
+        "url": settings.actor_id(handle),
+    }
+    # The rating rides in schema.org's own vocabulary, not NeoDB's.
+    assert doc["reviewRating"] == {
+        "@type": "Rating",
+        "ratingValue": 10,
+        "bestRating": 10,
+        "worstRating": 1,
+    }
+    assert doc["reviewBody"] == "even better on second thought"
+    # NeoDB's catalog type maps onto schema.org's.
+    assert doc["itemReviewed"]["@type"] == "Movie"
+    assert doc["itemReviewed"]["name"] == "Everything Everywhere All at Once"
+    assert doc["itemReviewed"]["url"] == settings.catalog_id("movie", "imdbId-tt6710474")
+
+
+def test_no_schema_org_without_a_rating_or_review(client):
+    """A bare shelf mark states no opinion; there is no Review to publish."""
+    handle, at_uri, rkey, _post_url = _the_review()
+    _patch_note(at_uri, relatedWith=[{"type": "Status", "status": "complete"}])
+    page = client.get(f"/users/{handle}/posts/{rkey}").text
+    assert '<script type="application/ld+json">' not in page
+
+
+def test_schema_org_withholds_a_spoiler_review_body(client):
+    """Spoiler text stays behind the page's disclosure control, so the
+    machine-readable copy does not restate it."""
+    handle, at_uri, rkey, _post_url = _the_review()
+    _patch_note(at_uri, sensitive=True, summary="Spoilers: a movie")
+    doc = _schema_of(client.get(f"/users/{handle}/posts/{rkey}").text)
+    assert "reviewBody" not in doc
+    assert doc["reviewRating"]["ratingValue"] == 10
+
+
+def test_schema_org_cannot_break_out_of_the_script_element(client):
+    handle, at_uri, rkey, _post_url = _the_review()
+    _patch_note(
+        at_uri,
+        relatedWith=[
+            {"type": "Comment", "content": "<p>pwned</p></script><script>alert(1)</script>"}
+        ],
+    )
+    page = client.get(f"/users/{handle}/posts/{rkey}").text
+    assert "</script><script>alert(1)" not in page
+    # Still a single well-formed JSON-LD block.
+    assert _schema_of(page)["@type"] == "Review"

@@ -18,9 +18,9 @@ DID = "did:plc:i6k6scfcdaup4e2va33nkprb"  # the fixture author
 OTHER_DID = "did:plc:someoneelse00000000000"
 
 ADMIN_ROUTES = (
-    "/optout/admin/import",
-    "/optout/admin/import/dry-run",
-    "/optout/admin/import/cancel",
+    "/manage/admin/import",
+    "/manage/admin/import/dry-run",
+    "/manage/admin/import/cancel",
 )
 
 
@@ -43,7 +43,7 @@ def client(settings: Settings, fixture_path, monkeypatch) -> TestClient:
 
 def _sign_in(client: TestClient) -> str:
     client.get("/oauth/callback", params={"state": "s", "code": "c"}, follow_redirects=False)
-    page = client.get("/optout")
+    page = client.get("/manage")
     match = re.search(r'name="csrf" value="([^"]+)"', page.text)
     assert match
     return match.group(1)
@@ -64,13 +64,13 @@ def _set_admins(settings: Settings, *entries: str, warm: bool = True) -> None:
 
 def test_no_admins_configured_means_no_admin_view(client, settings):
     _sign_in(client)
-    assert "Operator" not in client.get("/optout").text
+    assert "Operator" not in client.get("/manage").text
 
 
 def test_did_entry_grants_access(client, settings):
     _set_admins(settings, DID)
     _sign_in(client)
-    page = client.get("/optout").text
+    page = client.get("/manage").text
     assert "Operator" in page
     assert "Start import" in page
 
@@ -81,9 +81,9 @@ def test_handle_entries_need_a_refresh_before_they_grant_access(client, settings
     monkeypatch.setattr(admin.auth, "_resolve_identity", lambda ident: (DID, "https://pds.test"))
     _set_admins(settings, "operator.example.com", warm=False)
     _sign_in(client)
-    assert "Operator" not in client.get("/optout").text
+    assert "Operator" not in client.get("/manage").text
     asyncio.run(admin.refresh())
-    assert "Operator" in client.get("/optout").text
+    assert "Operator" in client.get("/manage").text
 
 
 def test_handle_entry_is_resolved_to_a_did(client, settings, monkeypatch):
@@ -92,7 +92,7 @@ def test_handle_entry_is_resolved_to_a_did(client, settings, monkeypatch):
     monkeypatch.setattr(admin.auth, "_resolve_identity", lambda ident: (DID, "https://pds.test"))
     _set_admins(settings, "operator.example.com")
     _sign_in(client)
-    assert "Operator" in client.get("/optout").text
+    assert "Operator" in client.get("/manage").text
 
 
 def test_a_handle_resolving_elsewhere_grants_nothing(client, settings, monkeypatch):
@@ -101,7 +101,7 @@ def test_a_handle_resolving_elsewhere_grants_nothing(client, settings, monkeypat
     monkeypatch.setattr(admin.auth, "_resolve_identity", lambda ident: (OTHER_DID, "https://x"))
     _set_admins(settings, "operator.example.com")
     _sign_in(client)
-    assert "Operator" not in client.get("/optout").text
+    assert "Operator" not in client.get("/manage").text
 
 
 def test_typed_handle_cannot_stand_in_for_the_verified_did(client, settings, monkeypatch):
@@ -116,7 +116,7 @@ def test_typed_handle_cannot_stand_in_for_the_verified_did(client, settings, mon
     monkeypatch.setattr(admin.auth, "is_valid_identifier", lambda ident: True)
     monkeypatch.setattr(admin.auth, "_resolve_identity", lambda ident: (DID, "https://pds.test"))
     _sign_in(client)
-    assert "Operator" not in client.get("/optout").text
+    assert "Operator" not in client.get("/manage").text
 
 
 def test_unresolvable_admin_entry_grants_nothing(client, settings, monkeypatch):
@@ -124,7 +124,7 @@ def test_unresolvable_admin_entry_grants_nothing(client, settings, monkeypatch):
     monkeypatch.setattr(admin.auth, "_resolve_identity", lambda ident: (None, None))
     _set_admins(settings, "typo.example.com")
     _sign_in(client)
-    assert "Operator" not in client.get("/optout").text
+    assert "Operator" not in client.get("/manage").text
 
 
 @pytest.mark.parametrize("path", ADMIN_ROUTES)
@@ -150,7 +150,7 @@ def test_import_refuses_without_an_api_key(client, settings):
     """The live tail needs no key, but the metered HTTP archive does."""
     _set_admins(settings, DID)
     csrf = _sign_in(client)
-    page = client.post("/optout/admin/import", data={"csrf": csrf})
+    page = client.post("/manage/admin/import", data={"csrf": csrf})
     assert page.status_code == 200
     assert "SKYBRIDGE_JETSTREAM_API_KEY" in page.text
 
@@ -158,7 +158,7 @@ def test_import_refuses_without_an_api_key(client, settings):
 def test_cancel_reports_when_nothing_is_running(client, settings):
     _set_admins(settings, DID)
     csrf = _sign_in(client)
-    page = client.post("/optout/admin/import/cancel", data={"csrf": csrf})
+    page = client.post("/manage/admin/import/cancel", data={"csrf": csrf})
     assert "No archive import is running" in page.text
 
 
@@ -174,5 +174,5 @@ def test_admin_entries_are_normalized(client, settings, monkeypatch):
     monkeypatch.setattr(admin.auth, "_resolve_identity", resolve)
     _set_admins(settings, "@Operator.Example.COM")
     _sign_in(client)
-    assert "Operator" in client.get("/optout").text
+    assert "Operator" in client.get("/manage").text
     assert seen == ["operator.example.com"]

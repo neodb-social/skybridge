@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 from contextlib import asynccontextmanager, suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,7 @@ from skybridge.config import get_settings
 from skybridge.db import init_db, session_scope
 from skybridge.models import BridgedActor, Cursor, Record, Work
 from skybridge.stats import collect_stats
+from skybridge.translate import works
 
 log = logging.getLogger("skybridge")
 
@@ -224,10 +226,13 @@ async def get_user(ident: str, request: Request) -> Response:
         return JSONResponse({"error": "not found"}, status_code=404)
     if _wants_ap(request):
         return ap_response(doc)
+    # An author hiding from signed-out readers gets the identity-only page:
+    # don't list their posts on it (see _hides_from_anonymous).
+    posts = [] if profile["no_unauthenticated"] else _recent_post_rows(Record.did == profile["did"])
     return _TEMPLATES.TemplateResponse(
         request,
         "profile.html",
-        {**profile, "actor_id": doc["id"], "settings": get_settings()},
+        {**profile, "posts": posts, "actor_id": doc["id"], "settings": get_settings()},
     )
 
 
@@ -306,7 +311,87 @@ async def user_outbox(ident: str) -> Response:
 _UNSAFE_HREF = re.compile(r'\bhref="(?!https?://)[^"]*"')
 
 
-def _post_page_ctx(obj: dict[str, Any], ident: str) -> dict[str, Any]:
+def _plain_text(fragment: str) -> str:
+    """Collapse a generated HTML fragment to a single line of plain text."""
+    return " ".join(re.sub(r"<[^>]+>", " ", fragment).split())
+
+
+def _display_time(iso: str) -> str:
+    """An ISO-8601 timestamp as ``YYYY-MM-DD HH:MM UTC``.
+
+    Falls back to the raw leading date: ``published`` comes from the author's
+    own record, so it is not guaranteed to parse.
+    """
+    try:
+        stamp = datetime.fromisoformat(iso)
+    except ValueError:
+        return iso[:10]
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=UTC)
+    return stamp.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _facets(obj: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """The Note's NeoDB ``relatedWith`` facets, keyed by type (first wins)."""
+    out: dict[str, dict[str, Any]] = {}
+    for facet in obj.get("relatedWith") or []:
+        if isinstance(facet, dict) and isinstance(facet.get("type"), str):
+            out.setdefault(facet["type"], facet)
+    return out
+
+
+def _review_schema(
+    obj: dict[str, Any],
+    ctx: dict[str, Any],
+    facets: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """A schema.org ``Review`` for the post, or ``None`` when it carries neither
+    a rating nor review text.
+
+    The same facts the AP ``Note`` states in NeoDB's vocabulary, restated in the
+    one search engines and unfurlers read.
+    """
+    rating = facets.get("Rating")
+    comment = facets.get("Comment")
+    if rating is None and comment is None:
+        return None
+    doc: dict[str, Any] = {
+        "@context": "https://schema.org",
+        "@type": "Review",
+        "url": ctx["url"],
+        "datePublished": ctx["published"],
+        "dateModified": ctx["updated"] or ctx["published"],
+        "author": {"@type": "Person", "name": ctx["handle"], "url": ctx["author_url"]},
+    }
+    work = ctx["work"]
+    if work is not None and work.get("name"):
+        item: dict[str, Any] = {
+            "@type": works.schema_type_for_ap_type(work.get("type")),
+            "name": work["name"],
+        }
+        if work.get("href"):
+            item["url"] = work["href"]
+        if work.get("image"):
+            item["image"] = work["image"]
+        doc["itemReviewed"] = item
+    value = rating.get("value") if rating else None
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        doc["reviewRating"] = {
+            "@type": "Rating",
+            "ratingValue": value,
+            "bestRating": rating.get("best", 10) if rating else 10,
+            "worstRating": rating.get("worst", 1) if rating else 1,
+        }
+    # Spoiler-marked text stays behind the page's disclosure control, so it is
+    # not restated in the machine-readable copy.
+    if comment is not None and not ctx["sensitive"]:
+        body = _plain_text(str(comment.get("content") or ""))
+        if body:
+            doc["reviewBody"] = body
+    return doc
+
+
+def _post_page_ctx(obj: dict[str, Any], ident: str, at_uri: str) -> dict[str, Any]:
     """Template context for the human-readable view of a Note."""
     handle = _handle_of(ident) if ident.startswith("did:") else ident
     work: dict[str, Any] | None = None
@@ -325,9 +410,10 @@ def _post_page_ctx(obj: dict[str, Any], ident: str) -> dict[str, Any]:
     if obj.get("sensitive"):
         description = obj.get("summary") or "Sensitive content"
     else:
-        text = re.sub(r"<[^>]+>", " ", content)
-        description = " ".join(text.split())[:200]
-    return {
+        description = _plain_text(content)[:200]
+    published = obj.get("published") or ""
+    updated = obj.get("updated")
+    ctx = {
         "og_title": obj.get("name") or f"Post by @{handle}",
         "title": obj.get("name"),
         "handle": handle,
@@ -335,14 +421,20 @@ def _post_page_ctx(obj: dict[str, Any], ident: str) -> dict[str, Any]:
         "content": content,
         "sensitive": bool(obj.get("sensitive")),
         "summary": obj.get("summary"),
-        "published": obj.get("published") or "",
-        "updated": obj.get("updated"),
+        "published": published,
+        "updated": updated,
+        # A post that was never edited was last modified when it was published.
+        "published_display": _display_time(published) if published else "",
+        "modified_display": _display_time(updated or published) if published else "",
         "hashtags": hashtags,
         "work": work,
         "url": obj["id"],
+        "at_uri": at_uri,
         "description": description,
         "settings": get_settings(),
     }
+    ctx["schema"] = _review_schema(obj, ctx, _facets(obj))
+    return ctx
 
 
 def _hides_from_anonymous(ident: str) -> bool:
@@ -359,18 +451,19 @@ def _hides_from_anonymous(ident: str) -> bool:
 
 @app.get("/users/{ident}/posts/{rkey}")
 async def get_post(ident: str, rkey: str, request: Request) -> Response:
-    obj = objects.get_post_object(ident, rkey)
+    view = objects.get_post_view(ident, rkey)
     wants_ap = _wants_ap(request)
-    if obj is None:
+    if view is None:
         if wants_ap:
             return JSONResponse({"error": "not found"}, status_code=404)
         return HTMLResponse("<h1>404</h1><p>No such post.</p>", status_code=404)
+    obj = view.document
     if wants_ap:
         status = 410 if obj.get("type") == "Tombstone" else 200
         return ap_response(obj, status=status)
     if obj.get("type") == "Tombstone":
         return HTMLResponse("<h1>410</h1><p>This post was deleted.</p>", status_code=410)
-    ctx = _post_page_ctx(obj, ident)
+    ctx = _post_page_ctx(obj, ident, view.at_uri)
     ctx["no_unauthenticated"] = _hides_from_anonymous(ident)
     return _TEMPLATES.TemplateResponse(request, "post.html", ctx)
 
@@ -388,6 +481,12 @@ async def get_catalog(work_type: str, work_id: str, request: Request) -> Respons
     if _wants_ap(request):
         return ap_response(doc)
     identifiers = [(k, doc[key]) for k, key in (("IMDb", "imdb"), ("ISBN", "isbn")) if doc.get(key)]
+    # This page is public, so authors hiding from signed-out readers stay out
+    # of the listing just as they do on /archive.
+    posts = _recent_post_rows(
+        Record.work_key == f"{work_type}:{work_id}",
+        Record.did.not_in(_anonymous_hidden_dids()),
+    )
     return _TEMPLATES.TemplateResponse(
         request,
         "work.html",
@@ -399,6 +498,7 @@ async def get_catalog(work_type: str, work_id: str, request: Request) -> Respons
             "links": [e["url"] for e in doc.get("external_resources", [])],
             "identifiers": identifiers,
             "peers": neodb_servers.peer_links(doc["id"]),
+            "posts": posts,
             "settings": get_settings(),
         },
     )
@@ -467,7 +567,7 @@ def _optout_page(
     is_admin = session is not None and admin.is_admin(session.did)
     return _TEMPLATES.TemplateResponse(
         request,
-        "optout.html",
+        "manage.html",
         {
             "message": message,
             "q": q,
@@ -486,7 +586,7 @@ def _current_session(request: Request) -> sessions.Session | None:
     return sessions.get(request.cookies.get(sessions.COOKIE_NAME))
 
 
-@app.get("/optout", response_class=HTMLResponse)
+@app.get("/manage", response_class=HTMLResponse)
 async def optout_form(request: Request) -> Response:
     # Status is only shown to the signed-in account holder: an open lookup
     # would let anyone enumerate what we hold about a user.
@@ -501,7 +601,7 @@ def _optout_error(
     return JSONResponse({"ok": False, "error": code}, status_code=status)
 
 
-@app.post("/optout")
+@app.post("/manage")
 async def optout_submit(request: Request, identifier: str = Form(...)) -> Response:
     """Start the atproto OAuth sign-in that gates the self-service actions.
 
@@ -536,7 +636,7 @@ def _action_session(request: Request, csrf: str) -> sessions.Session | None:
 _SESSION_EXPIRED = "Your sign-in has expired — please sign in again."
 
 
-@app.post("/optout/opt-out", response_class=HTMLResponse)
+@app.post("/manage/opt-out", response_class=HTMLResponse)
 async def optout_action_opt_out(request: Request, csrf: str = Form("")) -> Response:
     session = _action_session(request, csrf)
     if session is None:
@@ -546,7 +646,7 @@ async def optout_action_opt_out(request: Request, csrf: str = Form("")) -> Respo
     return _optout_page(request, session=session, message=msg)
 
 
-@app.post("/optout/opt-in", response_class=HTMLResponse)
+@app.post("/manage/opt-in", response_class=HTMLResponse)
 async def optout_action_opt_in(request: Request, csrf: str = Form("")) -> Response:
     session = _action_session(request, csrf)
     if session is None:
@@ -560,7 +660,7 @@ async def optout_action_opt_in(request: Request, csrf: str = Form("")) -> Respon
     return _optout_page(request, session=session, message=msg)
 
 
-@app.post("/optout/import", response_class=HTMLResponse)
+@app.post("/manage/import", response_class=HTMLResponse)
 async def optout_action_import(request: Request, csrf: str = Form("")) -> Response:
     """Kick off a background import of the account's recent activity."""
     session = _action_session(request, csrf)
@@ -592,7 +692,7 @@ def _admin_session(request: Request, csrf: str) -> sessions.Session | None:
 _NOT_ADMIN = "That account is not an operator of this relay."
 
 
-@app.post("/optout/admin/import/dry-run", response_class=HTMLResponse)
+@app.post("/manage/admin/import/dry-run", response_class=HTMLResponse)
 async def admin_import_dry_run(
     request: Request, csrf: str = Form(""), after_seq: int = Form(0)
 ) -> Response:
@@ -611,7 +711,7 @@ async def admin_import_dry_run(
     return _optout_page(request, session=session, message=msg, estimate=estimate)
 
 
-@app.post("/optout/admin/import", response_class=HTMLResponse)
+@app.post("/manage/admin/import", response_class=HTMLResponse)
 async def admin_import_start(
     request: Request, csrf: str = Form(""), after_seq: int = Form(0)
 ) -> Response:
@@ -631,7 +731,7 @@ async def admin_import_start(
     return _optout_page(request, session=session, message=msg)
 
 
-@app.post("/optout/admin/import/cancel", response_class=HTMLResponse)
+@app.post("/manage/admin/import/cancel", response_class=HTMLResponse)
 async def admin_import_cancel(request: Request, csrf: str = Form("")) -> Response:
     session = _admin_session(request, csrf)
     if session is None:
@@ -652,10 +752,10 @@ def _session_cookie_attrs() -> dict[str, Any]:
     }
 
 
-@app.post("/optout/signout")
+@app.post("/manage/signout")
 async def optout_signout(request: Request) -> Response:
     sessions.drop(request.cookies.get(sessions.COOKIE_NAME))
-    resp = RedirectResponse("/optout", status_code=303)
+    resp = RedirectResponse("/manage", status_code=303)
     resp.delete_cookie(sessions.COOKIE_NAME, **_session_cookie_attrs())
     return resp
 
@@ -698,7 +798,7 @@ async def oauth_callback(
         await pipeline.deliver_person_update(
             refreshed, seq=None, worker=getattr(app.state, "worker", None)
         )
-    resp = RedirectResponse("/optout", status_code=303)
+    resp = RedirectResponse("/manage", status_code=303)
     resp.set_cookie(
         sessions.COOKIE_NAME,
         token,
@@ -716,6 +816,18 @@ async def stats_json() -> Response:
     return JSONResponse(collect_stats())
 
 
+def _work_name(obj: dict[str, Any]) -> str | None:
+    """The catalog item a Note marks, from its work tag.
+
+    Marks and reviews are untitled Notes (see translate.neodb), so the work is
+    the only human-readable name a listing can show for them.
+    """
+    for tag in obj.get("tag") or []:
+        if isinstance(tag, dict) and tag.get("href") and tag.get("name"):
+            return str(tag["name"])
+    return None
+
+
 def _record_rows(rows: list[Record]) -> list[dict[str, Any]]:
     handles = {}
     with session_scope() as session:
@@ -725,8 +837,16 @@ def _record_rows(rows: list[Record]) -> list[dict[str, Any]]:
     out = []
     for r in rows:
         title = None
+        post_url = None
         if r.ap_object_json:
-            title = json.loads(r.ap_object_json).get("name")
+            obj = json.loads(r.ap_object_json)
+            title = obj.get("name") or _work_name(obj)
+            # Link to the id peers hold rather than one rebuilt from the
+            # author's current handle: post ids outlive a rename. Archive-only
+            # rows have no post page and a deleted one only tombstones, so
+            # both keep the archived-record link instead.
+            if r.deleted_at is None:
+                post_url = obj.get("id")
         out.append(
             {
                 "at_uri": r.at_uri,
@@ -737,9 +857,38 @@ def _record_rows(rows: list[Record]) -> list[dict[str, Any]]:
                 "updated_at": r.updated_at,
                 "handle": handles.get(r.did, r.did),
                 "title": title,
+                "post_url": post_url,
             }
         )
     return out
+
+
+# How many posts the profile and catalog-item pages list.
+RECENT_POSTS = 100
+
+
+def _recent_post_rows(*where: Any) -> list[dict[str, Any]]:
+    """The most recently bridged live posts matching ``where``, newest first.
+
+    Restricted to records that were actually published to AP and are not
+    tombstoned — the ones with a post page to link to. Ordered like
+    :func:`user_outbox`, so a profile listing agrees with the AP collection of
+    the same posts.
+    """
+    with session_scope() as session:
+        rows = list(
+            session.scalars(
+                select(Record)
+                .where(
+                    Record.deleted_at.is_(None),
+                    Record.ap_object_json.isnot(None),
+                    *where,
+                )
+                .order_by(Record.created_at.desc())
+                .limit(RECENT_POSTS)
+            )
+        )
+    return _record_rows(rows)
 
 
 @app.get("/", response_class=HTMLResponse)

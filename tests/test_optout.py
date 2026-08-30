@@ -117,8 +117,8 @@ def _sign_in(client: TestClient) -> str:
         follow_redirects=False,
     )
     assert r.status_code == 303
-    assert r.headers["location"] == "/optout"
-    page = client.get("/optout")
+    assert r.headers["location"] == "/manage"
+    page = client.get("/manage")
     assert page.status_code == 200
     return _csrf(page.text)
 
@@ -130,7 +130,7 @@ def test_optout_submit_starts_oauth_redirect(client, monkeypatch):
         lambda identifier: oauth.FlowStart("https://as.example/authorize?req=1", "st1"),
     )
     r = client.post(
-        "/optout",
+        "/manage",
         data={"identifier": "author.test"},
         headers={"accept": "text/html"},
         follow_redirects=False,
@@ -139,7 +139,7 @@ def test_optout_submit_starts_oauth_redirect(client, monkeypatch):
     assert r.headers["location"] == "https://as.example/authorize?req=1"
     # JSON callers get the URL instead of a redirect
     r = client.post(
-        "/optout",
+        "/manage",
         data={"identifier": "author.test"},
         headers={"accept": "application/json"},
     )
@@ -150,7 +150,7 @@ def test_optout_submit_starts_oauth_redirect(client, monkeypatch):
 def test_optout_submit_rejects_unresolvable_account(client, monkeypatch):
     monkeypatch.setattr(oauth, "start_flow", lambda identifier: None)
     r = client.post(
-        "/optout",
+        "/manage",
         data={"identifier": "nobody.test"},
         headers={"accept": "application/json"},
     )
@@ -162,7 +162,7 @@ def test_oauth_callback_opens_session_without_changes(client):
     before = _active_records(DID)
     assert before > 0
     _sign_in(client)
-    page = client.get("/optout")
+    page = client.get("/manage")
     assert "Signed in as" in page.text
     assert DID in page.text  # the signed-in account's status card
     assert "active record" in page.text
@@ -175,21 +175,21 @@ def test_opt_out_and_back_in_via_session(client):
     assert _active_records(DID) > 0
     csrf = _sign_in(client)
 
-    r = client.post("/optout/opt-out", data={"csrf": csrf})
+    r = client.post("/manage/opt-out", data={"csrf": csrf})
     assert r.status_code == 200
     assert "record(s) deleted" in r.text  # action message
     assert "opted out" in r.text  # status card reflects the new state
     assert _active_records(DID) == 0
     assert optout.is_opted_out(DID)
 
-    r = client.post("/optout/opt-in", data={"csrf": csrf})
+    r = client.post("/manage/opt-in", data={"csrf": csrf})
     assert r.status_code == 200
     assert "opted back in" in r.text
     assert not optout.is_opted_out(DID)
 
 
 def test_actions_require_login(client):
-    for path in ("/optout/opt-out", "/optout/opt-in"):
+    for path in ("/manage/opt-out", "/manage/opt-in"):
         r = client.post(path, data={"csrf": "whatever"})
         assert r.status_code == 401
     assert _active_records(DID) > 0  # nothing purged
@@ -198,9 +198,9 @@ def test_actions_require_login(client):
 
 def test_actions_require_csrf(client):
     _sign_in(client)
-    r = client.post("/optout/opt-out", data={"csrf": "wrong"})
+    r = client.post("/manage/opt-out", data={"csrf": "wrong"})
     assert r.status_code == 401
-    r = client.post("/optout/opt-out")  # missing entirely
+    r = client.post("/manage/opt-out")  # missing entirely
     assert r.status_code == 401
     assert _active_records(DID) > 0
     assert not optout.is_opted_out(DID)
@@ -208,11 +208,11 @@ def test_actions_require_csrf(client):
 
 def test_signout_ends_session(client):
     csrf = _sign_in(client)
-    r = client.post("/optout/signout", follow_redirects=False)
+    r = client.post("/manage/signout", follow_redirects=False)
     assert r.status_code == 303
-    page = client.get("/optout")
+    page = client.get("/manage")
     assert "Signed in as" not in page.text  # back to the sign-in form
-    r = client.post("/optout/opt-out", data={"csrf": csrf})
+    r = client.post("/manage/opt-out", data={"csrf": csrf})
     assert r.status_code == 401
     assert not optout.is_opted_out(DID)
 
@@ -221,7 +221,7 @@ def test_session_expires(client, monkeypatch):
     csrf = _sign_in(client)
     real_time = time.time
     monkeypatch.setattr(sessions.time, "time", lambda: real_time() + sessions.SESSION_TTL + 1)
-    r = client.post("/optout/opt-out", data={"csrf": csrf})
+    r = client.post("/manage/opt-out", data={"csrf": csrf})
     assert r.status_code == 401
     assert not optout.is_opted_out(DID)
 
@@ -242,12 +242,20 @@ def test_oauth_callback_denied_by_user(client):
 
 
 def test_optout_form_renders(client):
-    r = client.get("/optout")
+    r = client.get("/manage")
     assert r.status_code == 200
     assert "sign in" in r.text.lower()
     assert "app password" not in r.text.lower()
     # the signed-out page must advertise that importing exists at all
     assert "import recent activity" in r.text.lower()
+
+
+def test_the_page_moved_to_manage(client):
+    """The self-service page lives at /manage; the old paths are gone."""
+    assert client.get("/optout").status_code == 404
+    for path in ("/optout", "/optout/opt-out", "/optout/opt-in", "/optout/signout"):
+        assert client.post(path).status_code == 404, path
+    assert "/manage" in client.get("/").text  # linked from the nav
 
 
 def test_client_metadata_endpoint(client, settings):
@@ -259,7 +267,7 @@ def test_client_metadata_endpoint(client, settings):
 def test_status_not_shown_without_login(client):
     # The old unauthenticated ?q= lookup is gone: no way to enumerate what we
     # hold about an account without signing in as it.
-    r = client.get("/optout", params={"q": DID})
+    r = client.get("/manage", params={"q": DID})
     assert r.status_code == 200
     assert DID not in r.text
     assert "active record" not in r.text
@@ -271,7 +279,7 @@ def test_import_action_starts_backfill(client, monkeypatch):
         backfill, "start_import", lambda did, worker=None: calls.append(did) or True
     )
     csrf = _sign_in(client)
-    r = client.post("/optout/import", data={"csrf": csrf})
+    r = client.post("/manage/import", data={"csrf": csrf})
     assert r.status_code == 200
     assert "Importing recent activity" in r.text
     assert calls == [DID]
@@ -280,7 +288,7 @@ def test_import_action_starts_backfill(client, monkeypatch):
 def test_import_action_already_running(client, monkeypatch):
     monkeypatch.setattr(backfill, "start_import", lambda did, worker=None: False)
     csrf = _sign_in(client)
-    r = client.post("/optout/import", data={"csrf": csrf})
+    r = client.post("/manage/import", data={"csrf": csrf})
     assert r.status_code == 200
     assert "already in progress" in r.text
 
@@ -292,7 +300,7 @@ def test_import_action_refused_when_opted_out(client, monkeypatch):
     )
     csrf = _sign_in(client)
     asyncio.run(optout.opt_out(DID))
-    r = client.post("/optout/import", data={"csrf": csrf})
+    r = client.post("/manage/import", data={"csrf": csrf})
     assert r.status_code == 200
     assert "import is disabled" in r.text
     assert calls == []  # server-side guard: never even attempted
@@ -303,10 +311,10 @@ def test_import_action_requires_session_and_csrf(client, monkeypatch):
     monkeypatch.setattr(
         backfill, "start_import", lambda did, worker=None: calls.append(did) or True
     )
-    r = client.post("/optout/import", data={"csrf": "x"})  # never signed in
+    r = client.post("/manage/import", data={"csrf": "x"})  # never signed in
     assert r.status_code == 401
     _sign_in(client)
-    r = client.post("/optout/import", data={"csrf": "wrong"})  # bad CSRF echo
+    r = client.post("/manage/import", data={"csrf": "wrong"})  # bad CSRF echo
     assert r.status_code == 401
     assert calls == []
 
@@ -314,11 +322,11 @@ def test_import_action_requires_session_and_csrf(client, monkeypatch):
 def test_import_button_disabled_only_when_opted_out(client):
     # Signed-in account view for a bridged (not opted out) account: enabled.
     csrf = _sign_in(client)
-    page = client.get("/optout")
+    page = client.get("/manage")
     assert '<button type="submit">Import recent activity</button>' in page.text
     # After opting out the same view renders the button disabled.
-    client.post("/optout/opt-out", data={"csrf": csrf})
-    page = client.get("/optout")
+    client.post("/manage/opt-out", data={"csrf": csrf})
+    page = client.get("/manage")
     assert '<button type="submit" disabled>Import recent activity</button>' in page.text
 
 
@@ -330,7 +338,7 @@ def test_opted_out_actor_is_gone(client):
         assert actor is not None
         actor.handle = handle
     csrf = _sign_in(client)
-    client.post("/optout/opt-out", data={"csrf": csrf})
+    client.post("/manage/opt-out", data={"csrf": csrf})
     r = client.get(f"/users/{handle}", headers={"accept": "application/activity+json"})
     assert r.status_code == 410
     wf = client.get("/.well-known/webfinger", params={"resource": f"acct:{handle}@bridge.test"})
@@ -409,7 +417,7 @@ def test_sign_in_shows_the_preferences_it_just_read(client, monkeypatch):
     _live_account(monkeypatch, hide=True, labels=["!no-unauthenticated"])
 
     _sign_in(client)
-    page = client.get("/optout").text
+    page = client.get("/manage").text
 
     assert "hidden from recommendations" in page
     assert "hidden from signed-out readers" in page
@@ -420,7 +428,7 @@ def test_sign_in_reports_no_preferences_when_none_are_set(client, monkeypatch):
 
     _sign_in(client)
 
-    page = client.get("/optout").text
+    page = client.get("/manage").text
     assert "none set." in page
     assert "hidden from recommendations" not in page
     assert "hidden from signed-out readers" not in page

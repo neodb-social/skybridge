@@ -54,6 +54,25 @@ def ap_type_for(work_type: str) -> str | None:
     return WORK_TYPE_TO_AP_TYPE.get(work_type)
 
 
+# NeoDB catalog AP type -> schema.org type, for the machine-readable Review a
+# post page publishes. NeoDB's catalog vocabulary is its own; only Movie and
+# TVSeason happen to spell the same as schema.org's.
+AP_TYPE_TO_SCHEMA_TYPE: dict[str, str] = {
+    "Movie": "Movie",
+    "TVShow": "TVSeries",
+    "TVSeason": "TVSeason",
+    "Game": "VideoGame",
+    "Edition": "Book",
+    "Album": "MusicAlbum",
+    "Podcast": "PodcastSeries",
+}
+
+
+def schema_type_for_ap_type(ap_type: str | None) -> str:
+    """schema.org type for a work tag's AP type; ``CreativeWork`` if unknown."""
+    return AP_TYPE_TO_SCHEMA_TYPE.get(ap_type or "", "CreativeWork")
+
+
 def external_resource_urls(work_type: str, identifiers: dict) -> list[str]:
     """Canonical external-site URLs for the work's identifiers.
 

@@ -397,6 +397,40 @@ def test_the_post_object_is_unaffected(client, settings):
     assert r.json()["type"] == "Note"
 
 
+def test_the_profile_post_list_goes_with_the_content(client, settings):
+    """The gated profile shows identity only, so the post list goes too."""
+    handle, did, _ = _bridged_row()
+    assert "Recent posts" in client.get(f"/users/{handle}").text
+
+    _label(did)
+
+    assert "Recent posts" not in client.get(f"/users/{handle}").text
+
+
+def test_catalog_item_listing_drops_a_labelled_author(client, settings):
+    """The catalog page is public, so a hidden author's marks stay off it."""
+    _handle, did, at_uri = _bridged_row()
+    item = "/catalog/movie/imdbId-tt6710474"
+    rkey = at_uri.rsplit("/", 1)[-1]
+    assert f"/posts/{rkey}" in client.get(item).text
+
+    _label(did)
+
+    assert f"/posts/{rkey}" not in client.get(item).text
+
+
+def test_the_post_page_withholds_the_source_record(client, settings):
+    """The at:// URI names the author's DID and collection: identity-only means
+    it is not on the gated page either."""
+    handle, did, at_uri = _bridged_row()
+    rkey = at_uri.rsplit("/", 1)[-1]
+    assert at_uri in client.get(f"/users/{handle}/posts/{rkey}").text
+
+    _label(did)
+
+    assert at_uri not in client.get(f"/users/{handle}/posts/{rkey}").text
+
+
 def test_archive_views_drop_a_labelled_author(client, settings):
     _handle, did, at_uri = _bridged_row()
     # Listing rows link to /archive/{did}/{collection}/{rkey}, not the at:// URI.
