@@ -1,0 +1,37 @@
+{# One listing shape for every table of bridged records: /archive, a profile,
+   a catalog item and the signed-in account view on /manage.
+
+   `title` links to the post page when the record was published to AP and is
+   still live; archive-only and tombstoned rows have no post page, so they
+   carry only the raw-record link (see main._record_rows). #}
+{% macro record_table(rows, show_author=False, show_raw=False) %}
+<table>
+  <tr>
+    <th>When</th>
+    {% if show_author %}<th>Author</th>{% endif %}
+    <th>Type</th>
+    <th>Title</th>
+    {% if show_raw %}<th></th>{% endif %}
+  </tr>
+  {% for r in rows %}
+  <tr>
+    <td class="muted">{{ r.updated_at.strftime("%Y-%m-%d %H:%M") }}</td>
+    {% if show_author %}<td><a href="/users/{{ r.handle }}">{{ r.handle }}</a></td>{% endif %}
+    <td><span class="pill">{{ r.op }}</span> {{ r.collection.split(".")[-1] }}</td>
+    <td>
+      {% if r.post_url %}
+      <a href="{{ r.post_url }}">{{ r.title or r.rkey }}</a>
+      {% else %}
+      {{ r.title or r.rkey }}
+      {% endif %}
+      {# Shown wherever a rating is aggregated, so the catalog item's
+         schema.org aggregateRating describes what the page displays. #}
+      {% if r.rating %}<span class="pill">{{ r.rating }}</span>{% endif %}
+    </td>
+    {% if show_raw %}
+    <td><a href="/archive/{{ r.did }}/{{ r.collection }}/{{ r.rkey | urlencode }}">record</a></td>
+    {% endif %}
+  </tr>
+  {% endfor %}
+</table>
+{% endmacro %}

@@ -17,7 +17,7 @@ its docstring). What the v1 transport buys is the ability to point
 is a post-cutover safety net, not a permanent feature.
 
 Retiring v1 touches: the ``jetstream_is_v2`` guards (9 in this package plus one
-in ``web/optout.html``), :func:`skybridge.atproto.events._from_v1`, the dual
+in ``web/manage.html``), :func:`skybridge.atproto.events._from_v1`, the dual
 cursor read/write here, and two things easy to miss —
 ``backfill._commit_event`` still *produces* the v1 shape for the user-facing
 "Import recent activity" path, and ``fixtures/jetstream_sample.jsonl`` is

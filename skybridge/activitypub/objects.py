@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import select
@@ -29,8 +30,21 @@ def _record_for(ident: str, rkey: str) -> Record | None:
         return session.scalar(select(Record).where(Record.did == did, Record.rkey == rkey))
 
 
-def get_post_object(ident: str, rkey: str) -> dict[str, Any] | None:
-    """Return the stored ``Note`` (or a ``Tombstone`` if deleted)."""
+@dataclass(frozen=True)
+class PostView:
+    """A dereferenced post: the AP document plus the atproto URI behind it.
+
+    ``at_uri`` is not part of the ``Note`` — the translator never puts it there
+    — but the human-readable page names the source record, so it is carried
+    alongside rather than re-queried.
+    """
+
+    document: dict[str, Any]
+    at_uri: str
+
+
+def get_post_view(ident: str, rkey: str) -> PostView | None:
+    """Return the stored ``Note`` (or a ``Tombstone`` if deleted), plus its source URI."""
     record = _record_for(ident, rkey)
     if record is None:
         return None
@@ -45,19 +59,28 @@ def get_post_object(ident: str, rkey: str) -> dict[str, Any] | None:
     # happened to use: post ids outlive the handle they were minted from.
     object_id = stored.get("id") or settings.post_id(ident, rkey)
     if record.deleted_at is not None:
-        return {
-            "@context": "https://www.w3.org/ns/activitystreams",
-            "id": object_id,
-            "type": "Tombstone",
-            "formerType": "Note",
-            "deleted": record.deleted_at.isoformat() if record.deleted_at else None,
-        }
+        return PostView(
+            {
+                "@context": "https://www.w3.org/ns/activitystreams",
+                "id": object_id,
+                "type": "Tombstone",
+                "formerType": "Note",
+                "deleted": record.deleted_at.isoformat() if record.deleted_at else None,
+            },
+            record.at_uri,
+        )
     if record.ap_object_json is None:
         return None
     # Serve the full extension context so JSON-LD-strict consumers keep the
     # neodb relatedWith terms when they re-fetch the Note.
     stored.setdefault("@context", AP_CONTEXT)
-    return stored
+    return PostView(stored, record.at_uri)
+
+
+def get_post_object(ident: str, rkey: str) -> dict[str, Any] | None:
+    """Return just the stored ``Note`` / ``Tombstone`` (see :func:`get_post_view`)."""
+    view = get_post_view(ident, rkey)
+    return view.document if view is not None else None
 
 
 def get_work_object(work_type: str, work_id: str) -> dict[str, Any] | None:

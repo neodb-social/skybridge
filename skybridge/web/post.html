@@ -17,6 +17,12 @@
 <meta name="twitter:card" content="summary" />
 <meta name="twitter:image" content="{{ work.image }}" />
 {% endif %}
+{# Machine-readable copy of the rating / review the Note carries, for readers
+   that speak schema.org rather than ActivityPub. tojson escapes the HTML
+   specials, so it cannot break out of the script element. #}
+{% if schema %}
+<script type="application/ld+json">{{ schema | tojson }}</script>
+{% endif %}
 {% endif %}
 {% endblock %}
 {% block content %}
@@ -64,11 +70,20 @@
     <p>{% for t in hashtags %}<span class="pill">{{ t }}</span> {% endfor %}</p>
     {% endif %}
     <p class="muted">
-      Published {{ published[:10] }}{% if updated %} · updated {{ updated[:10] }}{% endif %}
+      Published <time datetime="{{ published }}">{{ published_display }}</time>
+      · last modified
+      <time datetime="{{ updated or published }}">{{ modified_display }}</time>
       · bridged from Atmosphere
     </p>
   </div>
 </div>
 {% endif %}
-<p class="muted">ActivityPub object: <code>{{ url }}</code></p>
+<p class="muted">
+  ActivityPub object: <code>{{ url }}</code>
+  {# The source record names the author's DID and collection; an author hiding
+     from signed-out readers gets the identity-only page, so it stays off it. #}
+  {% if not no_unauthenticated %}<br />
+  AT Protocol record: <code>{{ at_uri }}</code>
+  {% endif %}
+</p>
 {% endblock %}

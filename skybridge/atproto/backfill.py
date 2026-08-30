@@ -3,7 +3,7 @@
 Uses ``com.atproto.repo.listRecords`` against the author's PDS and feeds each
 record through the pipeline as a synthetic ``create`` commit. Two callers:
 the ``backfill`` CLI subcommand (operator seeding) and :func:`start_import`,
-behind the "Import recent activity" button on /optout (user-triggered,
+behind the "Import recent activity" button on /manage (user-triggered,
 windowed to the last ``backfill_days`` days, capped at ``backfill_limit``
 records, one run per DID at a time).
 

@@ -117,10 +117,14 @@ directories nobody asked for.
 only" while staying publicly federated, so this is honoured as far as it can
 be, and no further:
 
-- Our own web pages carry `noindex, nofollow`, drop their link-preview tags,
-  and show identity only. `/archive` and its detail pages hide the author's
-  records entirely. The AP representation at the same URLs is untouched — a
-  peer that follows the author is exactly the audience the label still allows.
+- Our own web pages carry `noindex, nofollow`, drop their link-preview tags
+  and their schema.org JSON-LD, and show identity only — no post list on the
+  profile, no source record on the post page. `/archive`, its detail pages and
+  the catalog item listings hide the author's records entirely. The one thing
+  that still counts them is a catalog item's rating average, which names and
+  quotes nobody (see Endpoints). The AP representation at the same URLs is
+  untouched — a peer that follows the author is exactly the audience the label
+  still allows.
 - Posts are addressed unlisted (`to: [followers]`, `cc: [as:Public]`), which
   keeps them out of the public, local, federated and hashtag timelines and out
   of trends. Delivery is unaffected: neodb-relay redistributes on `to` *or*
@@ -144,7 +148,7 @@ Jetstream commit (a delete and a `false` both mean false), and a profile record
 that comes back without the label.
 
 **Signing in resyncs the account.** Completing the atproto OAuth flow on
-`/optout` proves control of the DID, so the callback re-reads the whole account
+`/manage` proves control of the DID, so the callback re-reads the whole account
 from the network before showing the status page: handle, display name, avatar
 and both preferences. Anything that moved is published to the author's
 followers as an `Update(Person)`, and the status card shows which preferences
@@ -283,7 +287,7 @@ Run an estimate first, and read it carefully: the plan's `planner_entries`
 counts the planner's own work units, **not** records, and understates the
 records recovered by a wide margin. `estimated_bytes` is the number to judge.
 
-Start, watch and cancel an import from the admin panel on `/optout` (visible
+Start, watch and cancel an import from the admin panel on `/manage` (visible
 to accounts listed in `SKYBRIDGE_ADMINS` after signing in), or queue one from
 the CLI with `python -m skybridge import`.
 
@@ -299,7 +303,7 @@ the CLI with `python -m skybridge import`.
 | `SKYBRIDGE_PORT` | `8000` | Host port docker compose publishes the server on (compose-only) |
 | `SKYBRIDGE_JETSTREAM` | public Jetstream **v2** us-east | Jetstream WebSocket endpoint; a v1 endpoint still works, but import/discovery are v2-only |
 | `SKYBRIDGE_JETSTREAM_API_KEY` | unset | Jetstream v2 archive key, for importing history. Not needed for normal operation — the live socket takes no key |
-| `SKYBRIDGE_ADMINS` | unset | Comma/space-separated DIDs and/or handles that get the admin panel on `/optout`. Prefer DIDs: handles are transferable |
+| `SKYBRIDGE_ADMINS` | unset | Comma/space-separated DIDs and/or handles that get the admin panel on `/manage`. Prefer DIDs: handles are transferable |
 | `SKYBRIDGE_RELAY_KEY` | **required** | Service actor private key (PEM); alternatively place a PEM at `$SKYBRIDGE_DATA/relay_key.pem` |
 | `SKYBRIDGE_RELAYS` | unset | Comma/space-separated relay inbox URLs to publish through (Mastodon-style); empty = pure normal-server mode |
 
@@ -344,7 +348,7 @@ SKYBRIDGE_DOMAIN=bridge.example.social uv run python -m skybridge ingest
 
 # Seed from a single DID's existing popfeed records (--days N to only replay
 # recent ones, --limit to cap the fetch; default SKYBRIDGE_BACKFILL_LIMIT).
-# Signed-in users can trigger the same thing from /optout via the "Import
+# Signed-in users can trigger the same thing from /manage via the "Import
 # recent activity" button. Avoid running with --deliver while users may be
 # opting out live: opt-out can only cancel imports inside the server process.
 uv run python -m skybridge backfill did:plc:i6k6scfcdaup4e2va33nkprb
@@ -390,10 +394,32 @@ Every push to `main` runs the checks and publishes multi-arch
   `GET /catalog/{type}/{id}` (catalog work)
 - UI / stats: `GET /` (dashboard), `GET /archive`, `GET /archive/{at_uri}`
   (original record vs. translated AP side-by-side), `GET /catalog`, `GET /stats`
-- Opt-out: `GET /optout` (sign-in form; the account view once signed in),
-  `POST /optout` (starts the sign-in), `GET /oauth/client-metadata.json`,
-  `GET /oauth/callback` (opens the session), then `POST /optout/opt-out`,
-  `POST /optout/opt-in`, `POST /optout/import`, `POST /optout/signout` from
+
+Each of these URLs serves ActivityPub to a peer (`Accept: application/activity+json`)
+and HTML to a browser. The HTML views cross-link: the profile and catalog item
+pages list the 100 most recently bridged posts, `/archive` links each published
+row to its post page, and a post page names both its ActivityPub id and the
+`at://` record behind it.
+
+The HTML also carries schema.org JSON-LD, saying what the ActivityPub document
+at the same URL says in NeoDB's vocabulary, in the one search engines and
+unfurlers read. A post carrying a rating or review text embeds a `Review`; a
+catalog item embeds the work itself (`Movie` / `Book` / `VideoGame` / …, with
+its identifier URLs as `sameAs`), plus the reviews it lists and an
+`aggregateRating`, which is also shown on the page. Spoiler-marked review text
+is left out of both, as it is out of the link-preview tags.
+
+The average counts **every** rating bridged for the item, including from
+authors carrying `!no-unauthenticated`, whose posts are not listed on the page
+and whose reviews are not embedded. The label hides an author's posts, not the
+existence of a score: an average names nobody and quotes nobody. A retracted
+record does drop out of it — an opt-out tombstones the data rather than hiding
+it.
+- Manage (self-service opt-out / import): `GET /manage` (sign-in form; the
+  account view once signed in),
+  `POST /manage` (starts the sign-in), `GET /oauth/client-metadata.json`,
+  `GET /oauth/callback` (opens the session), then `POST /manage/opt-out`,
+  `POST /manage/opt-in`, `POST /manage/import`, `POST /manage/signout` from
   the account view — users prove control of their account via **AT Protocol
   OAuth** against their own authorization server (PAR + PKCE + DPoP); no
   passwords ever touch the relay, tokens are discarded right after the

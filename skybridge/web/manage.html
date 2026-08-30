@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "macros.html" import record_table %}
 {% block title %}Manage · Skybridge{% endblock %}
 {% block content %}
 <h2>Manage bridging of your AT Protocol account</h2>
@@ -56,40 +57,30 @@
   {% endif %}
   {% if status.recent %}
   <p class="muted">{{ status.recent | length }} most recent record(s) (up to 200).</p>
-  <table>
-    <tr><th>When</th><th>Type</th><th>Title</th><th></th></tr>
-    {% for r in status.recent %}
-    <tr>
-      <td class="muted">{{ r.updated_at.strftime("%Y-%m-%d %H:%M") }}</td>
-      <td><span class="pill">{{ r.op }}</span> {{ r.collection.split(".")[-1] }}</td>
-      <td>{{ r.title or r.rkey }}</td>
-      <td><a href="/archive/{{ r.did }}/{{ r.collection }}/{{ r.rkey | urlencode }}">view</a></td>
-    </tr>
-    {% endfor %}
-  </table>
+  {{ record_table(status.recent, show_raw=True) }}
   {% endif %}
 </div>
 
 <div>
-  <form method="get" action="/optout" style="display:inline">
+  <form method="get" action="/manage" style="display:inline">
     <button type="submit">Check status</button>
   </form>
-  <form method="post" action="/optout/import" style="display:inline">
+  <form method="post" action="/manage/import" style="display:inline">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <button type="submit"{% if status.opted_out %} disabled{% endif %}>Import recent activity</button>
   </form>
   {% if status.opted_out %}
-  <form method="post" action="/optout/opt-in" style="display:inline">
+  <form method="post" action="/manage/opt-in" style="display:inline">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <button type="submit">Opt back in</button>
   </form>
   {% else %}
-  <form method="post" action="/optout/opt-out" style="display:inline">
+  <form method="post" action="/manage/opt-out" style="display:inline">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <button type="submit">Opt out &amp; delete</button>
   </form>
   {% endif %}
-  <form method="post" action="/optout/signout" style="display:inline">
+  <form method="post" action="/manage/signout" style="display:inline">
     <button type="submit">Sign out</button>
   </form>
 </div>
@@ -153,11 +144,11 @@
 </div>
 
 <div>
-  <form method="post" action="/optout/admin/import/dry-run" style="display:inline">
+  <form method="post" action="/manage/admin/import/dry-run" style="display:inline">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <button type="submit"{% if not admin.can_import %} disabled{% endif %}>Estimate import</button>
   </form>
-  <form method="post" action="/optout/admin/import" style="display:inline">
+  <form method="post" action="/manage/admin/import" style="display:inline">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <label class="muted">from seq
       <input name="after_seq" value="0" size="12" inputmode="numeric">
@@ -166,7 +157,7 @@
       Start import
     </button>
   </form>
-  <form method="post" action="/optout/admin/import/cancel" style="display:inline">
+  <form method="post" action="/manage/admin/import/cancel" style="display:inline">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <button type="submit"{% if not admin.running %} disabled{% endif %}>Cancel import</button>
   </form>
@@ -194,7 +185,7 @@
 
 {% else %}
 <h3>Sign in to check status, import recent activity, opt out, or opt back in</h3>
-<form method="post" action="/optout">
+<form method="post" action="/manage">
   <p>
     <label>Handle or DID<br>
       <input name="identifier" placeholder="alice.bsky.social" required

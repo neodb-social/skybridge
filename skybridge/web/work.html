@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "macros.html" import record_table %}
 {% block title %}{{ title }} · Skybridge{% endblock %}
 {% block head %}
 <meta property="og:type" content="website" />
@@ -11,6 +12,10 @@
 <meta name="twitter:card" content="summary" />
 <meta name="twitter:image" content="{{ poster }}" />
 {% endif %}
+{# The item, and the marks bridged for it, in the vocabulary search engines
+   read — the AP object at this URL says the same in NeoDB's. tojson escapes
+   the HTML specials, so it cannot break out of the script element. #}
+<script type="application/ld+json">{{ schema | tojson }}</script>
 {% endblock %}
 {% block content %}
 <div class="hero">
@@ -21,7 +26,17 @@
   {% endif %}
   <div>
     <h2>{{ title }}</h2>
-    <p><span class="pill">{{ category }}</span></p>
+    <p>
+      <span class="pill">{{ category }}</span>
+      {# Every bridged rating, including from authors whose posts are not
+         listed below: an average attributes no score to anyone. #}
+      {% if rating %}
+      <strong>{{ rating.ratingValue }}/{{ rating.bestRating }}</strong>
+      <span class="muted">
+        from {{ rating.ratingCount }} bridged rating{{ "" if rating.ratingCount == 1 else "s" }}
+      </span>
+      {% endif %}
+    </p>
     {% if identifiers %}
     <p class="muted">
       {% for name, value in identifiers %}{{ name }}: <code>{{ value }}</code>{% if not loop.last %} · {% endif %}{% endfor %}
@@ -44,4 +59,9 @@
     {% endif %}
   </div>
 </div>
+{% if posts %}
+<h3>Recent posts</h3>
+<p class="muted">{{ posts | length }} most recent bridged post(s) about this item (up to 100).</p>
+{{ record_table(posts, show_author=True) }}
+{% endif %}
 {% endblock %}

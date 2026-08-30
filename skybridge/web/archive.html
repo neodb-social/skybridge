@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "macros.html" import record_table %}
 {% block title %}Recent · Skybridge{% endblock %}
 {% block content %}
 <h2>Recent</h2>
@@ -7,16 +8,5 @@
   <button type="submit">Search</button>
 </form>
 <p class="muted">{{ total }} most recent record(s){% if q %} matching “{{ q }}”{% endif %} (up to 100).</p>
-<table>
-  <tr><th>When</th><th>Author</th><th>Type</th><th>Title</th><th></th></tr>
-  {% for r in rows %}
-  <tr>
-    <td class="muted">{{ r.updated_at.strftime("%Y-%m-%d %H:%M") }}</td>
-    <td>{{ r.handle }}</td>
-    <td><span class="pill">{{ r.op }}</span> {{ r.collection.split(".")[-1] }}</td>
-    <td>{{ r.title or r.rkey }}</td>
-    <td><a href="/archive/{{ r.did }}/{{ r.collection }}/{{ r.rkey | urlencode }}">view</a></td>
-  </tr>
-  {% endfor %}
-</table>
+{{ record_table(rows, show_author=True, show_raw=True) }}
 {% endblock %}
