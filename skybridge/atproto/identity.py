@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
@@ -54,15 +55,53 @@ class Identity:
     # Visibility preferences read off the atproto account; see BridgedActor.
     hide_from_recommendations: bool = False
     no_unauthenticated: bool = False
+    # Did the PDS answer the read each preference above came from? Both are
+    # False whether the user turned the preference off or the request failed,
+    # so only these say which. They are deliberately per-record rather than
+    # per-repo: the three reads are three separate requests, and one of them
+    # succeeding says nothing about another that timed out.
+    bsky_answered: bool = False
+    declaration_answered: bool = False
+    # Did ``handle`` come from the DID document, or is it the synthetic
+    # ``<did-tail>.did`` placeholder we fall back to when PLC is unreachable?
+    # Without this an offline moment reads as a rename onto the placeholder.
+    handle_resolved: bool = False
 
 
 def _http_json(url: str, timeout: float = 8.0) -> dict | None:
+    """The server's JSON, or ``None`` when we never got any.
+
+    An HTTP error carrying a JSON body returns that body rather than ``None``,
+    because for atproto the two are different answers: a record that does not
+    exist comes back as ``400 {"error": "RecordNotFound"}``, which is the
+    server telling us the user has not set something, while a timeout tells us
+    nothing at all. Collapsing both into ``None`` is what would let an outage
+    read as a preference turned off (see ``_answered``). Callers that only
+    want a payload are unaffected: they already key off ``value`` / ``records``
+    / ``service``, which an error document does not carry.
+    """
     try:
         req = urllib.request.Request(url, headers={"User-Agent": get_settings().user_agent})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.load(resp)
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.load(exc)
+        except Exception:
+            return None
+        return body if isinstance(body, dict) and body.get("error") else None
     except Exception:
         return None
+
+
+def _answered(resp: dict | None) -> bool:
+    """Did the PDS answer this read at all?
+
+    True both for a record it returned and for one it reported as absent:
+    those are both answers. False only when nothing came back, which must
+    never be read as "the user turned this off".
+    """
+    return isinstance(resp, dict) and ("value" in resp or "error" in resp)
 
 
 def _fallback_handle(did: str) -> str:
@@ -71,11 +110,19 @@ def _fallback_handle(did: str) -> str:
     return f"{tail}.did"
 
 
-def _profile_record(pds: str, did: str, collection: str) -> dict:
-    prof = _http_json(
+def _record_response(pds: str, did: str, collection: str) -> dict | None:
+    """Raw ``getRecord`` response for ``rkey=self``; see ``_http_json``."""
+    return _http_json(
         f"{pds}/xrpc/com.atproto.repo.getRecord?repo={did}&collection={collection}&rkey=self"
     )
-    return (prof or {}).get("value", {}) if isinstance(prof, dict) else {}
+
+
+def _record_value(resp: dict | None) -> dict:
+    return resp.get("value", {}) if isinstance(resp, dict) else {}
+
+
+def _profile_record(pds: str, did: str, collection: str) -> dict:
+    return _record_value(_record_response(pds, did, collection))
 
 
 def has_self_label(bsky_value: dict, label: str) -> bool:
@@ -172,17 +219,24 @@ def resolve_remote(did: str) -> Identity:
     avatar: str | None = None
     hide_from_recommendations = False
     no_unauthenticated = False
+    bsky_answered = False
+    declaration_answered = False
     if pds:
         val = _profile_record(pds, did, _PROFILE_COLLECTION)
         display_name = val.get("displayName") or val.get("name") or None
         avatar = _avatar_url(val, did=did, pds=pds)
-        bsky_val = _profile_record(pds, did, _BSKY_PROFILE_COLLECTION)
+        bsky_resp = _record_response(pds, did, _BSKY_PROFILE_COLLECTION)
+        bsky_val = _record_value(bsky_resp)
         if not display_name:
             display_name = bsky_val.get("displayName") or bsky_val.get("name") or None
         if not avatar:
             avatar = _avatar_url(bsky_val, did=did, pds=pds)
         no_unauthenticated = has_self_label(bsky_val, NO_UNAUTHENTICATED)
-        hide_from_recommendations = _hide_from_recommendations(pds, did)
+        bsky_answered = _answered(bsky_resp)
+
+        decl_resp = _record_response(pds, did, VISIBILITY_COLLECTION)
+        hide_from_recommendations = bool(_record_value(decl_resp).get(HIDE_FIELD))
+        declaration_answered = _answered(decl_resp)
     return Identity(
         did=did,
         handle=handle or _fallback_handle(did),
@@ -190,6 +244,9 @@ def resolve_remote(did: str) -> Identity:
         avatar=avatar,
         hide_from_recommendations=hide_from_recommendations,
         no_unauthenticated=no_unauthenticated,
+        bsky_answered=bsky_answered,
+        declaration_answered=declaration_answered,
+        handle_resolved=handle is not None,
     )
 
 
@@ -263,20 +320,112 @@ def rename_actor(did: str, handle: str) -> BridgedActor | None:
     (``INVALID_HANDLE``) is not a rename: the actor keeps the last name we
     know it by until a real one arrives.
     """
-    if not handle or handle == INVALID_HANDLE:
+    if not _is_real_handle(handle):
         return None
     with session_scope() as session:
         row = session.get(BridgedActor, did)
         if row is None or row.handle == handle:
             return None
 
-        retired = row.handle
-        _claim_handle(session, handle, did=did)
-        row.handle = handle
+        _apply_rename(session, row, handle)
         row.last_seen = utcnow()
-        session.merge(HandleAlias(handle=retired, did=did))
-        log.info("actor %s renamed %s -> %s", did, retired, handle)
         return row
+
+
+def _is_real_handle(handle: str) -> bool:
+    """A handle we can rename an actor to, as opposed to a placeholder."""
+    return bool(handle) and handle != INVALID_HANDLE
+
+
+def _apply_rename(session: Session, row: BridgedActor, handle: str) -> None:
+    """Move ``row`` onto ``handle``, retiring the name it held as an alias."""
+    retired = row.handle
+    _claim_handle(session, handle, did=row.did)
+    row.handle = handle
+    session.merge(HandleAlias(handle=retired, did=row.did))
+    log.info("actor %s renamed %s -> %s", row.did, retired, handle)
+
+
+def resync_actor(did: str) -> BridgedActor | None:
+    """Re-read everything about a bridged actor from the network.
+
+    Runs when the account holder signs in to the self-service page. They have
+    just proved control of the DID on their own authorization server, so this
+    is the moment to pick up a renamed handle, an edited display name or
+    avatar, and either visibility preference.
+
+    Returns the row only when something actually moved, so the caller
+    publishes an ``Update(Person)`` exactly when there is news. ``None`` for a
+    DID we do not bridge — signing in is not activity, and we bridge people
+    because of what they post — and for one that opted out, whose records were
+    retracted and whose actor nobody should hear about again.
+
+    Unlike :func:`refresh_actor` this may also turn a preference OFF, which is
+    the whole point of doing it on a login: the user expects the settings they
+    hold right now to apply. It is still not willing to confuse an absent
+    record with a failed fetch, so each flag is lowered only when the read it
+    came from answered — its OWN read, not a sibling's. The three reads are
+    three separate requests, and one of them succeeding says nothing about
+    another that timed out.
+    """
+    with session_scope() as session:
+        row = session.get(BridgedActor, did)
+        if row is None or row.opted_out:
+            return None
+
+    ident = resolve_remote(did)
+
+    with session_scope() as session:
+        row = session.get(BridgedActor, did)
+        if row is None or row.opted_out:
+            # Re-checked: an opt-out landing while we were on the network
+            # keeps the row and sets the flag, so this is the branch that
+            # catches it — and re-announcing that actor is the one thing an
+            # opt-out means we must not do.
+            return None
+        before = (
+            row.handle,
+            row.display_name,
+            row.avatar,
+            bool(row.hide_from_recommendations),
+            bool(row.no_unauthenticated),
+        )
+
+        # Only a handle that genuinely resolved counts. Unreachable PLC yields
+        # the synthetic `<did-tail>.did` placeholder, and applying that would
+        # rename a live actor onto its fallback and retire its real name.
+        if ident.handle_resolved and _is_real_handle(ident.handle) and ident.handle != row.handle:
+            _apply_rename(session, row, ident.handle)
+
+        # Each preference follows the read that carries it, and nothing else.
+        if ident.declaration_answered:
+            row.hide_from_recommendations = ident.hide_from_recommendations
+        if ident.bsky_answered:
+            row.no_unauthenticated = ident.no_unauthenticated
+            # Both profile sources were consulted and neither had a name: the
+            # user cleared it, so clear ours too (as refresh_actor does).
+            row.display_name = ident.display_name
+        elif ident.display_name is not None:
+            # The bsky profile was not readable, so we only half-looked; only
+            # ever overwrite with a real value.
+            row.display_name = ident.display_name
+
+        # Never cleared, for the reason given in refresh_actor: a removed
+        # avatar and a failed blob lookup are indistinguishable here.
+        if ident.avatar is not None:
+            row.avatar = ident.avatar
+
+        row.last_seen = utcnow()
+        changed = before != (
+            row.handle,
+            row.display_name,
+            row.avatar,
+            bool(row.hide_from_recommendations),
+            bool(row.no_unauthenticated),
+        )
+        if changed:
+            log.info("resynced actor %s on sign-in", did)
+        return row if changed else None
 
 
 def set_hide_from_recommendations(did: str, hide: bool) -> BridgedActor | None:

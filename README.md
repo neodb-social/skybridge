@@ -143,6 +143,26 @@ widely again". Clearing has exact signals of its own: the declaration's own
 Jetstream commit (a delete and a `false` both mean false), and a profile record
 that comes back without the label.
 
+**Signing in resyncs the account.** Completing the atproto OAuth flow on
+`/optout` proves control of the DID, so the callback re-reads the whole account
+from the network before showing the status page: handle, display name, avatar
+and both preferences. Anything that moved is published to the author's
+followers as an `Update(Person)`, and the status card shows which preferences
+are currently being carried.
+
+This is the one path allowed to turn a preference *off*, because the account
+holder is present and expects the settings they hold right now to apply. It
+still refuses to confuse an absent record with a failed fetch, so each flag is
+lowered only when the read it came from answered — its own read, not a
+sibling's. The three reads are three separate requests, and one succeeding
+says nothing about another that timed out. atproto reports a missing record as
+`400 {"error": "RecordNotFound"}`, which is an answer; nothing coming back at
+all is not. Two things it will never do — mint an actor for a DID we do not bridge
+(signing in is not activity), and touch an account that opted out (its records
+were retracted, so nobody should hear about its actor again). A handle is
+applied only when the DID document actually resolved one, so an unreachable
+PLC cannot rename a live actor onto its `<did-tail>.did` placeholder.
+
 One popfeed action ("watched + rated") writes a review *and* a listItem; the
 bridge emits ONE AP `Note` per (author, work) carrying `Status` + `Rating` +
 `Comment` together. The Note id is anchored on whichever record publishes

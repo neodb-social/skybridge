@@ -17,6 +17,9 @@ from skybridge.stats import collect_stats
 from skybridge.translate import neodb
 from sqlalchemy import func, select
 
+# atproto's answer for a record that is not there (see tests/test_identity.py).
+_NOT_FOUND = {"error": "RecordNotFound", "message": "Could not locate record"}
+
 
 def _counts_from_fixture(path):
     wanted = set(WANTED_COLLECTIONS)
@@ -557,7 +560,7 @@ def test_profile_event_refreshes_avatar_via_bsky_fallback(settings, monkeypatch)
         "collection=app.bsky.actor.profile": {
             "value": {"displayName": "Bsky Name", "avatar": {"ref": {"$link": avatar_cid}}}
         },
-        "collection=app.bsky.actor.contentVisibilityDeclaration": None,
+        "collection=app.bsky.actor.contentVisibilityDeclaration": _NOT_FOUND,
     }
     monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
 
@@ -586,7 +589,7 @@ def test_profile_event_clears_display_name_when_both_sources_empty(settings, mon
             "service": [{"id": "#atproto_pds", "serviceEndpoint": "https://pds.example"}]
         },
         "collection=app.bsky.actor.profile": {"value": {"displayName": ""}},
-        "collection=app.bsky.actor.contentVisibilityDeclaration": None,
+        "collection=app.bsky.actor.contentVisibilityDeclaration": _NOT_FOUND,
     }
     monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
 

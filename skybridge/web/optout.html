@@ -30,6 +30,30 @@
     <span class="pill">not bridged</span> No bridged records.
     {% endif %}
   </p>
+  {# Re-read from your account on every sign-in, so this reflects the Bluesky
+     settings you hold right now rather than what the firehose last told us. #}
+  {% if status.bridged and not status.opted_out %}
+  <p class="muted">
+    Bluesky visibility preferences carried to the Fediverse:
+    {% if status.hide_from_recommendations or status.no_unauthenticated %}
+    <br />
+    {% if status.hide_from_recommendations %}
+    <span class="pill">hidden from recommendations</span>
+    Your bridged profile asks other servers to keep it out of directories,
+    follow suggestions and trends.
+    <br />
+    {% endif %}
+    {% if status.no_unauthenticated %}
+    <span class="pill">hidden from signed-out readers</span>
+    Your posts are not shown on this site, and are sent unlisted so other
+    servers keep them out of their public timelines. They stay readable to
+    anyone your followers' servers show them to.
+    {% endif %}
+    {% else %}
+    none set.
+    {% endif %}
+  </p>
+  {% endif %}
   {% if status.recent %}
   <p class="muted">{{ status.recent | length }} most recent record(s) (up to 200).</p>
   <table>

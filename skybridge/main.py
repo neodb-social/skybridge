@@ -23,7 +23,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from skybridge import admin, neodb_servers, optout, sessions, telemetry
+from skybridge import admin, neodb_servers, optout, pipeline, sessions, telemetry
 from skybridge.activitypub import nodeinfo, objects, webfinger
 from skybridge.activitypub.actors import RELAY_DID, get_relay_keys, person_actor, relay_actor
 from skybridge.activitypub.delivery import DeliveryWorker
@@ -430,6 +430,8 @@ def _status_ctx(did: str, fallback_handle: str | None = None) -> dict[str, Any]:
         "opted_out": st.opted_out,
         "record_count": st.record_count,
         "recent": _record_rows(st.recent_rows),
+        "hide_from_recommendations": st.hide_from_recommendations,
+        "no_unauthenticated": st.no_unauthenticated,
     }
 
 
@@ -686,6 +688,16 @@ async def oauth_callback(
             400,
         )
     token = sessions.create(result.did, result.handle)
+    # The account holder is here and has just proved control of the DID, so
+    # re-read their handle, profile and visibility preferences before showing
+    # the status page — otherwise it reports whatever the firehose last
+    # happened to tell us. A no-op for a DID we do not bridge or that opted
+    # out; peers hear about it only when something actually moved.
+    refreshed = await asyncio.to_thread(identity.resync_actor, result.did)
+    if refreshed is not None:
+        await pipeline.deliver_person_update(
+            refreshed, seq=None, worker=getattr(app.state, "worker", None)
+        )
     resp = RedirectResponse("/optout", status_code=303)
     resp.set_cookie(
         sessions.COOKIE_NAME,

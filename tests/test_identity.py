@@ -19,6 +19,11 @@ PLC_DOC = {
 AVATAR_CID = "bafkreid2bchkp7nddjrm34vkw7nygts5szfdelcq4p4efpuy2dpypcmcmi"
 AVATAR_URL = f"{PDS}/xrpc/com.atproto.sync.getBlob?did={DID}&cid={AVATAR_CID}"
 
+# How atproto reports a record that is not there: HTTP 400 with an error body.
+# Distinct from a stub of ``None``, which stands for a request that never got
+# an answer — the difference that decides whether a preference may be cleared.
+_NOT_FOUND = {"error": "RecordNotFound", "message": "Could not locate record"}
+
 BSKY_PROFILE_WITH_AVATAR = {
     "value": {
         "$type": "app.bsky.actor.profile",
@@ -131,7 +136,7 @@ def test_resolve_remote_falls_back_to_bsky_for_display_name_and_avatar(monkeypat
             "value": {"$type": "social.popfeed.actor.profile", "displayName": "", "bannerUrl": ""}
         },
         "collection=app.bsky.actor.profile": BSKY_PROFILE_WITH_AVATAR,
-        "collection=app.bsky.actor.contentVisibilityDeclaration": None,
+        "collection=app.bsky.actor.contentVisibilityDeclaration": _NOT_FOUND,
     }
     monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
 
@@ -149,7 +154,7 @@ def test_resolve_remote_prefers_popfeed_display_name_over_bsky(monkeypatch):
             "value": {"$type": "social.popfeed.actor.profile", "displayName": "Pop Alice"}
         },
         "collection=app.bsky.actor.profile": BSKY_PROFILE_WITH_AVATAR,
-        "collection=app.bsky.actor.contentVisibilityDeclaration": None,
+        "collection=app.bsky.actor.contentVisibilityDeclaration": _NOT_FOUND,
     }
     monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
 
@@ -168,7 +173,7 @@ def test_resolve_remote_avatar_none_when_bsky_fetch_fails(monkeypatch):
         # Simulates a network failure: _http_json swallows exceptions and
         # returns None, which must never propagate as an exception here.
         "collection=app.bsky.actor.profile": None,
-        "collection=app.bsky.actor.contentVisibilityDeclaration": None,
+        "collection=app.bsky.actor.contentVisibilityDeclaration": _NOT_FOUND,
     }
     monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
 
@@ -195,7 +200,7 @@ def test_resolve_remote_still_reads_bsky_when_popfeed_has_everything(monkeypatch
             }
         },
         "collection=app.bsky.actor.profile": {"value": {"displayName": "Bsky Alice"}},
-        "collection=app.bsky.actor.contentVisibilityDeclaration": None,
+        "collection=app.bsky.actor.contentVisibilityDeclaration": _NOT_FOUND,
     }
     monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses, calls))
 
@@ -249,7 +254,7 @@ def test_missing_declaration_record_means_false(monkeypatch):
         "plc.directory": PLC_DOC,
         "collection=social.popfeed.actor.profile": {"value": {"displayName": "Alice"}},
         "collection=app.bsky.actor.profile": {"value": {"displayName": "Alice"}},
-        "collection=app.bsky.actor.contentVisibilityDeclaration": None,
+        "collection=app.bsky.actor.contentVisibilityDeclaration": _NOT_FOUND,
     }
     monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
 
@@ -317,7 +322,7 @@ def test_refresh_never_clears_a_preference_on_a_failed_fetch(settings, monkeypat
         "plc.directory": PLC_DOC,
         # The PDS is answering for nothing right now.
         "collection=app.bsky.actor.profile": None,
-        "collection=app.bsky.actor.contentVisibilityDeclaration": None,
+        "collection=app.bsky.actor.contentVisibilityDeclaration": _NOT_FOUND,
     }
     monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
 
@@ -338,10 +343,187 @@ def test_refresh_clears_the_label_once_the_profile_comes_back_without_it(setting
     responses = {
         "plc.directory": PLC_DOC,
         "collection=app.bsky.actor.profile": {"value": {"displayName": "Alice"}},
-        "collection=app.bsky.actor.contentVisibilityDeclaration": None,
+        "collection=app.bsky.actor.contentVisibilityDeclaration": _NOT_FOUND,
     }
     monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
 
     identity.refresh_actor(DID, {"displayName": "Alice"}, allow_network=True)
 
     assert _actor(DID).no_unauthenticated is False
+
+
+# --------------------------------------------------------------------------- #
+# Sign-in resync
+# --------------------------------------------------------------------------- #
+def _network(monkeypatch, *, handle=HANDLE, display_name="Alice", labels=None, hide=False):
+    profile: dict = {"$type": "app.bsky.actor.profile"}
+    if display_name is not None:
+        profile["displayName"] = display_name
+    if labels is not None:
+        profile["labels"] = {
+            "$type": "com.atproto.label.defs#selfLabels",
+            "values": [{"val": v} for v in labels],
+        }
+    responses = {
+        "plc.directory": {
+            "alsoKnownAs": [f"at://{handle}"],
+            "service": [{"id": "#atproto_pds", "serviceEndpoint": PDS}],
+        },
+        "collection=social.popfeed.actor.profile": None,
+        "collection=app.bsky.actor.profile": {"value": profile},
+        "collection=app.bsky.actor.contentVisibilityDeclaration": (
+            {"value": {"hideFromAlgorithmicRecommendations": True}} if hide else _NOT_FOUND
+        ),
+    }
+    monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
+
+
+def test_resync_refreshes_profile_and_preferences(settings, monkeypatch):
+    identity.ensure_actor(DID, allow_network=False)
+    _network(monkeypatch, display_name="New Name", labels=["!no-unauthenticated"], hide=True)
+
+    row = identity.resync_actor(DID)
+
+    assert row is not None  # something moved, so followers get an Update
+    assert row.display_name == "New Name"
+    assert row.hide_from_recommendations is True
+    assert row.no_unauthenticated is True
+
+
+def test_resync_applies_a_rename_and_keeps_the_old_name_resolvable(settings, monkeypatch):
+    identity.ensure_actor(DID, allow_network=False)
+    identity.rename_actor(DID, "old.test")
+    _network(monkeypatch, handle="new.test")
+
+    row = identity.resync_actor(DID)
+
+    assert row is not None and row.handle == "new.test"
+    # Already-federated ids under the retired name keep dereferencing.
+    assert identity.actor_by_ident("old.test") is not None
+
+
+def test_resync_reports_no_change_when_nothing_moved(settings, monkeypatch):
+    identity.ensure_actor(DID, allow_network=False)
+    _network(monkeypatch, display_name="Alice")
+    assert identity.resync_actor(DID) is not None  # first pass applies the name
+
+    # Nothing to tell followers the second time.
+    assert identity.resync_actor(DID) is None
+
+
+def test_resync_may_turn_a_preference_off(settings, monkeypatch):
+    """The point of doing this on a sign-in: the settings the user holds right
+    now apply, in both directions."""
+    identity.ensure_actor(DID, allow_network=False)
+    with identity.session_scope() as session:
+        row = session.get(BridgedActor, DID)
+        assert row is not None
+        row.hide_from_recommendations = True
+        row.no_unauthenticated = True
+
+    # The repo is readable and neither preference is set in it any more.
+    _network(monkeypatch, labels=None, hide=False)
+    row = identity.resync_actor(DID)
+
+    assert row is not None
+    assert row.hide_from_recommendations is False
+    assert row.no_unauthenticated is False
+
+
+def _preferences_set(monkeypatch) -> None:
+    identity.ensure_actor(DID, allow_network=False)
+    identity.rename_actor(DID, HANDLE)  # already on the name PLC reports
+    with identity.session_scope() as session:
+        row = session.get(BridgedActor, DID)
+        assert row is not None
+        row.hide_from_recommendations = True
+        row.no_unauthenticated = True
+
+
+def test_resync_will_not_turn_a_preference_off_on_a_dead_pds(settings, monkeypatch):
+    """Nothing answered, so nothing is believed to have been turned off."""
+    _preferences_set(monkeypatch)
+    responses = {
+        "plc.directory": PLC_DOC,
+        "collection=social.popfeed.actor.profile": None,
+        "collection=app.bsky.actor.profile": None,
+        "collection=app.bsky.actor.contentVisibilityDeclaration": None,
+    }
+    monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
+
+    assert identity.resync_actor(DID) is None
+    row = _actor(DID)
+    assert row.hide_from_recommendations is True
+    assert row.no_unauthenticated is True
+
+
+def test_a_failed_declaration_read_does_not_clear_it(settings, monkeypatch):
+    """Each preference follows its OWN read.
+
+    The three reads are three separate requests, so the bsky profile
+    answering says nothing about a declaration fetch that timed out.
+    """
+    _preferences_set(monkeypatch)
+    responses = {
+        "plc.directory": PLC_DOC,
+        "collection=social.popfeed.actor.profile": {"value": {"displayName": "Alice"}},
+        "collection=app.bsky.actor.profile": {"value": {"displayName": "Alice"}},
+        "collection=app.bsky.actor.contentVisibilityDeclaration": None,  # timed out
+    }
+    monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
+
+    identity.resync_actor(DID)
+
+    row = _actor(DID)
+    assert row.hide_from_recommendations is True  # untouched
+    assert row.no_unauthenticated is False  # its own record answered
+
+
+def test_a_failed_profile_read_does_not_clear_the_label(settings, monkeypatch):
+    """The mirror case: the declaration answered, the label's record did not."""
+    _preferences_set(monkeypatch)
+    responses = {
+        "plc.directory": PLC_DOC,
+        "collection=social.popfeed.actor.profile": {"value": {"displayName": "Alice"}},
+        "collection=app.bsky.actor.profile": None,  # timed out
+        "collection=app.bsky.actor.contentVisibilityDeclaration": _NOT_FOUND,
+    }
+    monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
+
+    identity.resync_actor(DID)
+
+    row = _actor(DID)
+    assert row.no_unauthenticated is True  # untouched
+    assert row.hide_from_recommendations is False  # its own record answered
+
+
+def test_resync_does_not_rename_onto_the_placeholder_when_plc_is_down(settings, monkeypatch):
+    identity.ensure_actor(DID, allow_network=False)
+    identity.rename_actor(DID, HANDLE)
+    responses = {"plc.directory": None}
+    monkeypatch.setattr(identity, "_http_json", _fake_http_json(responses))
+
+    assert identity.resync_actor(DID) is None
+    assert _actor(DID).handle == HANDLE
+
+
+def test_resync_never_mints_an_actor(settings, monkeypatch):
+    """Signing in is not activity: we bridge people for what they post."""
+    _network(monkeypatch)
+
+    assert identity.resync_actor("did:plc:stranger") is None
+    assert identity.actor_by_ident("did:plc:stranger") is None
+
+
+def test_resync_leaves_an_opted_out_account_alone(settings, monkeypatch):
+    """Its records were retracted; nobody should hear about its actor again."""
+    identity.ensure_actor(DID, allow_network=False)
+    with identity.session_scope() as session:
+        row = session.get(BridgedActor, DID)
+        assert row is not None
+        row.opted_out = True
+        row.display_name = "Old Name"
+    _network(monkeypatch, display_name="New Name")
+
+    assert identity.resync_actor(DID) is None
+    assert _actor(DID).display_name == "Old Name"

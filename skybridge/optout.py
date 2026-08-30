@@ -38,6 +38,11 @@ class BridgeStatus:
     opted_out: bool
     record_count: int
     recent_rows: list[Record]
+    # The Bluesky visibility preferences we are currently carrying for this
+    # account, shown back to the account holder so a sign-in refresh is
+    # visible rather than silent.
+    hide_from_recommendations: bool = False
+    no_unauthenticated: bool = False
 
 
 def lookup_status(did: str, *, recent_limit: int = 200) -> BridgeStatus:
@@ -63,6 +68,8 @@ def lookup_status(did: str, *, recent_limit: int = 200) -> BridgeStatus:
             opted_out=session.get(OptOut, did) is not None,
             record_count=count,
             recent_rows=recent,
+            hide_from_recommendations=actor is not None and bool(actor.hide_from_recommendations),
+            no_unauthenticated=actor is not None and bool(actor.no_unauthenticated),
         )
 
 

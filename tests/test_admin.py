@@ -9,7 +9,7 @@ from dataclasses import replace
 import pytest
 from fastapi.testclient import TestClient
 from skybridge import admin, sessions
-from skybridge.atproto import oauth
+from skybridge.atproto import identity, oauth
 from skybridge.atproto.replay import replay_file
 from skybridge.config import Settings, set_settings
 from skybridge.main import app
@@ -32,6 +32,10 @@ def client(settings: Settings, fixture_path, monkeypatch) -> TestClient:
         "finish_flow",
         lambda state, code, iss: oauth.FlowResult(did=DID, handle="author.test"),
     )
+    # Signing in re-reads the account from the network (identity.resync_actor).
+    # Keep the suite offline: an unreachable PLC/PDS is the resolver's normal
+    # degraded path and leaves the actor untouched.
+    monkeypatch.setattr(identity, "_http_json", lambda url, timeout=8.0: None)
     sessions._SESSIONS.clear()
     admin.reset_cache()
     return TestClient(app, base_url="https://bridge.test")

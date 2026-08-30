@@ -741,7 +741,7 @@ async def _process_profile(
         return None
 
     _mark_profile_seq(did, seq)
-    activity, delivered = await _deliver_person_update(row, seq=seq, worker=worker)
+    activity, delivered = await deliver_person_update(row, seq=seq, worker=worker)
     return Processed(at_uri, operation, _PROFILE_COLLECTION, activity, delivered)
 
 
@@ -775,11 +775,11 @@ async def _process_visibility(
         # nothing to tell anyone about.
         return None
 
-    activity, delivered = await _deliver_person_update(row, seq=seq, worker=worker)
+    activity, delivered = await deliver_person_update(row, seq=seq, worker=worker)
     return Processed(at_uri, operation, _VISIBILITY_COLLECTION, activity, delivered)
 
 
-async def _deliver_person_update(
+async def deliver_person_update(
     row: BridgedActor, *, seq: int | None, worker: DeliveryWorker | None
 ) -> tuple[dict[str, Any], int]:
     """Send an ``Update(Person)`` for a refreshed actor to its own followers.
@@ -951,7 +951,7 @@ async def _process_identity(
     if row is None:
         return None
 
-    activity, delivered = await _deliver_person_update(row, seq=event.get("seq"), worker=worker)
+    activity, delivered = await deliver_person_update(row, seq=event.get("seq"), worker=worker)
     return Processed(f"at://{did}", "update", _IDENTITY_KIND, activity, delivered)
 
 

@@ -9,7 +9,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 from skybridge import optout, sessions
-from skybridge.atproto import backfill, oauth
+from skybridge.atproto import backfill, identity, oauth
 from skybridge.atproto.replay import replay_file
 from skybridge.db import session_scope
 from skybridge.main import app
@@ -94,6 +94,10 @@ def client(settings, fixture_path, monkeypatch) -> TestClient:
         "finish_flow",
         lambda state, code, iss: oauth.FlowResult(did=DID, handle="author.test"),
     )
+    # Signing in re-reads the account from the network (identity.resync_actor).
+    # Keep the suite offline: an unreachable PLC/PDS is the resolver's normal
+    # degraded path and leaves the actor untouched.
+    monkeypatch.setattr(identity, "_http_json", lambda url, timeout=8.0: None)
     sessions._SESSIONS.clear()  # no leakage between tests
     # https base URL: the session cookie is Secure (settings.scheme is https)
     return TestClient(app, base_url="https://bridge.test")
@@ -349,3 +353,85 @@ def test_signed_in_view_lists_up_to_200_recent_records(settings):
     st = optout.lookup_status(DID)
     assert st.record_count == 210
     assert len(st.recent_rows) == 200  # the account view shows the recent 200
+
+
+# --------------------------------------------------------------------------- #
+# Signing in refreshes the account from the network
+# --------------------------------------------------------------------------- #
+def _live_account(monkeypatch, *, display_name="Fresh Name", hide=False, labels=None):
+    """Stub the PLC/PDS reads resync_actor makes for the fixture author."""
+    profile: dict = {"$type": "app.bsky.actor.profile", "displayName": display_name}
+    if labels is not None:
+        profile["labels"] = {
+            "$type": "com.atproto.label.defs#selfLabels",
+            "values": [{"val": v} for v in labels],
+        }
+    responses = {
+        "plc.directory": {
+            "alsoKnownAs": ["at://someone.bsky.social"],  # the handle it already holds
+            "service": [{"id": "#atproto_pds", "serviceEndpoint": "https://pds.example"}],
+        },
+        "collection=social.popfeed.actor.profile": None,
+        "collection=app.bsky.actor.profile": {"value": profile},
+        "collection=app.bsky.actor.contentVisibilityDeclaration": (
+            {"value": {"hideFromAlgorithmicRecommendations": True}} if hide else None
+        ),
+    }
+
+    def fake(url: str, timeout: float = 8.0) -> dict | None:
+        for substring, value in responses.items():
+            if substring in url:
+                return value
+        return None
+
+    monkeypatch.setattr(identity, "_http_json", fake)
+
+
+def _actor_row() -> BridgedActor:
+    with session_scope() as session:
+        row = session.get(BridgedActor, DID)
+        assert row is not None
+        return row
+
+
+def test_sign_in_refreshes_profile_and_preferences(client, monkeypatch):
+    _live_account(monkeypatch, display_name="Fresh Name", hide=True, labels=["!no-unauthenticated"])
+
+    _sign_in(client)
+
+    row = _actor_row()
+    assert row.display_name == "Fresh Name"
+    assert row.hide_from_recommendations is True
+    assert row.no_unauthenticated is True
+
+
+def test_sign_in_shows_the_preferences_it_just_read(client, monkeypatch):
+    _live_account(monkeypatch, hide=True, labels=["!no-unauthenticated"])
+
+    _sign_in(client)
+    page = client.get("/optout").text
+
+    assert "hidden from recommendations" in page
+    assert "hidden from signed-out readers" in page
+
+
+def test_sign_in_reports_no_preferences_when_none_are_set(client, monkeypatch):
+    _live_account(monkeypatch)
+
+    _sign_in(client)
+
+    page = client.get("/optout").text
+    assert "none set." in page
+    assert "hidden from recommendations" not in page
+    assert "hidden from signed-out readers" not in page
+
+
+def test_sign_in_by_an_opted_out_account_changes_nothing(client, monkeypatch):
+    asyncio.run(optout.opt_out(DID))
+    before = _actor_row().display_name
+    _live_account(monkeypatch, display_name="Fresh Name")
+
+    _sign_in(client)
+
+    # Everything was retracted; refreshing the actor would only re-announce it.
+    assert _actor_row().display_name == before
