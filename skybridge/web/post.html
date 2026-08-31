@@ -12,6 +12,8 @@
 <meta property="og:title" content="{{ og_title }}" />
 <meta property="og:description" content="{{ description }}" />
 <meta property="og:url" content="{{ url }}" />
+{# A post that was never edited was last modified when it was published. #}
+<meta property="article:modified_time" content="{{ updated or published }}" />
 {% if work and work.image %}
 <meta property="og:image" content="{{ work.image }}" />
 <meta name="twitter:card" content="summary" />
@@ -71,8 +73,6 @@
     {% endif %}
     <p class="muted">
       Published <time datetime="{{ published }}">{{ published_display }}</time>
-      · last modified
-      <time datetime="{{ updated or published }}">{{ modified_display }}</time>
       · bridged from Atmosphere
     </p>
   </div>

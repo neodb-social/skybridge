@@ -533,9 +533,7 @@ def _post_page_ctx(obj: dict[str, Any], ident: str, at_uri: str) -> dict[str, An
         "summary": obj.get("summary"),
         "published": published,
         "updated": updated,
-        # A post that was never edited was last modified when it was published.
         "published_display": _display_time(published) if published else "",
-        "modified_display": _display_time(updated or published) if published else "",
         "hashtags": hashtags,
         "work": work,
         "url": obj["id"],

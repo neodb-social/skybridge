@@ -120,7 +120,7 @@ class Settings:
     relay_key_pem: str | None = None
     relay_key_file: str = "data/relay_key.pem"
     relay_summary: str = (
-        "Skybridge mirrors activities from Atmosphere (e.g. popfeed) to "
+        "Skybridge mirrors activities from Atmosphere (e.g. popfeed, bookhive) to "
         "the Fediverse in NeoDB-compatible format."
     )
     # External Fediverse relay inboxes we subscribe to as a client (Mastodon-

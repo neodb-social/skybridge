@@ -611,15 +611,17 @@ def test_post_page_shows_published_and_last_modified(client):
     )
     page = client.get(f"/users/{handle}/posts/{rkey}").text
     assert '<time datetime="2026-07-03T17:16:24.038Z">2026-07-03 17:16 UTC</time>' in page
-    assert "last modified" in page
-    assert '<time datetime="2026-08-01T09:30:00+00:00">2026-08-01 09:30 UTC</time>' in page
+    # The edit time is for machines, so it rides in the head, not the body.
+    assert '<meta property="article:modified_time" content="2026-08-01T09:30:00+00:00" />' in page
+    assert "last modified" not in page
 
 
 def test_a_post_never_edited_is_last_modified_when_published(client):
     handle, at_uri, rkey, _post_url = _the_review()
     _patch_note(at_uri, published="2026-07-03T17:16:24.038Z", updated=None)
     page = client.get(f"/users/{handle}/posts/{rkey}").text
-    assert page.count('<time datetime="2026-07-03T17:16:24.038Z">2026-07-03 17:16 UTC</time>') == 2
+    assert '<time datetime="2026-07-03T17:16:24.038Z">2026-07-03 17:16 UTC</time>' in page
+    assert '<meta property="article:modified_time" content="2026-07-03T17:16:24.038Z" />' in page
 
 
 def _schema_of(page: str) -> dict:
