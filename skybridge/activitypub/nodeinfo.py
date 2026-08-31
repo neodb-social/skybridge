@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from skybridge.config import get_settings
-from skybridge.stats import collect_stats
+from skybridge.stats import UNKNOWN, cached_usage
 
 
 def discovery() -> dict:
@@ -18,8 +18,34 @@ def discovery() -> dict:
     }
 
 
+def _counted(**numbers: int) -> dict[str, int]:
+    """Only the numbers that have been counted at least once.
+
+    A cold cache reports nothing rather than a zero, which a peer would read as
+    an empty node instead of an unmeasured one.
+    """
+    return {name: value for name, value in numbers.items() if value != UNKNOWN}
+
+
 def document() -> dict:
-    stats = collect_stats()
+    # Answered from the cache stats.usage_refresh_loop keeps warm: a scrape
+    # runs no queries, and the counts may be up to that interval old.
+    counts = cached_usage()
+    usage: dict = {}
+    users = _counted(total=counts["total"], activeMonth=counts["active_month"])
+    if users:
+        usage["users"] = users
+    usage.update(_counted(localPosts=counts["local_posts"]))
+
+    metadata: dict = {
+        # NeoDB's peer discovery (takahe get_neodb_peers) requires
+        # metadata.nodeEnvironment == "production" plus "neodb" in protocols
+        "nodeEnvironment": "production",
+        "nodeName": get_settings().relay_name,
+        "nodeDescription": get_settings().relay_summary,
+    }
+    metadata.update(_counted(relays=counts["relays_accepted"], worksCatalogued=counts["works"]))
+
     return {
         "version": "2.1",
         "software": {
@@ -30,17 +56,6 @@ def document() -> dict:
         "protocols": ["activitypub", "neodb"],
         "services": {"inbound": ["atproto"], "outbound": ["activitypub"]},
         "openRegistrations": False,
-        "usage": {
-            "users": {"total": stats["bridged_actors"]},
-            "localPosts": stats["records_active"],
-        },
-        "metadata": {
-            # NeoDB's peer discovery (takahe get_neodb_peers) requires
-            # metadata.nodeEnvironment == "production" plus "neodb" in protocols
-            "nodeEnvironment": "production",
-            "nodeName": get_settings().relay_name,
-            "nodeDescription": get_settings().relay_summary,
-            "relays": stats["relays_accepted"],
-            "worksCatalogued": stats["works"],
-        },
+        "usage": usage,
+        "metadata": metadata,
     }

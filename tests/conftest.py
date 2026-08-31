@@ -8,6 +8,7 @@ import pytest
 from skybridge.config import Settings, set_settings
 from skybridge.crypto import generate_keypair
 from skybridge.db import init_db
+from skybridge.stats import reset_usage
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
 
@@ -33,6 +34,9 @@ def settings(tmp_path) -> Settings:
 def _db(settings: Settings):
     # init_db reads the active settings (db_path=:memory:) installed above.
     init_db(reset=True)
+    # The NodeInfo counts are cached in a module global, so they would
+    # otherwise outlive the database they were counted from.
+    reset_usage()
     yield
     set_settings(None)
 

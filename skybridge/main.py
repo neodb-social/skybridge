@@ -35,7 +35,7 @@ from skybridge.atproto import backfill, discover, identity, oauth
 from skybridge.config import get_settings
 from skybridge.db import init_db, session_scope
 from skybridge.models import BridgedActor, Cursor, Record, Work
-from skybridge.stats import collect_stats
+from skybridge.stats import collect_stats, usage_refresh_loop
 from skybridge.translate import works
 
 log = logging.getLogger("skybridge")
@@ -78,6 +78,11 @@ async def lifespan(app: FastAPI):
     # do a blocking identity resolution inside a request.
     admin_task = asyncio.create_task(admin.refresh_loop(), name="admin-refresh")
     app.state.admin_task = admin_task
+
+    # Counts the NodeInfo document serves. Off in its own slow loop because
+    # they are whole-table aggregates and nothing waits on them being current.
+    usage_task = asyncio.create_task(usage_refresh_loop(), name="usage-refresh")
+    app.state.usage_task = usage_task
     try:
         yield
     finally:
@@ -89,6 +94,9 @@ async def lifespan(app: FastAPI):
         admin_task.cancel()
         with suppress(asyncio.CancelledError):
             await admin_task
+        usage_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await usage_task
         if not relay_task.done():
             relay_task.cancel()
             with suppress(asyncio.CancelledError):

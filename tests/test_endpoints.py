@@ -17,8 +17,9 @@ from skybridge.atproto import identity
 from skybridge.atproto.replay import replay_file
 from skybridge.db import session_scope
 from skybridge.main import app
-from skybridge.models import BridgedActor, Record
+from skybridge.models import BridgedActor, Record, utcnow
 from skybridge.pipeline import process_event
+from skybridge.stats import refresh_usage, usage_counts
 from sqlalchemy import select
 
 AP = {"accept": "application/activity+json"}
@@ -126,9 +127,44 @@ def test_nodeinfo(client):
     assert href.endswith("/nodeinfo/2.1")
     doc = client.get("/nodeinfo/2.1").json()
     assert doc["software"]["name"] == "neodb-skybridge"
-    assert doc["usage"]["users"]["total"] >= 1
     assert doc["metadata"]["nodeEnvironment"] == "production"
     assert "neodb" in doc["protocols"]
+    # The counts come from the refresh loop, which the test client never
+    # starts: uncounted numbers are left out rather than reported as zero.
+    assert doc["usage"] == {}
+    assert "relays" not in doc["metadata"]
+
+    asyncio.run(refresh_usage())
+    doc = client.get("/nodeinfo/2.1").json()
+    assert doc["usage"]["users"]["total"] >= 1
+    assert doc["usage"]["users"]["activeMonth"] >= 1
+    assert doc["usage"]["localPosts"] >= 1
+    assert doc["metadata"]["relays"] == 0
+
+
+def test_nodeinfo_counts_skip_retracted_records(client):
+    """Retracting an author's records drops them from both counts.
+
+    This is the shape an opt-out leaves behind, and it stamps `updated_at` on
+    every row it tombstones — so "active this month" has to read the tombstone,
+    not the timestamp.
+    """
+    _handle, at_uri, _rkey, _post_url = _the_review()
+    before = usage_counts()
+    with session_scope() as session:
+        review = session.get(Record, at_uri)
+        assert review is not None
+        did = review.did
+        rows = list(session.scalars(select(Record).where(Record.did == did)))
+        published = sum(1 for row in rows if row.ap_object_json and row.deleted_at is None)
+        for row in rows:
+            row.op = "delete"
+            row.deleted_at = row.updated_at = utcnow()
+
+    after = usage_counts()
+    assert published >= 1
+    assert after["local_posts"] == before["local_posts"] - published
+    assert after["active_month"] == before["active_month"] - 1
 
 
 # --- handle renames: everything already federated keeps resolving ----------
