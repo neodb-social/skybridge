@@ -20,6 +20,7 @@ from typing import Any
 
 from fastapi import FastAPI, Form, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
@@ -112,6 +113,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Skybridge", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
 
 # --------------------------------------------------------------------------- #

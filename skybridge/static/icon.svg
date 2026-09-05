@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">NeoDB Open Triad 2.2 symbol</title>
+  <desc id="desc">Three open interlocking pieces in soft green, blue, and coral, separated by a continuous four-unit gap.</desc>
+  <g transform="translate(70 64) rotate(45) scale(.8) translate(-64 -64)">
+    <path fill="#C0D9B4" d="M20 16h40q4 0 4 4v40q0 4-4 4H48v3q0 8-8 8t-8-8v-3H20q-4 0-4-4V20q0-4 4-4Z"/>
+    <path fill="#8DCAFF" d="M20 68h8v-1q0 12 12 12t12-12v1h8q4 0 4 4v8h3q8 0 8 8t-8 8h-3v12q0 4-4 4H20q-4 0-4-4V72q0-4 4-4Z"/>
+    <path fill="#FFB380" d="M72 64h36q4 0 4 4v40q0 4-4 4H72q-4 0-4-4V100h-1q12 0 12-12t-12-12h1V68q0-4 4-4Z"/>
+  </g>
+</svg>

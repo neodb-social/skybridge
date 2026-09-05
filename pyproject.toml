@@ -30,6 +30,9 @@ dev = ["pytest>=9.0.3", "ruff>=0.15.16", "ty>=0.0.44", "pre-commit>=4.6.0"]
 requires = ["setuptools>=77"]  # PEP 639 SPDX license expression support
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.package-data]
+skybridge = ["web/*.html", "static/*.svg"]
+
 [tool.setuptools.packages.find]
 include = ["skybridge*"]
 

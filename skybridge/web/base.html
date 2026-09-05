@@ -4,6 +4,7 @@
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>{% block title %}Skybridge{% endblock %}</title>
+        <link rel="icon" type="image/svg+xml" href="{{ url_for('static', path='icon.svg') }}" />
         {% block head %}{% endblock %}
         <style>
             :root {
@@ -19,7 +20,7 @@
             header {
                 display: flex;
                 gap: 1rem;
-                align-items: baseline;
+                align-items: center;
                 flex-wrap: wrap;
                 border-bottom: 1px solid #8884;
                 padding-bottom: 0.75rem;
@@ -28,6 +29,18 @@
             header h1 {
                 margin: 0;
                 font-size: 1.4rem;
+            }
+            .brand {
+                display: inline-flex;
+                align-items: center;
+                gap: 0.5rem;
+                text-decoration: none;
+            }
+            .brand-icon {
+                display: block;
+                width: 3rem;
+                height: 3rem;
+                flex-shrink: 0;
             }
             nav a {
                 margin-right: 1rem;
@@ -140,7 +153,12 @@
     </head>
     <body>
         <header>
-            <h1><a href="/" style="text-decoration: none">🌁 skybridge</a></h1>
+            <h1>
+                <a class="brand" href="/">
+                    <img class="brand-icon" src="{{ url_for('static', path='icon.svg') }}" width="48" height="48" alt="" />
+                    skybridge
+                </a>
+            </h1>
             <nav>
                 <a href="/archive">Recent</a>
                 <a href="/catalog">Catalog</a>
