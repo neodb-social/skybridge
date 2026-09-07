@@ -102,7 +102,7 @@ def test_book_becomes_rating_comment_and_status(settings):
 
     comments = [r for r in note["relatedWith"] if r["type"] == "Comment"]
     assert len(comments) == 1
-    # plain text (no facets): paragraphs preserved, single newlines -> <br/>
+    # plain text (no facets): paragraphs preserved, single newlines -> <br>
     assert comments[0]["content"] == "<p>A landmark of the genre.</p><p>Utterly humane.</p>"
 
     # lead line links the work with the ~neodb~ marker so peers localize it
