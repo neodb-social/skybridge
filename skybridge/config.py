@@ -53,6 +53,15 @@ WANTED_COLLECTIONS: tuple[str, ...] = (
     # (comments, like popfeed reactions) and buzz.bookhive.hiveBook /
     # buzz.bookhive.catalogBook (the app's catalog, not user activity).
     "buzz.bookhive.book",
+    # teal.fm (https://github.com/teal-fm/teal), a music scrobbler: one play
+    # record per track listened to. Bridged as ONE Note per (author, release)
+    # with a Status of complete — see translate.teal and pipeline._process_play.
+    # Both NSIDs are live: the alpha namespace is what pre-July-2026 trackers
+    # still write. Not bridged: fm.teal.actor.status (+alpha; "now playing",
+    # rkey self, rewritten every track), fm.teal.actor.profile and
+    # fm.teal.actor.profileStatus (identity/onboarding, not content).
+    "fm.teal.feed.play",
+    "fm.teal.alpha.feed.play",
     # Bluesky's "hide my posts from algorithmic recommendations" declaration
     # (rkey `self`). Carried onto the bridged Person as `discoverable: false`.
     # Watched network-wide, unlike app.bsky.actor.profile above, because it is
@@ -83,7 +92,7 @@ WANTED_KINDS: tuple[str, ...] = ("commit", "identity", "account")
 # `collections`). NOT used for ingestion: buzz.bookhive.* would pull in
 # high-volume catalogBook records carrying multi-KB author biographies that the
 # bridge has no use for. See WANTED_COLLECTIONS for what is actually ingested.
-DISCOVERY_COLLECTIONS: tuple[str, ...] = ("social.popfeed.*", "buzz.bookhive.*")
+DISCOVERY_COLLECTIONS: tuple[str, ...] = ("social.popfeed.*", "buzz.bookhive.*", "fm.teal.*")
 
 
 @dataclass(frozen=True)
@@ -120,7 +129,7 @@ class Settings:
     relay_key_pem: str | None = None
     relay_key_file: str = "data/relay_key.pem"
     relay_summary: str = (
-        "Skybridge mirrors activities from Atmosphere (e.g. popfeed, bookhive) to "
+        "Skybridge mirrors activities from Atmosphere (e.g. popfeed, bookhive, teal.fm) to "
         "the Fediverse in NeoDB-compatible format."
     )
     # External Fediverse relay inboxes we subscribe to as a client (Mastodon-

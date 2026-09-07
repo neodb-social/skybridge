@@ -1,7 +1,8 @@
 # 🌁 NeoDB Sky Bridge
 
-NeoDB Sky Bridge relays public AT Protocol records (e.g. popfeed and
-[BookHive](https://github.com/nperez0111/bookhive)) into the Fediverse
+NeoDB Sky Bridge relays public AT Protocol records (e.g. popfeed,
+[BookHive](https://github.com/nperez0111/bookhive) and
+[teal.fm](https://github.com/teal-fm/teal)) into the Fediverse
 as NeoDB-compatible ActivityPub activities. 
 
 Any AT Protocol user may opt out by themselves (verified via atproto OAuth).
@@ -202,9 +203,9 @@ Visibility preferences above): unlike a profile edit it is a rare, low-volume
 record, and like one it only ever updates an actor we already bridge.
 
 `uv run python -m skybridge discover` keeps this list honest: it subscribes to
-`social.popfeed.*` / `buzz.bookhive.*` (Jetstream v2 accepts namespace
-wildcards) and reports every collection seen, flagging the ones we don't
-bridge. Ingestion itself still asks for the explicit list — a wildcard
+`social.popfeed.*` / `buzz.bookhive.*` / `fm.teal.*` (Jetstream v2 accepts
+namespace wildcards) and reports every collection seen, flagging the ones we
+don't bridge. Ingestion itself still asks for the explicit list — a wildcard
 subscription would also pull in `buzz.bookhive.catalogBook`, whose records
 carry multi-KB author biographies we have no use for.
 
@@ -234,6 +235,58 @@ Known but not bridged:
   entries, not user activity)
 - the `cover` blob (a PDS blob, not a URL): no poster is derived yet, so the
   Note relies on the catalog-item tag for imagery
+
+### teal.fm
+
+[teal.fm](https://github.com/teal-fm/teal) is a music scrobbler on atproto:
+one `fm.teal.feed.play` record is written for every track a user listens to,
+naming the track, the artists and the release (album), with MusicBrainz ids
+(`mbid:<uuid>`) when the tracker could match them. Two NSIDs are live on the
+network and both are bridged: `fm.teal.feed.play` and the pre-July-2026
+`fm.teal.alpha.feed.play`, which older trackers still write; the record shapes
+agree on every field used here.
+
+The bridged work is the **release**, as a NeoDB `Album` (category `music`).
+Its identity is `releaseMbId`, exposed as a `https://musicbrainz.org/release/…`
+external resource that NeoDB resolves; when a play carries no MusicBrainz id
+but its `originUri` is an Apple Music track URL, the album id in that URL
+identifies the release instead (`https://music.apple.com/album/…`, also
+resolved by NeoDB). A play that names no release — only a recording id, or a
+Last.fm track page — mints no work and is archived without AP emission: NeoDB
+has no track item to mark, and a scrobbler makes many of these.
+
+A scrobbler writes one record per track, so bridging each play as its own Note
+would post a 12-track album twelve times. Plays are instead bridged as **ONE
+`Note` per (author, release)**:
+
+- The first play of a release publishes the Note (`Create`), anchored on that
+  play's rkey. Its content names only the album and the artists of that play
+  (never a track or a play count) and carries a `Status` of `complete`
+  (NeoDB's "listened"); there is no `Rating` and no `Comment`.
+- Every further play of the same release is archived, grouped on the same
+  work, and **sends nothing**: the Note is re-derived and compared with the
+  stored one (ignoring `updated` stamps), and an `Update` goes out only when
+  it actually differs — a release title that only a later play supplied, or a
+  visibility preference that changed since (re-derivation happens on the next
+  event for that release, not when the preference flips).
+- Deleting the anchoring play `Delete`s the Note; the newest surviving play of
+  the release re-publishes it under its own rkey. Deleting any other play just
+  re-derives the Note, which almost always changes nothing.
+
+| teal.fm record | becomes |
+|---|---|
+| `fm.teal.feed.play` / `fm.teal.alpha.feed.play` | one `Note` per (author, release): "Listened to *Album* by *Artists*" with a `Status` of `complete` `withRegardTo` the album; later plays of the same release are archived silently |
+
+`published` is the anchoring play's `playedTime` (a play has no `createdAt`).
+
+Known but not bridged:
+- `fm.teal.actor.status` / `fm.teal.alpha.actor.status` ("now playing": rkey
+  `self`, rewritten on every track, expiring ten minutes later)
+- `fm.teal.actor.profile` (display name + avatar blob; the bridged actor's
+  identity comes from the bsky profile fallback) and
+  `fm.teal.actor.profileStatus` (onboarding progress)
+- `recordingMbId` / `trackMbId` / `isrc`: track-level ids with no NeoDB item
+  type to land on
 
 ### Account lifecycle
 

@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from skybridge.config import get_settings
 from skybridge.db import session_scope
 from skybridge.models import Work, WorkIdentifier
-from skybridge.translate import bookhive
+from skybridge.translate import bookhive, teal
 
 # popfeed creativeWorkType -> NeoDB catalog category.
 WORK_TYPE_TO_CATEGORY: dict[str, str] = {
@@ -108,6 +108,10 @@ def external_resource_urls(work_type: str, identifiers: dict) -> list[str]:
         urls.append(f"https://musicbrainz.org/release-group/{identifiers['mbId']}")
     if identifiers.get("mbReleaseId"):
         urls.append(f"https://musicbrainz.org/release/{identifiers['mbReleaseId']}")
+    apple = identifiers.get("appleMusicAlbumId")
+    if apple and work_type in ("music", "album", "ep"):
+        # NeoDB resolves Apple Music album URLs (catalog/sites/apple_music.py).
+        urls.append(f"https://music.apple.com/album/{apple}")
     return urls
 
 
@@ -116,6 +120,8 @@ def external_resource_urls(work_type: str, identifiers: dict) -> list[str]:
 # across pressings) over mbReleaseId. BookHive's goodreadsId/hiveId rank after
 # the ISBNs so a book still merges with popfeed/NeoDB editions by ISBN first,
 # falling back to hiveId (always present on a BookHive book) when it has none.
+# A teal.fm play's Apple Music album id ranks after the MusicBrainz ids for the
+# same reason: a release identified on MusicBrainz should merge there first.
 _ID_PRIORITY = (
     "imdbId",
     "tmdbId",
@@ -128,6 +134,7 @@ _ID_PRIORITY = (
     "musicbrainzId",
     "mbId",
     "mbReleaseId",
+    "appleMusicAlbumId",
     "hiveId",
 )
 
@@ -248,13 +255,16 @@ def _effective_record(record: dict) -> dict:
     """The record whose work actually gets minted.
 
     A BookHive book is normalized to the generic ``book`` work shape (see
-    :mod:`skybridge.translate.bookhive`). Episode list-adds become season
-    activity (see :func:`season_view`); an episode that can't be resolved to a
-    season keeps its own tv_episode work, which the pipeline archives without
-    AP emission.
+    :mod:`skybridge.translate.bookhive`); a teal.fm play to a ``music`` work
+    for its release (see :mod:`skybridge.translate.teal`). Episode list-adds
+    become season activity (see :func:`season_view`); an episode that can't be
+    resolved to a season keeps its own tv_episode work, which the pipeline
+    archives without AP emission.
     """
     if bookhive.is_book(record):
         return bookhive.as_work_record(record)
+    if teal.is_play(record):
+        return teal.as_work_record(record)
     if record.get("creativeWorkType") == EPISODE_TYPE and str(record.get("$type", "")).endswith(
         "feed.listItem"
     ):
@@ -357,6 +367,14 @@ def mint(record: dict, *, session: Session | None = None) -> WorkRef | None:
             row.poster_url = ref.poster_url
         merged = {**json.loads(row.identifiers_json or "{}"), **identifiers}
         row.identifiers_json = json.dumps(merged)
+        # And the other way round: a record that names its work only by id
+        # (a teal.fm play with no releaseName, say) still gets the title the
+        # catalog entry learned from another record, so a Note re-derived
+        # from it names the work rather than falling back to a placeholder.
+        if row.title and not ref.title:
+            ref.title = row.title
+        if row.poster_url and not ref.poster_url:
+            ref.poster_url = row.poster_url
     for key, val in aliases:
         if session.get(WorkIdentifier, (ref.work_type, key, val)) is None:
             session.add(

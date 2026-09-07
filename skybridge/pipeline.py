@@ -21,7 +21,7 @@ from skybridge.atproto import events, identity
 from skybridge.config import get_settings
 from skybridge.db import session_scope
 from skybridge.models import BridgedActor, Record, utcnow
-from skybridge.translate import neodb, works
+from skybridge.translate import neodb, teal, works
 
 log = logging.getLogger("skybridge.pipeline")
 
@@ -302,6 +302,23 @@ async def process_event(
     record = event.get("record") or {}
     ref = works.mint(record)
 
+    if collection in teal.PLAY_COLLECTIONS:
+        # A scrobble: one Note per (author, release), not per play. See
+        # _process_play for the grouping rules.
+        return await _process_play(
+            at_uri=at_uri,
+            did=did,
+            collection=collection,
+            rkey=rkey,
+            handle=handle,
+            record=record,
+            ref=ref,
+            operation=operation,
+            seq=seq,
+            cid=event.get("cid"),
+            worker=worker,
+        )
+
     is_episode_work = ref is not None and ref.work_type == works.EPISODE_TYPE
     is_unresolved_episode = ref is None and record.get("creativeWorkType") == works.EPISODE_TYPE
     if is_episode_work or is_unresolved_episode:
@@ -539,7 +556,9 @@ def _pair_rows(did: str, work_key: str) -> tuple[Record | None, Record | None, R
 
 @dataclass
 class DerivedPair:
-    """A pair Note derived by :func:`_derive_pair`, not yet persisted."""
+    """A shared Note derived for one (author, work) — by :func:`_derive_pair`
+    for a review/listItem pair or by :func:`_derive_play_group` for a group of
+    teal.fm plays — not yet persisted."""
 
     anchor_uri: str
     stored_note_json: str | None  # the anchor's currently stored Note, if any
@@ -663,6 +682,207 @@ def _pair_trigger(did: str, work_key: str) -> str | None:
         if ap_object_json is not None:
             return at_uri
     return candidates[0][0] if candidates else None
+
+
+# --- teal.fm plays: one Note per (author, release) -------------------------
+#
+# A scrobbler writes one record per track, so bridging each play as its own
+# Note would post a 12-track album twelve times — to followers' timelines and
+# onto the item page of every NeoDB peer. Instead every active play of one
+# (author, release) shares ONE Note, anchored on the play that published it
+# first (/users/<handle>/posts/<rkey>). The Note's content names only the album
+# and its artists, never a track or a count, so a further play of the same
+# release derives an identical Note and sends NOTHING: an Update goes out only
+# when the derived Note actually differs (a release title that arrived late, a
+# changed visibility preference, a rename of the anchor). Deleting the anchor
+# Deletes the Note, and the newest surviving play re-publishes under its own
+# rkey; deleting any other play just re-derives (and almost always sends
+# nothing). A play whose release cannot be identified mints no work and is
+# archived without AP emission — NeoDB has no track item to mark.
+
+
+def _play_rows(did: str, work_key: str) -> list[Record]:
+    """Active plays of one (author, release), newest first.
+
+    Play rkeys are TIDs, which sort by write time as strings, so the first row
+    is the most recent play — the one that re-anchors the Note when the
+    current anchor is deleted.
+    """
+    with session_scope() as session:
+        return list(
+            session.scalars(
+                select(Record)
+                .where(
+                    Record.did == did,
+                    Record.work_key == work_key,
+                    Record.collection.in_(teal.PLAY_COLLECTIONS),
+                    Record.deleted_at.is_(None),
+                )
+                .order_by(Record.rkey.desc(), Record.at_uri.desc())
+            )
+        )
+
+
+def _play_holder(did: str, work_key: str, *, exclude_uri: str) -> Record | None:
+    """The play currently holding the group's published Note, other than
+    *exclude_uri*."""
+    return next(
+        (r for r in _play_rows(did, work_key) if r.ap_object_json and r.at_uri != exclude_uri),
+        None,
+    )
+
+
+def _without_volatile(obj: Any) -> Any:
+    """*obj* with every ``updated`` stamp removed, at any depth.
+
+    A re-derived Note differs from the stored one in ``updated`` (top level
+    and on each relatedWith facet) even when nothing else moved; that stamp
+    is the one thing that must not count as a change.
+    """
+    if isinstance(obj, dict):
+        return {k: _without_volatile(v) for k, v in obj.items() if k != "updated"}
+    if isinstance(obj, list):
+        return [_without_volatile(v) for v in obj]
+    return obj
+
+
+def _same_note(stored_json: str | None, note: dict) -> bool:
+    stored = _source_dict(stored_json) if stored_json else None
+    return stored is not None and _without_volatile(stored) == _without_volatile(note)
+
+
+def _derive_play_group(*, did: str, work_key: str, handle: str) -> DerivedPair | None:
+    """Derive the single Note for every active play of one (author, release).
+
+    Anchored on the play holding the published Note; with none published, the
+    newest play whose object id was never tombstoned becomes the anchor
+    (Create). Returns ``None`` when no active play remains.
+    """
+    rows = _play_rows(did, work_key)
+    if not rows:
+        return None
+    anchor = next((r for r in rows if r.ap_object_json), None)
+    operation = "update"
+    if anchor is None:
+        # Prefer an rkey whose object id peers never saw Deleted (a row in the
+        # pending-retraction shape carries a Delete and no Note); when every
+        # survivor is burned, reuse one — same known limit as _persist.
+        anchor = next(
+            (r for r in rows if not (r.ap_object_json is None and r.ap_activity_json)), rows[0]
+        )
+        operation = "create"
+    source = json.loads(anchor.source_json or "{}")
+    note, activity = neodb.translate(
+        did=did,
+        unlisted=_unlisted(did),
+        handle=handle,
+        collection=anchor.collection,
+        rkey=anchor.rkey,
+        record=source,
+        operation=operation,
+        event_time=None,
+        ref=works.mint(source),
+        prior_object_id=_stored_note_id(anchor.ap_object_json) if operation == "update" else None,
+    )
+    assert note is not None  # never a delete translation on this path
+    return DerivedPair(anchor.at_uri, anchor.ap_object_json, note, activity)
+
+
+def _sync_play_group(*, did: str, work_key: str, handle: str) -> DerivedPair | None:
+    """Re-derive the group's Note and persist it — only if it changed.
+
+    Returns ``None`` both when the group is empty and when the derived Note
+    equals the stored one apart from its ``updated`` stamps: nothing is
+    written and the caller sends nothing, which is what keeps a scrobbler's
+    every play from becoming an Update on the fediverse.
+    """
+    derived = _derive_play_group(did=did, work_key=work_key, handle=handle)
+    if derived is None:
+        return None
+    if derived.stored_note_json is not None and _same_note(derived.stored_note_json, derived.note):
+        return None
+    _update_ap(derived.anchor_uri, derived.note, derived.activity)
+    return derived
+
+
+async def _process_play(
+    *,
+    at_uri: str,
+    did: str,
+    collection: str,
+    rkey: str,
+    handle: str,
+    record: dict,
+    ref: works.WorkRef | None,
+    operation: str,
+    seq: int | None,
+    cid: str | None,
+    worker: DeliveryWorker | None,
+) -> Processed:
+    """Create/update of one teal.fm play; see the section comment above.
+
+    The play is archived first (keeping any Note this row already anchors),
+    then the Note of the release it now belongs to is re-derived, and so is
+    the Note of the release it left if an update moved it. A play that
+    anchors a Note but loses its release, or moves into a group whose Note
+    another play already holds, has its own Note retracted first — one
+    (author, release) must never end up with two published Notes.
+    """
+    note_id, prior_key = _prior_state(at_uri)
+    new_key = ref.work_key if ref is not None else None
+    retraction = None
+    if note_id is not None and (
+        new_key is None
+        or (prior_key != new_key and _play_holder(did, new_key, exclude_uri=at_uri) is not None)
+    ):
+        _, retraction = neodb.translate(
+            did=did,
+            unlisted=_unlisted(did),
+            handle=handle,
+            collection=collection,
+            rkey=rkey,
+            record=None,
+            operation="delete",
+            event_time=None,
+            prior_object_id=note_id,
+        )
+    _persist(
+        at_uri=at_uri,
+        did=did,
+        collection=collection,
+        rkey=rkey,
+        seq=seq,
+        cid=cid,
+        source=record,
+        note=None,
+        activity=retraction,
+        operation=operation,
+        work_key=new_key,
+        # The retraction replaces the stored AP forms (pending-Delete shape);
+        # otherwise the row keeps the Note it may anchor for _derive_play_group.
+        preserve_ap=retraction is None,
+    )
+    delivered = 0
+    if worker is not None and retraction is not None:
+        delivered += await fanout(worker, record_uri=at_uri, did=did, activity=retraction)
+    activity = retraction
+    if new_key is not None:
+        group = _sync_play_group(did=did, work_key=new_key, handle=handle)
+        if group is not None:
+            activity = group.activity
+            if worker is not None:
+                delivered += await fanout(
+                    worker, record_uri=group.anchor_uri, did=did, activity=group.activity
+                )
+    if prior_key and prior_key != new_key:
+        # The play left another release's group (an update re-identified it):
+        # that group may have lost its anchor and needs a survivor to publish.
+        prior_group = _sync_play_group(did=did, work_key=prior_key, handle=handle)
+        if worker is not None and prior_group is not None:
+            delivered += await fanout(
+                worker, record_uri=prior_group.anchor_uri, did=did, activity=prior_group.activity
+            )
+    return Processed(at_uri, operation, collection, activity or {}, delivered)
 
 
 def _update_ap(at_uri: str, note: dict | None, activity: dict | None) -> None:
@@ -1013,6 +1233,14 @@ async def _process_delete(
         delivered = 0
         if worker is not None:
             delivered = await fanout(worker, record_uri=at_uri, did=did, activity=activity)
+        if collection in teal.PLAY_COLLECTIONS and work_key:
+            # The anchor of a play group is gone: the newest surviving play of
+            # the same release re-publishes the group's Note under its own rkey.
+            group = _sync_play_group(did=did, work_key=work_key, handle=handle)
+            if worker is not None and group is not None:
+                delivered += await fanout(
+                    worker, record_uri=group.anchor_uri, did=did, activity=group.activity
+                )
         return Processed(at_uri, "delete", collection, activity, delivered)
 
     # Record without a Note of its own (merged into a pair Note, or archived
@@ -1029,6 +1257,10 @@ async def _process_delete(
     pair = None
     if collection in _PAIRED_COLLECTIONS and work_key and _contributes(collection, source):
         pair = _sync_pair(did=did, work_key=work_key, handle=handle, trigger_uri=at_uri)
+    elif collection in teal.PLAY_COLLECTIONS and work_key:
+        # A non-anchor play: the group's Note is re-derived from what remains
+        # and, its content not depending on this play, almost always unchanged.
+        pair = _sync_play_group(did=did, work_key=work_key, handle=handle)
     delivered = 0
     if worker is not None and pair is not None:
         delivered = await fanout(

@@ -33,7 +33,7 @@ from skybridge.atproto import identity
 from skybridge.config import get_settings
 from skybridge.db import session_scope
 from skybridge.models import Record
-from skybridge.translate import bookhive, richtext, works
+from skybridge.translate import bookhive, richtext, teal, works
 
 log = logging.getLogger("skybridge.translate")
 
@@ -140,7 +140,9 @@ def _published(record: dict, event_time: str | None) -> str:
     """Best-effort ISO-8601 published timestamp.
 
     popfeed records sometimes carry ``createdAt`` as an empty object; fall back
-    to the firehose event time and finally to *now*.
+    to the firehose event time and finally to *now*. A teal.fm play has no
+    ``createdAt`` at all: its ``playedTime`` is when playback began, which is
+    the moment the Note is about.
 
     The firehose value arrives as ISO-8601 already (Jetstream v2 sends it that
     way, and the v1/archive adapters render their epoch microseconds before
@@ -148,7 +150,7 @@ def _published(record: dict, event_time: str | None) -> str:
     integer/float round trip, which at ~1.8e15 microseconds sat close enough
     to float64's exact-integer limit to risk a microsecond of drift.
     """
-    created = record.get("createdAt") or record.get("addedAt")
+    created = record.get("createdAt") or record.get("addedAt") or record.get("playedTime")
     if isinstance(created, str) and created:
         return created
     if event_time:
@@ -310,6 +312,8 @@ def build_note(
     # feed.review in 2025 — is no longer bridged; see config.WANTED_COLLECTIONS.)
     if collection == bookhive.BOOK_COLLECTION:
         _populate_book(note, record, ref)
+    elif collection in teal.PLAY_COLLECTIONS:
+        _populate_play(note, record, ref)
     elif collection.endswith("feed.list"):
         _populate_list(note, record, handle, rkey, ref)
     elif collection.endswith("feed.listItem"):
@@ -473,6 +477,29 @@ def _populate_book(note: dict, record: dict, ref: works.WorkRef | None) -> None:
             note["relatedWith"].append(_related(note, "Comment", ref.url, {"content": review_html}))
         if status:
             note["relatedWith"].append(_related(note, "Status", ref.url, {"status": status}))
+
+
+def _populate_play(note: dict, record: dict, ref: works.WorkRef | None) -> None:
+    """Populate the Note for a teal.fm play, as the mark on its *release*.
+
+    One Note stands for every play of one (author, release) — see
+    ``pipeline._process_play`` — so the content must not depend on which
+    track or how many tracks were played: it names the album and the artists
+    of the anchoring play, nothing per-track, and carries a ``Status`` of
+    ``complete`` (NeoDB's "listened"). No Rating and no Comment: a scrobble
+    has neither.
+    """
+    title = (ref.title if ref is not None else None) or teal.release_title(record) or "an album"
+    artists = teal.artist_names(record)
+    lead = f"<p>Listened to {_title_html(title, ref)}"
+    if artists:
+        lead += f" by {html.escape(', '.join(artists))}"
+    note["content"] = lead + "</p>"
+
+    if ref is not None:
+        note["tag"].append(_work_tag(ref))
+        note["tag"].append({"type": "Hashtag", "name": f"#{works.category_for(ref.work_type)}"})
+        note["relatedWith"].append(_related(note, "Status", ref.url, {"status": "complete"}))
 
 
 def _populate_list(
