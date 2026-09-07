@@ -701,35 +701,57 @@ def _pair_trigger(did: str, work_key: str) -> str | None:
 # archived without AP emission — NeoDB has no track item to mark.
 
 
-def _play_rows(did: str, work_key: str) -> list[Record]:
-    """Active plays of one (author, release), newest first.
+def _active_plays(did: str, work_key: str):
+    """Base query: the active plays of one (author, release), newest first.
 
     Play rkeys are TIDs, which sort by write time as strings, so the first row
     is the most recent play — the one that re-anchors the Note when the
-    current anchor is deleted.
+    current anchor is deleted. Callers always add a ``LIMIT``: a heavy
+    listener's album can hold thousands of plays, and derivation needs one.
     """
-    with session_scope() as session:
-        return list(
-            session.scalars(
-                select(Record)
-                .where(
-                    Record.did == did,
-                    Record.work_key == work_key,
-                    Record.collection.in_(teal.PLAY_COLLECTIONS),
-                    Record.deleted_at.is_(None),
-                )
-                .order_by(Record.rkey.desc(), Record.at_uri.desc())
-            )
+    return (
+        select(Record)
+        .where(
+            Record.did == did,
+            Record.work_key == work_key,
+            Record.collection.in_(teal.PLAY_COLLECTIONS),
+            Record.deleted_at.is_(None),
         )
-
-
-def _play_holder(did: str, work_key: str, *, exclude_uri: str) -> Record | None:
-    """The play currently holding the group's published Note, other than
-    *exclude_uri*."""
-    return next(
-        (r for r in _play_rows(did, work_key) if r.ap_object_json and r.at_uri != exclude_uri),
-        None,
+        .order_by(Record.rkey.desc(), Record.at_uri.desc())
     )
+
+
+def _play_holder(did: str, work_key: str, *, exclude_uri: str | None = None) -> Record | None:
+    """The play currently holding the group's published Note (other than
+    *exclude_uri*, when given)."""
+    query = _active_plays(did, work_key).where(Record.ap_object_json.is_not(None))
+    if exclude_uri is not None:
+        query = query.where(Record.at_uri != exclude_uri)
+    with session_scope() as session:
+        return session.scalars(query.limit(1)).first()
+
+
+def _play_anchor(did: str, work_key: str) -> tuple[Record | None, str]:
+    """``(anchor, operation)`` for the group's Note; ``(None, ...)`` if empty.
+
+    The play holding the published Note anchors an ``update``. Otherwise the
+    newest play whose object id peers never saw Deleted anchors a ``create``
+    (a row in the pending-retraction shape carries a Delete and no Note);
+    when every survivor is burned, the newest one is reused — same known
+    limit as _persist. Three bounded queries, never the whole group.
+    """
+    holder = _play_holder(did, work_key)
+    if holder is not None:
+        return holder, "update"
+    with session_scope() as session:
+        fresh = session.scalars(
+            _active_plays(did, work_key)
+            .where(Record.ap_object_json.is_(None), Record.ap_activity_json.is_(None))
+            .limit(1)
+        ).first()
+        if fresh is not None:
+            return fresh, "create"
+        return session.scalars(_active_plays(did, work_key).limit(1)).first(), "create"
 
 
 def _without_volatile(obj: Any) -> Any:
@@ -756,21 +778,11 @@ def _derive_play_group(*, did: str, work_key: str, handle: str) -> DerivedPair |
 
     Anchored on the play holding the published Note; with none published, the
     newest play whose object id was never tombstoned becomes the anchor
-    (Create). Returns ``None`` when no active play remains.
+    (Create) — see _play_anchor. Returns ``None`` when no active play remains.
     """
-    rows = _play_rows(did, work_key)
-    if not rows:
-        return None
-    anchor = next((r for r in rows if r.ap_object_json), None)
-    operation = "update"
+    anchor, operation = _play_anchor(did, work_key)
     if anchor is None:
-        # Prefer an rkey whose object id peers never saw Deleted (a row in the
-        # pending-retraction shape carries a Delete and no Note); when every
-        # survivor is burned, reuse one — same known limit as _persist.
-        anchor = next(
-            (r for r in rows if not (r.ap_object_json is None and r.ap_activity_json)), rows[0]
-        )
-        operation = "create"
+        return None
     source = json.loads(anchor.source_json or "{}")
     # `playedTime` is optional in the lexicon. Without it `published` would
     # fall back to *now* on every derivation, differ every time, and turn each
