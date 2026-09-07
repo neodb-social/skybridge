@@ -305,6 +305,21 @@ def test_first_play_publishes_and_later_plays_of_the_release_send_nothing(settin
     assert _row(third.at_uri).work_key == anchor.work_key
 
 
+def test_plays_without_played_time_still_send_nothing_after_the_first(settings):
+    # playedTime is optional in the lexicon. Without it `published` must come
+    # from something fixed (the anchor's ingest time), or every re-derivation
+    # would differ by a fresh timestamp and each play would become an Update.
+    first = _run(_commit("3lplay000001", {k: v for k, v in PLAY.items() if k != "playedTime"}))
+    assert first is not None and first.activity["type"] == "Create"
+    before = _row(first.at_uri)
+    second = _run(_commit("3lplay000002", {k: v for k, v in PLAY_2.items() if k != "playedTime"}))
+    assert second is not None and second.activity == {} and second.delivered == 0
+    after = _row(first.at_uri)
+    assert after.ap_object_json == before.ap_object_json
+    assert after.ap_activity_json == before.ap_activity_json
+    assert _row(second.at_uri).ap_object_json is None
+
+
 def test_a_different_release_gets_its_own_note(settings):
     _run(_commit("3lplay000001", PLAY))
     other = _run(_commit("3lplay000002", APPLE_PLAY))

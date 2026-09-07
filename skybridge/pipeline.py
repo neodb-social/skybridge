@@ -772,6 +772,13 @@ def _derive_play_group(*, did: str, work_key: str, handle: str) -> DerivedPair |
         )
         operation = "create"
     source = json.loads(anchor.source_json or "{}")
+    # `playedTime` is optional in the lexicon. Without it `published` would
+    # fall back to *now* on every derivation, differ every time, and turn each
+    # further play into an Update — so the anchor row's own (fixed) ingest
+    # time is the fallback instead. SQLite hands the column back naive.
+    ingested = anchor.created_at
+    if ingested.tzinfo is None:
+        ingested = ingested.replace(tzinfo=UTC)
     note, activity = neodb.translate(
         did=did,
         unlisted=_unlisted(did),
@@ -780,7 +787,7 @@ def _derive_play_group(*, did: str, work_key: str, handle: str) -> DerivedPair |
         rkey=anchor.rkey,
         record=source,
         operation=operation,
-        event_time=None,
+        event_time=ingested.isoformat(),
         ref=works.mint(source),
         prior_object_id=_stored_note_id(anchor.ap_object_json) if operation == "update" else None,
     )

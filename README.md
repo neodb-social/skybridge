@@ -277,7 +277,14 @@ would post a 12-track album twelve times. Plays are instead bridged as **ONE
 |---|---|
 | `fm.teal.feed.play` / `fm.teal.alpha.feed.play` | one `Note` per (author, release): "Listened to *Album* by *Artists*" with a `Status` of `complete` `withRegardTo` the album; later plays of the same release are archived silently |
 
-`published` is the anchoring play's `playedTime` (a play has no `createdAt`).
+`published` is the anchoring play's `playedTime` (a play has no `createdAt`),
+falling back to the bridge's own ingest time of that play when it is absent.
+
+One consequence of "later plays send nothing" for imports: a history import
+that does not deliver (the default) publishes each album's Note silently, and
+because every later live play of that album derives the same Note, nothing
+ever sends it. Those albums federate only through an import that delivers, or
+once something about the Note actually changes.
 
 Known but not bridged:
 - `fm.teal.actor.status` / `fm.teal.alpha.actor.status` ("now playing": rkey
