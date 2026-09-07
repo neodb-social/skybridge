@@ -43,12 +43,31 @@ def test_plain_text_keeps_paragraph_and_line_breaks():
     assert review_html("one\ntwo\n\n\nthree") == "<p>one<br>two</p><p>three</p>"
 
 
-def test_no_html_sniffing_a_plain_review_is_still_escaped():
-    # A body with no markup at all must not have its stray < swallowed: the
-    # sanitizer is unconditional, so there is no heuristic to misfire here.
+def test_stray_angle_brackets_in_prose_are_escaped():
     assert review_html("I love <3 this, and 5 < 6 & 7 > 2") == (
         "<p>I love &lt;3 this, and 5 &lt; 6 &amp; 7 &gt; 2</p>"
     )
+
+
+def test_a_bracketed_url_is_prose_not_a_tag():
+    # `https` names no element, so this is text. Reading it as a tag deletes
+    # the author's URL instead of showing it.
+    assert review_html("More: <https://example.com/review>") == (
+        "<p>More: &lt;https://example.com/review&gt;</p>"
+    )
+
+
+def test_a_bracketed_aside_is_prose_not_a_tag():
+    # A real bridged review opens with this; `insert` names no element.
+    assert review_html("<insert witty joke here>\n\nOn to the film.") == (
+        "<p>&lt;insert witty joke here&gt;</p><p>On to the film.</p>"
+    )
+
+
+def test_a_real_element_name_is_markup_even_when_we_drop_it():
+    # The flip side, also from a real bridged review: `div` is an element, so
+    # it belongs to the sanitizer rather than on the page as literal text.
+    assert review_html("<div>A great choice.</div>") == "A great choice."
 
 
 @pytest.mark.parametrize(
@@ -72,10 +91,28 @@ def test_script_and_style_lose_their_content_too():
     assert review_html("<style>body{color:red}</style>ok") == "<p>ok</p>"
 
 
-def test_event_handlers_and_unknown_tags_are_dropped():
+def test_event_handlers_and_non_allowlisted_elements_are_dropped():
     assert review_html("<img src=x onerror=alert(1)>text") == "<p>text</p>"
     assert review_html('<b class="x" onclick="y()">bold</b>') == "<p><b>bold</b></p>"
-    assert review_html("<marquee>scroll</marquee>") == "<p>scroll</p>"
+    assert review_html("<h1>shouting</h1>") == "shouting"
+
+
+def test_a_newline_inside_a_tag_does_not_break_it():
+    # Line breaks belong in text, never inside markup: substituting one into
+    # the tag would leave the attributes behind as visible text.
+    assert review_html('<a\nhref="https://example.com">link</a>') == (
+        '<p><a href="https://example.com" rel="nofollow noopener">link</a></p>'
+    )
+
+
+def test_a_blank_line_inside_an_inline_element_splits_cleanly():
+    assert review_html("<i>a\n\nb</i>") == "<p><i>a</i></p><p><i>b</i></p>"
+
+
+def test_a_body_trailing_off_mid_tag_keeps_its_text():
+    # Nothing closes this tag, so it was never markup; the characters the
+    # author typed survive rather than being swallowed as a tag name.
+    assert review_html("I rated it <b") == "<p>I rated it &lt;b</p>"
 
 
 def test_output_is_well_formed_despite_unclosed_and_nested_blocks():
