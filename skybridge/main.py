@@ -320,12 +320,18 @@ async def user_outbox(ident: str) -> Response:
 
 # Records stored before render_facets validated link schemes may carry unsafe
 # hrefs (e.g. javascript:). Every href the translator emits today is validated
-# at render time (render_facets, translate.richtext) so this only cleans up
-# already-stored content, and it matches by regex because that generated HTML
-# always double-quotes its attributes. The one false positive it accepts: a
-# review body whose *text* mentions href="..." keeps its quotes unescaped
-# through the sanitizer, so the literal mention is dropped from this page.
-_UNSAFE_HREF = re.compile(r'\bhref="(?!https?://)[^"]*"')
+# at render time (render_facets, translate.richtext), so this only cleans up
+# already-stored content; it matches by regex because that generated HTML
+# always double-quotes its attributes.
+#
+# It has to match inside an anchor tag rather than anywhere in the fragment: a
+# review body that *mentions* href="..." in its prose keeps those quotes as a
+# text node (the sanitizer escapes < > and & there, not quotes), and stripping
+# that would eat the author's words. Anchoring on <a and forbidding > in
+# between cannot reach a text node, since text nodes carry no unescaped >.
+# The scheme test is case-insensitive to agree with the sanitizer, which
+# accepts HTTPS:// and leaves the case as the author wrote it.
+_UNSAFE_HREF = re.compile(r'(<a\b[^>]*?\s)href="(?!https?://)[^"]*"', re.IGNORECASE)
 
 
 def _plain_text(fragment: str) -> str:
@@ -521,7 +527,8 @@ def _post_page_ctx(obj: dict[str, Any], ident: str, at_uri: str) -> dict[str, An
                 "image": tag.get("image"),
                 "type": tag.get("type"),
             }
-    content = _UNSAFE_HREF.sub("", obj.get("content", ""))
+    # Keeps the opening <a (group 1), drops only its href.
+    content = _UNSAFE_HREF.sub(r"\1", obj.get("content", ""))
     if obj.get("sensitive"):
         description = obj.get("summary") or "Sensitive content"
     else:

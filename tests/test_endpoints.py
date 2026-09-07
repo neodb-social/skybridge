@@ -491,6 +491,26 @@ def test_post_html_page_scrubs_unsafe_hrefs_in_stored_content(client):
     assert ">click</a>" in page
 
 
+def test_post_html_page_keeps_safe_hrefs_and_href_like_prose(client):
+    # The scrub above must not overreach. A sanitized review body keeps the
+    # link case its author wrote, and keeps quotes in its text nodes, so a
+    # scheme-sensitive or tag-blind scrub would eat both of these.
+    handle, rkey = _a_published_review()
+    with session_scope() as session:
+        rec = session.scalar(select(Record).where(Record.rkey == rkey))
+        assert rec is not None
+        assert rec.ap_object_json is not None
+        obj = json.loads(rec.ap_object_json)
+        obj["content"] += (
+            '<p><a href="HTTPS://example.com/x" rel="nofollow noopener">link</a>'
+            ' and the tag uses href="/chapter" here.</p>'
+        )
+        rec.ap_object_json = json.dumps(obj)
+    page = client.get(f"/users/{handle}/posts/{rkey}").text
+    assert 'href="HTTPS://example.com/x"' in page
+    assert 'uses href="/chapter" here.' in page
+
+
 def test_unknown_post_html_page_is_404(client):
     handle = _a_bridged_handle()
     r = client.get(f"/users/{handle}/posts/nope")
