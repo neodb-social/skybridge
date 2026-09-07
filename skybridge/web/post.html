@@ -58,8 +58,11 @@
       <span class="muted">· @{{ handle }}@{{ settings.domain }}</span>
     </p>
     {% if title %}<h2>{{ title }}</h2>{% endif %}
-    {# content is server-generated HTML: all user text is escaped by the
-       translator (render_facets / _title_html), so it is safe to embed. #}
+    {# content is server-generated HTML. The translator escapes the text it
+       lays out itself (render_facets / _title_html) and runs review bodies,
+       which arrive as the writing app's HTML, through translate.richtext's
+       allowlist sanitizer. That sanitizer is this page's XSS boundary: AP
+       peers re-sanitize what we send them, we cannot. #}
     {% if sensitive %}
     <details>
       <summary>{{ summary or "Sensitive content" }}</summary>

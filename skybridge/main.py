@@ -319,9 +319,12 @@ async def user_outbox(ident: str) -> Response:
 
 
 # Records stored before render_facets validated link schemes may carry unsafe
-# hrefs (e.g. javascript:). The translator double-quotes attributes and
-# html.escape()s all user text, so attribute matching by regex is reliable on
-# this generated HTML.
+# hrefs (e.g. javascript:). Every href the translator emits today is validated
+# at render time (render_facets, translate.richtext) so this only cleans up
+# already-stored content, and it matches by regex because that generated HTML
+# always double-quotes its attributes. The one false positive it accepts: a
+# review body whose *text* mentions href="..." keeps its quotes unescaped
+# through the sanitizer, so the literal mention is dropped from this page.
 _UNSAFE_HREF = re.compile(r'\bhref="(?!https?://)[^"]*"')
 
 

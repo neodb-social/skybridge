@@ -118,6 +118,19 @@ def test_book_becomes_rating_comment_and_status(settings):
     assert note["published"] == BOOK["createdAt"]
 
 
+def test_editor_line_breaks_in_a_review_stay_markup(settings):
+    # BookHive's rich-text editor writes line breaks into `review` as literal
+    # <br>, so escaping the body put &lt;br&gt; on the wire (see
+    # translate.richtext); the tags belong to the markup, not to the text.
+    record = {**BOOK, "review": "Read the first one last year.<br><br>A children's book."}
+    note, _ = _translate(record, rkey="bk-br")
+    assert note is not None
+    body = "<p>Read the first one last year.<br><br>A children's book.</p>"
+    assert note["content"].endswith(body)
+    comments = [r for r in note["relatedWith"] if r["type"] == "Comment"]
+    assert comments and comments[0]["content"] == body
+
+
 def test_status_only_book_has_no_rating_or_comment(settings):
     note, _ = _translate(WANT_TO_READ)
     assert note is not None

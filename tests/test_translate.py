@@ -401,6 +401,36 @@ def test_review_becomes_rating_and_comment(settings):
     assert activity["type"] == "Create"
 
 
+def test_letterboxd_imported_review_keeps_its_markup(settings):
+    # popfeed's Letterboxd importer writes that site's HTML into `text` and
+    # leaves `facets` empty; escaping it would show the tag names to readers.
+    record = {
+        **REVIEW,
+        "text": 'reminded me of <a href="http://letterboxd.com/film/moon/"><i>Moon</i></a>',
+        "facets": [],
+    }
+    ref = works.work_ref(record)
+    note, _ = neodb.translate(
+        did="did:plc:abc",
+        handle="alice.test",
+        collection="social.popfeed.feed.review",
+        rkey="rv-lb",
+        record=record,
+        operation="create",
+        event_time=None,
+        ref=ref,
+    )
+    assert note is not None
+    body = (
+        "<p>reminded me of "
+        '<a href="http://letterboxd.com/film/moon/" rel="nofollow noopener">'
+        "<i>Moon</i></a></p>"
+    )
+    assert note["content"].endswith(body)
+    comments = [r for r in note["relatedWith"] if r["type"] == "Comment"]
+    assert comments and comments[0]["content"] == body
+
+
 def test_review_content_link_carries_neodb_marker_but_tag_href_does_not(settings):
     # NeoDB peers rewrite href="https://domain/~neodb~/path" in incoming post
     # content so their readers land on their own instance's copy of the work
