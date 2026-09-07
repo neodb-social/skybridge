@@ -14,6 +14,10 @@ marks while generic Mastodon servers still render the base ``Note``):
 * The work link in Note ``content`` carries NeoDB's ``/~neodb~/`` URL marker
   so peer instances localize it for their readers; ``tag`` hrefs stay
   unmarked.
+* Every user string we lay out ourselves (titles, list names) is escaped, but
+  a *review body* is the writing app's own HTML in practice, so it goes
+  through :mod:`skybridge.translate.richtext`'s allowlist sanitizer instead
+  (see :func:`_review_body`).
 """
 
 from __future__ import annotations
@@ -29,7 +33,7 @@ from skybridge.atproto import identity
 from skybridge.config import get_settings
 from skybridge.db import session_scope
 from skybridge.models import Record
-from skybridge.translate import bookhive, works
+from skybridge.translate import bookhive, richtext, works
 
 log = logging.getLogger("skybridge.translate")
 
@@ -345,6 +349,22 @@ def _title_html(title: str, ref: works.WorkRef | None) -> str:
     return f"<strong>{html.escape(title)}</strong>"
 
 
+def _review_body(text: str, facets: list[dict] | None = None) -> str:
+    """Render a review body into HTML.
+
+    Two mutually exclusive shapes reach us. A record with ``facets`` declares
+    its text to be atproto richtext, so it renders through
+    :func:`render_facets` and every character is escaped — facet indices are
+    byte offsets into the raw text, so markup inside it would shift them and
+    the link spans would land on the wrong words. A record without facets may
+    carry the writing app's editor HTML (see :mod:`skybridge.translate.richtext`),
+    so it goes through the sanitizer instead.
+    """
+    if facets:
+        return render_facets(text, facets)
+    return richtext.review_html(text)
+
+
 def _populate_review(
     note: dict, record: dict, ref: works.WorkRef | None, shelf_status: str | None = None
 ) -> None:
@@ -364,7 +384,7 @@ def _populate_review(
         lead = f"<p>Rated {_title_html(title, ref)} {rating:g}/{_RATING_BEST}</p>"
     else:
         lead = f"<p>Reviewed {_title_html(title, ref)}</p>"
-    text_html = render_facets(text, record.get("facets")) if text else ""
+    text_html = _review_body(text, record.get("facets")) if text else ""
     note["content"] = lead + text_html
     if record.get("containsSpoilers"):
         # Mastodon renders ``summary`` as the content warning text.
@@ -407,16 +427,6 @@ _BOOK_STATUS_LEAD = {
 }
 
 
-def _plain_html(text: str) -> str:
-    """Render BookHive's plain-text review (no atproto facets) into HTML,
-    escaping it and preserving paragraph and line breaks."""
-    paragraphs = [p for p in re.split(r"\n{2,}", text.strip()) if p.strip()]
-    return "".join(
-        "<p>" + "<br/>".join(html.escape(line) for line in para.split("\n")) + "</p>"
-        for para in paragraphs
-    )
-
-
 def _populate_book(note: dict, record: dict, ref: works.WorkRef | None) -> None:
     """Populate the Note for a ``buzz.bookhive.book`` record.
 
@@ -440,7 +450,8 @@ def _populate_book(note: dict, record: dict, ref: works.WorkRef | None) -> None:
         lead = f"<p>{_BOOK_STATUS_LEAD[status]} {_title_html(title, ref)}</p>"
     else:
         lead = f"<p>Added {_title_html(title, ref)}</p>"
-    review_html = _plain_html(review) if review else ""
+    # BookHive carries no facets: the review is editor HTML (see _review_body).
+    review_html = _review_body(review) if review else ""
     note["content"] = lead + review_html
 
     # As with reviews, the cover rides on the catalog-item tag, not as media.
