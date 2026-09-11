@@ -53,7 +53,7 @@
     <p class="muted">Find this item on a NeoDB server:</p>
     <ul>
       {% for peer in peers %}
-      <li><a href="{{ peer.url }}">{{ peer.name }}</a></li>
+      <li><a href="{{ peer.url }}" rel="nofollow">{{ peer.name }}</a></li>
       {% endfor %}
     </ul>
     {% endif %}

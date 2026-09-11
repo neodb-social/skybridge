@@ -406,7 +406,7 @@ def test_work_html_page_links_neodb_servers(client, settings):
     finally:
         neodb_servers.set_servers([])
     url = quote(settings.catalog_id("movie", "imdbId-tt6710474"), safe="")
-    assert f'<a href="https://neodb.social/search?q={url}">NeoDB</a>' in page
+    assert f'<a href="https://neodb.social/search?q={url}" rel="nofollow">NeoDB</a>' in page
     assert f"https://{settings.domain}/search?q=" not in page
 
 
