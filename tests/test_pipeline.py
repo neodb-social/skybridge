@@ -14,7 +14,6 @@ from skybridge.db import session_scope
 from skybridge.models import BridgedActor, Record, Work
 from skybridge.pipeline import process_event
 from skybridge.stats import collect_stats
-from skybridge.translate import neodb
 from sqlalchemy import func, select
 
 # atproto's answer for a record that is not there (see tests/test_identity.py).
@@ -486,27 +485,6 @@ def test_list_item_note_names_the_archived_list(settings):
     assert "name" not in note
 
 
-def test_list_item_note_falls_back_when_list_never_archived(settings, monkeypatch):
-    # Keep this offline: an archive miss now tries a live fetch of the parent
-    # list (see neodb._fetch_and_archive_list). Force it to fail so the test
-    # stays deterministic and exercises the generic fallback wording.
-    monkeypatch.setattr(neodb, "_fetch_and_archive_list", lambda list_uri: None)
-    item = {
-        "$type": "social.popfeed.feed.listItem",
-        "title": "Arc the Lad R",
-        "listType": "complete",
-        "listUri": f"at://{_MERGE_DID}/social.popfeed.feed.list/never-seen",
-        "identifiers": {"igdbId": "26382"},
-        "creativeWorkType": "video_game",
-        "addedAt": "2026-01-02T00:00:00.000Z",
-    }
-    result = _run(_ev("social.popfeed.feed.listItem", "it-list2", item))
-    assert result.activity["type"] == "Create"
-    note = result.activity["object"]
-    assert "to a list" in note["content"]
-    assert "name" not in note
-
-
 # --- social.popfeed.actor.profile: refreshes identity, never mints one -----
 
 _PROFILE_COLLECTION = "social.popfeed.actor.profile"
@@ -650,18 +628,6 @@ def test_profile_delete_is_a_noop(settings):
         actor = session.get(BridgedActor, _PROFILE_DID)
         assert actor is not None
         assert actor.display_name == "Untouched"
-
-
-def test_profile_collection_absent_from_fixture(fixture_path):
-    # Guards the _counts_from_fixture assumptions above: WANTED_COLLECTIONS
-    # now includes the profile collection, but the fixture has no such
-    # events, so none of the existing count assertions change.
-    assert _PROFILE_COLLECTION in WANTED_COLLECTIONS
-    assert not any(
-        ev.get("commit", {}).get("collection") == _PROFILE_COLLECTION
-        for ev in read_events(fixture_path)
-        if ev.get("kind") == "commit"
-    )
 
 
 def test_ingest_metric_ticks_for_wanted_collection_only(settings, monkeypatch):

@@ -10,6 +10,7 @@ def test_is_valid_identifier():
     assert auth.is_valid_identifier("did:plc:i6k6scfcdaup4e2va33nkprb")
     assert auth.is_valid_identifier("did:web:example.com")
     assert not auth.is_valid_identifier("not a handle!")
+    assert not auth.is_valid_identifier("' OR 1=1 --")
     assert not auth.is_valid_identifier("nodots")
     assert not auth.is_valid_identifier("a" * 300 + ".com")
     assert not auth.is_valid_identifier("did:plc:" + "x" * 600)
@@ -28,12 +29,6 @@ def test_is_valid_identifier_rejects_special_use_hosts():
     assert not auth.is_valid_identifier("did:web:localhost%3A8443")
     assert not auth.is_valid_identifier("did:web:single-label")
     assert auth.is_valid_identifier("did:web:pds.example.com%3A8443:alice")
-
-
-def test_invalid_identifiers_rejected_before_any_network():
-    # oauth.start_flow gates on is_valid_identifier before resolving
-    assert not auth.is_valid_identifier("not a handle!")
-    assert not auth.is_valid_identifier("' OR 1=1 --")
 
 
 def test_is_public_https_rejects_unsafe_endpoints():

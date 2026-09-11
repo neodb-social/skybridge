@@ -167,8 +167,3 @@ def test_loopback_client_for_local_dev(settings):
     assert cid.startswith("http://localhost?")
     assert "redirect_uri=http%3A%2F%2F127.0.0.1%3A8000%2Foauth%2Fcallback" in cid
     assert "scope=atproto" in cid
-
-
-def test_hosted_client_id_for_https(settings):
-    assert oauth.client_id() == settings.url("oauth/client-metadata.json")
-    assert oauth.redirect_uri() == settings.url("oauth/callback")

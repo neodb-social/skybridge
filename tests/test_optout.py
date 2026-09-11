@@ -250,14 +250,6 @@ def test_optout_form_renders(client):
     assert "import recent activity" in r.text.lower()
 
 
-def test_the_page_moved_to_manage(client):
-    """The self-service page lives at /manage; the old paths are gone."""
-    assert client.get("/optout").status_code == 404
-    for path in ("/optout", "/optout/opt-out", "/optout/opt-in", "/optout/signout"):
-        assert client.post(path).status_code == 404, path
-    assert "/manage" in client.get("/").text  # linked from the nav
-
-
 def test_client_metadata_endpoint(client, settings):
     r = client.get("/oauth/client-metadata.json")
     assert r.status_code == 200

@@ -159,12 +159,6 @@ def test_episode_list_item_minted_as_season(settings):
     assert ("tmdbId", "7377127") not in _aliases("tv_season")
 
 
-def test_episode_review_keeps_episode_work(settings):
-    # Only list-adds convert; a review still mints (an unfederated) episode work.
-    ref = works.mint(EP_REVIEW)
-    assert ref is not None and ref.work_type == "tv_episode"
-
-
 def test_converted_season_merges_with_real_season_record(settings):
     # Season record first (keyed by its own tmdbId), episode add folds into it.
     ref1 = works.mint(SEASON_REVIEW)

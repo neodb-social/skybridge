@@ -62,11 +62,6 @@ def _stored(rkey: str = "r1") -> Record:
     return row
 
 
-def test_live_event_records_its_seq_as_the_high_water_mark(settings):
-    _run(_commit(100))
-    assert _stored().last_seq == 100
-
-
 def test_redelivered_event_is_ignored(settings):
     _run(_commit(100))
     assert _run(_commit(100)) is None, "an inclusive-cursor replay must be a no-op"

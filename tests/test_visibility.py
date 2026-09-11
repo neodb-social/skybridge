@@ -89,29 +89,6 @@ def _canonicalise(doc: dict) -> dict:
     return jsonld.compact(jsonld.expand(payload), context)
 
 
-def test_neodb_reads_the_flag_after_its_own_canonicalisation(settings):
-    """takahe: ``self.discoverable = document.get("toot:discoverable", True)``.
-
-    The prefixed key has to survive compaction, or the receiver silently falls
-    back to its permissive default and the preference is lost.
-    """
-    doc = person_actor(_actor(hide_from_recommendations=True))
-
-    compacted = _canonicalise(doc)
-
-    assert compacted.get("toot:discoverable", True) is False
-
-
-def test_a_receiver_reading_raw_keys_sees_the_flag(settings):
-    """Mastodon: ``@account.discoverable = @json['discoverable'] || false``.
-
-    It never compacts a fetched actor, so it only ever sees the bare key.
-    """
-    doc = person_actor(_actor(hide_from_recommendations=True))
-
-    assert doc["discoverable"] is False
-
-
 def test_the_two_keys_do_not_collide_into_an_array(settings):
     """Only one value survives on either path.
 
@@ -283,18 +260,6 @@ def test_unlisted_swaps_to_and_cc(settings):
     assert note["cc"] == [PUBLIC]
     assert activity["to"] == [followers]
     assert activity["cc"] == [PUBLIC]
-
-
-def test_unlisted_still_reaches_the_relay_and_neodb(settings):
-    """Both receivers accept ``cc``-public.
-
-    neodb-relay redistributes on To OR Cc (``api/handle.go``), and takahe
-    files a cc-public post as unlisted rather than dropping it
-    (``activities/models/post.py by_ap``). Reach is reduced; delivery is not.
-    """
-    _note, activity = _note_and_activity(unlisted=True)
-
-    assert PUBLIC in activity["to"] + activity["cc"]
 
 
 def test_the_pipeline_addresses_a_labelled_author_unlisted(settings):

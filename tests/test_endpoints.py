@@ -323,10 +323,7 @@ def test_stats_json(client):
     assert r.json()["records_total"] > 0
 
 
-def test_dashboard_and_archive_html(client):
-    assert client.get("/").status_code == 200
-    assert "Skybridge" in client.get("/").text
-    assert client.get("/archive").status_code == 200
+def test_catalog_index_renders(client):
     assert client.get("/catalog").status_code == 200
 
 

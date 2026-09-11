@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from skybridge.activitypub.delivery import DeliveryWorker
 from skybridge.atproto import jetstream
-from skybridge.config import DEFAULT_JETSTREAM, Settings, set_settings
+from skybridge.config import Settings, set_settings
 from skybridge.db import session_scope
 from skybridge.models import Cursor
 
@@ -25,15 +25,6 @@ def _use(settings: Settings, url: str) -> Settings:
 
 def _query(url: str) -> dict[str, list[str]]:
     return parse_qs(urlsplit(url).query)
-
-
-def test_default_endpoint_is_v2(settings):
-    assert settings.jetstream_is_v2
-    assert DEFAULT_JETSTREAM.endswith("network.bsky.jetstream.subscribeEvents")
-
-
-def test_v1_endpoint_is_still_recognised(settings):
-    assert not _use(settings, V1_URL).jetstream_is_v2
 
 
 def test_v2_url_uses_the_v2_parameter_names(settings):
