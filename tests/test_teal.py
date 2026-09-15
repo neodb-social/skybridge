@@ -678,6 +678,40 @@ def test_an_upgraded_database_indexes_the_session_columns(settings):
     assert wanted <= names
 
 
+def test_replaying_an_untimed_play_keeps_its_first_seen_time(settings):
+    # A play without playedTime is dated when the bridge first saw it. A
+    # replay must not re-date it to now: that moves the anchor's `published`,
+    # which reads as a real change and sends an Update nothing asked for.
+    untimed = {k: v for k, v in PLAY.items() if k != "playedTime"}
+    first = _run(_commit("3lplay000001", untimed))
+    assert first is not None and first.activity["type"] == "Create"
+    before = _row(first.at_uri)
+    assert before.played_at is not None
+
+    replay = _run(_commit("3lplay000001", untimed, "update"))
+    assert replay is not None and replay.activity == {}
+    after = _row(first.at_uri)
+    assert after.played_at == before.played_at
+    assert after.ap_object_json == before.ap_object_json
+
+
+def test_played_time_offsets_are_compared_in_utc(settings):
+    # SQLite drops the offset of a DATETIME, so a play stamped in a non-UTC
+    # zone has to be converted before it is stored, or it reads back hours
+    # adrift and lands in the wrong session. Two plays exactly 14 days apart,
+    # both at -10:00, are one session.
+    start = {**PLAY, "playedTime": "2026-09-01T00:00:00-10:00"}
+    fortnight = {**PLAY_2, "playedTime": "2026-09-15T00:00:00-10:00"}
+    first = _run(_commit("3lplay000001", start))
+    assert first is not None and first.activity["type"] == "Create"
+    assert _row(first.at_uri).played_at == datetime(2026, 9, 1, 10, 0, tzinfo=UTC).replace(
+        tzinfo=None
+    )
+    second = _run(_commit("3lplay000009", fortnight))
+    assert second is not None and second.activity == {}
+    assert _row(second.at_uri).play_group == _row(first.at_uri).play_group
+
+
 def test_a_real_change_is_not_held_back_by_the_refresh_interval(settings):
     # The release name arrives only with the second play, minutes after the
     # first: a changed Note goes out at once, throttle or no throttle.

@@ -742,8 +742,15 @@ def _play_time(record: dict, fallback: datetime) -> datetime:
 
 
 def _aware(moment: datetime) -> datetime:
-    """A timestamp as UTC-aware: SQLite hands a DATETIME column back naive."""
-    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+    """A timestamp as UTC-aware.
+
+    SQLite stores a DATETIME as text with no offset and hands it back naive,
+    so an aware value has to be converted to UTC BEFORE it is written or its
+    local clock time would read back as UTC — a play stamped 00:00-10:00 would
+    come back ten hours early and land in the wrong session. A naive value is
+    one that already came out of the database, and is UTC by that same rule.
+    """
+    return moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
 
 
 def _row_play_time(row: Record) -> datetime:
@@ -810,19 +817,34 @@ def _play_group(*, did: str, work_key: str, rkey: str, at_uri: str, played: date
     return f"{work_key}#{rkey}"
 
 
-def _prior_play_state(at_uri: str) -> tuple[str | None, str | None, str | None]:
-    """(published Note id, play_group, work_key) of a play before this event.
+@dataclass
+class PriorPlay:
+    """What an archived play already held, before the event now in hand."""
+
+    note_id: str | None = None
+    play_group: str | None = None
+    work_key: str | None = None
+    played_at: datetime | None = None
+
+
+def _prior_play_state(at_uri: str) -> PriorPlay:
+    """What :func:`_process_play` needs to know about the play it is replacing.
 
     The play equivalent of :func:`_prior_state`, which reports the work alone:
     a play's Note is shared per session, so the session is the key the
-    retraction and re-derivation paths need, and the work says whether that
-    session still applies.
+    retraction and re-derivation paths need, the work says whether that session
+    still applies, and the play time is what an update must not invent afresh.
     """
     with session_scope() as session:
         row = session.get(Record, at_uri)
         if row is None or row.deleted_at is not None:
-            return None, None, None
-        return _stored_note_id(row.ap_object_json), row.play_group, row.work_key
+            return PriorPlay()
+        return PriorPlay(
+            _stored_note_id(row.ap_object_json),
+            row.play_group,
+            row.work_key,
+            _row_play_time(row),
+        )
 
 
 def _active_plays(did: str, play_group: str):
@@ -1002,17 +1024,22 @@ async def _process_play(
     play already holds, has its own Note retracted first — one session must
     never end up with two published Notes.
     """
-    note_id, prior_group, prior_work_key = _prior_play_state(at_uri)
-    played = _play_time(record, utcnow())
+    prior = _prior_play_state(at_uri)
+    note_id = prior.note_id
+    # A play without `playedTime` counts as played when the bridge first saw
+    # it — and keeps that moment through every later update and replay. Taking
+    # *now* again would move the anchor's `published`, which reads as a real
+    # change to the Note and sends an Update a replay has no business sending.
+    played = _play_time(record, prior.played_at or utcnow())
     if ref is None:
         new_group = None
-    elif prior_group is not None and prior_work_key == ref.work_key:
+    elif prior.play_group is not None and prior.work_key == ref.work_key:
         # An update or a replay of a play already in a session, still naming
         # the same release: it keeps its session. Deciding membership afresh
         # would compare it against whatever play is newest NOW and could walk
         # it out of the session its Note was published under, leaving the
         # album with two Notes for one listening.
-        new_group = prior_group
+        new_group = prior.play_group
     else:
         new_group = _play_group(
             did=did,
@@ -1025,7 +1052,7 @@ async def _process_play(
     if note_id is not None and (
         new_group is None
         or (
-            prior_group != new_group
+            prior.play_group != new_group
             and _play_holder(did, new_group, exclude_uri=at_uri) is not None
         )
     ):
@@ -1071,13 +1098,13 @@ async def _process_play(
                 delivered += await fanout(
                     worker, record_uri=group.anchor_uri, did=did, activity=group.activity
                 )
-    if prior_group and prior_group != new_group:
+    if prior.play_group and prior.play_group != new_group:
         # The play left another session (an update re-identified it): that
         # session may have lost its anchor and needs a survivor to publish.
-        prior = _sync_play_group(did=did, play_group=prior_group, handle=handle)
-        if worker is not None and prior is not None:
+        left = _sync_play_group(did=did, play_group=prior.play_group, handle=handle)
+        if worker is not None and left is not None:
             delivered += await fanout(
-                worker, record_uri=prior.anchor_uri, did=did, activity=prior.activity
+                worker, record_uri=left.anchor_uri, did=did, activity=left.activity
             )
     return Processed(at_uri, operation, collection, activity or {}, delivered)
 
