@@ -271,7 +271,7 @@ into **listening sessions**, and each session is bridged as **ONE `Note`**:
   marks a session complete: a scrobble reports that the author is playing the
   album, never that they reached its end.
 - Every further play of the same session is archived and refreshes the Note
-  with an `Update` — but at most one `Update` per
+  with an `Update` — but only a play refreshes it, and at most one `Update` per
   `SKYBRIDGE_TEAL_UPDATE_HOURS` (default 24), since an `Update` per scrobbled
   track would flood relays for a mark that did not move. The throttle clock is
   when the bridge last sent that Note (the anchor row's `updated_at`), so it

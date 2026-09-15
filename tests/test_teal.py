@@ -529,6 +529,22 @@ def test_a_repeat_play_refreshes_the_note_once_per_interval(settings):
     assert fourth is not None and fourth.activity == {}
 
 
+def test_a_delete_after_the_interval_does_not_refresh_the_note(settings):
+    # Only a play refreshes the mark. A re-derivation that no play triggered
+    # has nothing new to report, however long ago the Note last went out.
+    first = _run(_commit("3lplay000001", PLAY))
+    second = _run(_commit("3lplay000002", PLAY_2))
+    assert first is not None and second is not None
+    before = _row(first.at_uri)
+    _age_anchor(first.at_uri, hours=25)
+
+    deleted = _run(_commit("3lplay000002", {}, "delete"))
+    assert deleted is not None and deleted.activity == {} and deleted.delivered == 0
+    after = _row(first.at_uri)
+    assert after.ap_object_json == before.ap_object_json
+    assert _json(after.ap_activity_json)["type"] == "Create"
+
+
 def test_a_real_change_is_not_held_back_by_the_refresh_interval(settings):
     # The release name arrives only with the second play, minutes after the
     # first: a changed Note goes out at once, throttle or no throttle.

@@ -790,7 +790,8 @@ def _play_group(*, did: str, work_key: str, rkey: str, at_uri: str, played: date
             .limit(1)
         ).first()
         if newest is not None and abs(played - _row_play_time(newest)) <= window:
-            return newest.play_group or f"{work_key}#{rkey}"
+            assert newest.play_group is not None  # the query filters NULL out
+            return newest.play_group
     return f"{work_key}#{rkey}"
 
 
@@ -931,15 +932,21 @@ def _derive_play_group(*, did: str, play_group: str, handle: str) -> DerivedPair
     return DerivedPair(anchor.at_uri, anchor.ap_object_json, note, activity)
 
 
-def _sync_play_group(*, did: str, play_group: str, handle: str) -> DerivedPair | None:
+def _sync_play_group(
+    *, did: str, play_group: str, handle: str, refresh: bool = False
+) -> DerivedPair | None:
     """Re-derive the session's Note and persist it — if it is worth sending.
 
     Returns ``None`` when the session is empty, and when the derived Note
-    equals the stored one apart from its ``updated`` stamps while that stamp
-    is younger than ``teal_update_hours``: nothing is written and the caller
-    sends nothing, which is what keeps a scrobbler's every play from becoming
-    an Update on the fediverse. Past that interval the unchanged Note IS sent
-    again, to refresh the "is listening" mark on NeoDB peers.
+    equals the stored one apart from its ``updated`` stamps: nothing is
+    written and the caller sends nothing, which is what keeps a scrobbler's
+    every play from becoming an Update on the fediverse.
+
+    *refresh* is the one exception, and only a new play sets it: past
+    ``teal_update_hours`` the unchanged Note IS sent again, to refresh the
+    "is listening" mark on NeoDB peers. A re-derivation that no play
+    triggered — a deleted play, a session another play left — never refreshes
+    on its own: it has nothing new to report.
     """
     derived = _derive_play_group(did=did, play_group=play_group, handle=handle)
     if derived is None:
@@ -947,7 +954,7 @@ def _sync_play_group(*, did: str, play_group: str, handle: str) -> DerivedPair |
     if (
         derived.stored_note_json is not None
         and _same_note(derived.stored_note_json, derived.note)
-        and not _refresh_due(derived.anchor_uri)
+        and not (refresh and _refresh_due(derived.anchor_uri))
     ):
         return None
     _update_ap(derived.anchor_uri, derived.note, derived.activity)
@@ -1031,7 +1038,8 @@ async def _process_play(
         delivered += await fanout(worker, record_uri=at_uri, did=did, activity=retraction)
     activity = retraction
     if new_group is not None:
-        group = _sync_play_group(did=did, play_group=new_group, handle=handle)
+        # The only caller that may refresh an unchanged Note: this IS a play.
+        group = _sync_play_group(did=did, play_group=new_group, handle=handle, refresh=True)
         if group is not None:
             activity = group.activity
             if worker is not None:
