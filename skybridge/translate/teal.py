@@ -14,7 +14,7 @@ one adapter.
 The bridged *work* is the release, mapped to a NeoDB ``Album``. NeoDB has no
 track item type, so a play that names no release (only a recording id, or
 nothing at all) has nothing to mark and mints no work. Plays are bridged as ONE
-Note per (author, release) rather than one per play — see
+Note per listening session of (author, release) rather than one per play — see
 ``pipeline._process_play``; this module only knows the record shape.
 """
 

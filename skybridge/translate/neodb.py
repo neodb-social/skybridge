@@ -482,16 +482,18 @@ def _populate_book(note: dict, record: dict, ref: works.WorkRef | None) -> None:
 def _populate_play(note: dict, record: dict, ref: works.WorkRef | None) -> None:
     """Populate the Note for a teal.fm play, as the mark on its *release*.
 
-    One Note stands for every play of one (author, release) — see
+    One Note stands for every play of one listening session — see
     ``pipeline._process_play`` — so the content must not depend on which
     track or how many tracks were played: it names the album and the artists
     of the anchoring play, nothing per-track, and carries a ``Status`` of
-    ``complete`` (NeoDB's "listened"). No Rating and no Comment: a scrobble
-    has neither.
+    ``progress`` (NeoDB's "listening"). A scrobbler reports that the author is
+    playing the album, never that they reached its end, so the mark says they
+    are listening and no later activity completes it. No Rating and no
+    Comment: a scrobble has neither.
     """
     title = (ref.title if ref is not None else None) or teal.release_title(record) or "an album"
     artists = teal.artist_names(record)
-    lead = f"<p>Listened to {_title_html(title, ref)}"
+    lead = f"<p>Listening to {_title_html(title, ref)}"
     if artists:
         lead += f" by {html.escape(', '.join(artists))}"
     note["content"] = lead + "</p>"
@@ -499,7 +501,7 @@ def _populate_play(note: dict, record: dict, ref: works.WorkRef | None) -> None:
     if ref is not None:
         note["tag"].append(_work_tag(ref))
         note["tag"].append({"type": "Hashtag", "name": f"#{works.category_for(ref.work_type)}"})
-        note["relatedWith"].append(_related(note, "Status", ref.url, {"status": "complete"}))
+        note["relatedWith"].append(_related(note, "Status", ref.url, {"status": "progress"}))
 
 
 def _populate_list(

@@ -54,8 +54,9 @@ WANTED_COLLECTIONS: tuple[str, ...] = (
     # buzz.bookhive.catalogBook (the app's catalog, not user activity).
     "buzz.bookhive.book",
     # teal.fm (https://github.com/teal-fm/teal), a music scrobbler: one play
-    # record per track listened to. Bridged as ONE Note per (author, release)
-    # with a Status of complete — see translate.teal and pipeline._process_play.
+    # record per track listened to. Bridged as ONE Note per listening session
+    # of (author, release), with a Status of progress ("is listening") — see
+    # translate.teal and pipeline._process_play.
     # Both NSIDs are live: the alpha namespace is what pre-July-2026 trackers
     # still write. Not bridged: fm.teal.actor.status (+alpha; "now playing",
     # rkey self, rewritten every track), fm.teal.actor.profile and
@@ -145,6 +146,18 @@ class Settings:
     # only those created within the last `backfill_days` days.
     backfill_limit: int = 1000
     backfill_days: int = 7
+
+    # --- teal.fm listening sessions ----------------------------------------
+    # Plays of one (author, release) share ONE Note while consecutive plays are
+    # no more than `teal_window_days` apart. A longer silence means the listener
+    # came back to the album later, which is worth its own post, so the next
+    # play starts a new session and a new Create. Within a session a repeat
+    # play refreshes the Note, but at most once per `teal_update_hours` — a
+    # scrobbler writes a record per track, and an Update per track would flood
+    # relays for a mark that did not move. A real change to the Note (a release
+    # title that arrived late, a visibility change) is never throttled.
+    teal_window_days: int = 14
+    teal_update_hours: int = 24
     # Optional Sentry DSN: enables error tracking + a per-collection ingest
     # counter metric. Unset (the default) keeps telemetry fully off.
     sentry_dsn: str | None = None
@@ -250,6 +263,8 @@ def _from_env() -> Settings:
         sentry_dsn=os.environ.get("SKYBRIDGE_SENTRY_DSN") or None,
         backfill_limit=_env_int("SKYBRIDGE_BACKFILL_LIMIT", 1000, minimum=1),
         backfill_days=_env_int("SKYBRIDGE_BACKFILL_DAYS", 7, minimum=0),
+        teal_window_days=_env_int("SKYBRIDGE_TEAL_WINDOW_DAYS", 14, minimum=0),
+        teal_update_hours=_env_int("SKYBRIDGE_TEAL_UPDATE_HOURS", 24, minimum=0),
     )
 
 

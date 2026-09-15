@@ -39,6 +39,7 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("bridged_actor", "hide_from_recommendations", "BOOLEAN NOT NULL DEFAULT 0"),
     ("bridged_actor", "no_unauthenticated", "BOOLEAN NOT NULL DEFAULT 0"),
     ("bridged_actor", "last_visibility_seq", "INTEGER"),
+    ("record", "play_group", "VARCHAR"),
 )
 
 

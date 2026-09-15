@@ -256,35 +256,56 @@ Last.fm track page — mints no work and is archived without AP emission: NeoDB
 has no track item to mark, and a scrobbler makes many of these.
 
 A scrobbler writes one record per track, so bridging each play as its own Note
-would post a 12-track album twelve times. Plays are instead bridged as **ONE
-`Note` per (author, release)**:
+would post a 12-track album twelve times. Plays of one release are instead cut
+into **listening sessions**, and each session is bridged as **ONE `Note`**:
 
-- The first play of a release publishes the Note (`Create`), anchored on that
+- A play joins the newest session of that release when it follows the session's
+  latest play by no more than `SKYBRIDGE_TEAL_WINDOW_DAYS` (default 14). A
+  longer silence means the listener came back to the album later, which is
+  worth its own post: that play founds a new session and a new `Create` goes
+  out, while the earlier session keeps its own Note unchanged.
+- The first play of a session publishes the Note (`Create`), anchored on that
   play's rkey. Its content names only the album and the artists of that play
-  (never a track or a play count) and carries a `Status` of `complete`
-  (NeoDB's "listened"); there is no `Rating` and no `Comment`.
-- Every further play of the same release is archived, grouped on the same
-  work, and **sends nothing**: the Note is re-derived and compared with the
-  stored one (ignoring `updated` stamps), and an `Update` goes out only when
-  it actually differs — a release title that only a later play supplied, or a
-  visibility preference that changed since (re-derivation happens on the next
-  event for that release, not when the preference flips).
+  (never a track or a play count) and carries a `Status` of `progress`
+  (NeoDB's "listening"); there is no `Rating` and no `Comment`. Nothing later
+  marks a session complete: a scrobble reports that the author is playing the
+  album, never that they reached its end.
+- Every further play of the same session is archived and refreshes the Note
+  with an `Update` — but at most one `Update` per
+  `SKYBRIDGE_TEAL_UPDATE_HOURS` (default 24), since an `Update` per scrobbled
+  track would flood relays for a mark that did not move. The throttle clock is
+  when the bridge last sent that Note (the anchor row's `updated_at`), so it
+  survives a restart and needs no timer in memory.
+- A real change to the Note is never throttled: the Note is re-derived and
+  compared with the stored one (ignoring `updated` stamps), and an `Update`
+  goes out at once when it actually differs — a release title that only a
+  later play supplied, or a visibility preference that changed since
+  (re-derivation happens on the next event for that release, not when the
+  preference flips).
 - Deleting the anchoring play `Delete`s the Note; the newest surviving play of
-  the release re-publishes it under its own rkey. Deleting any other play just
-  re-derives the Note, which almost always changes nothing.
+  **the same session** re-publishes it under its own rkey. Deleting any other
+  play just re-derives the Note, which almost always changes nothing.
+
+A play's session is decided once, when the play is ingested, and kept in
+`record.play_group` (`"<work_key>#<founder rkey>"`), so it never moves under a
+Note that peers already hold. Sessions are therefore cut on arrival order,
+which for both live ingest and a backfill replay is play order (backfill
+replays oldest-first by write time). A play that arrives late and lands inside
+an older silence founds its own session rather than merging the two around it,
+and deleting the plays in the middle of a session never splits it.
 
 | teal.fm record | becomes |
 |---|---|
-| `fm.teal.feed.play` / `fm.teal.alpha.feed.play` | one `Note` per (author, release): "Listened to *Album* by *Artists*" with a `Status` of `complete` `withRegardTo` the album; later plays of the same release are archived silently |
+| `fm.teal.feed.play` / `fm.teal.alpha.feed.play` | one `Note` per listening session: "Listening to *Album* by *Artists*" with a `Status` of `progress` `withRegardTo` the album; further plays of the session refresh it at most once a day |
 
-`published` is the anchoring play's `playedTime` (a play has no `createdAt`),
-falling back to the bridge's own ingest time of that play when it is absent.
+`published` is the session-anchoring play's `playedTime` (a play has no
+`createdAt`), falling back to the bridge's own ingest time of that play when it
+is absent. The same `playedTime` decides which session a play joins.
 
-One consequence of "later plays send nothing" for imports: a history import
-that does not deliver (the default) publishes each album's Note silently, and
-because every later live play of that album derives the same Note, nothing
-ever sends it. Those albums federate only through an import that delivers, or
-once something about the Note actually changes.
+One consequence for imports: a history import that does not deliver (the
+default) publishes each session's Note silently. A later live play of that
+album federates it only once it opens a new session, or once the refresh
+interval has passed, or once something about the Note actually changes.
 
 Known but not bridged:
 - `fm.teal.actor.status` / `fm.teal.alpha.actor.status` ("now playing": rkey
@@ -383,6 +404,8 @@ until they re-fetch the actor.
 | `SKYBRIDGE_INGEST` | unset | set to `1` to start live ingestion inside `serve` |
 | `SKYBRIDGE_BACKFILL_LIMIT` | `1000` | max records fetched per user-triggered "Import recent activity" run (total; reviews and shelf items are budgeted before archive-only lists) |
 | `SKYBRIDGE_BACKFILL_DAYS` | `7` | only records written within the last N days (by TID rkey, falling back to `createdAt`) are re-published by an import |
+| `SKYBRIDGE_TEAL_WINDOW_DAYS` | `14` | teal.fm: plays of one album more than N days apart start a new listening session, with its own `Note` |
+| `SKYBRIDGE_TEAL_UPDATE_HOURS` | `24` | teal.fm: shortest interval between two `Update`s refreshing one session's `Note`; a real change to the Note ignores it |
 | `SKYBRIDGE_LOG` | `INFO` | log level |
 | `SKYBRIDGE_SENTRY_DSN` | unset | optional; enables Sentry error reporting and a `atproto.record_ingested` counter metric with `collection`/`operation` attributes |
 

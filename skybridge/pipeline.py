@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -303,7 +303,7 @@ async def process_event(
     ref = works.mint(record)
 
     if collection in teal.PLAY_COLLECTIONS:
-        # A scrobble: one Note per (author, release), not per play. See
+        # A scrobble: one Note per listening session, not per play. See
         # _process_play for the grouping rules.
         return await _process_play(
             at_uri=at_uri,
@@ -316,6 +316,7 @@ async def process_event(
             operation=operation,
             seq=seq,
             cid=event.get("cid"),
+            event_time=event_time,
             worker=worker,
         )
 
@@ -684,36 +685,142 @@ def _pair_trigger(did: str, work_key: str) -> str | None:
     return candidates[0][0] if candidates else None
 
 
-# --- teal.fm plays: one Note per (author, release) -------------------------
+# --- teal.fm plays: one Note per listening session -------------------------
 #
 # A scrobbler writes one record per track, so bridging each play as its own
 # Note would post a 12-track album twelve times — to followers' timelines and
-# onto the item page of every NeoDB peer. Instead every active play of one
-# (author, release) shares ONE Note, anchored on the play that published it
-# first (/users/<handle>/posts/<rkey>). The Note's content names only the album
-# and its artists, never a track or a count, so a further play of the same
-# release derives an identical Note and sends NOTHING: an Update goes out only
-# when the derived Note actually differs (a release title that arrived late, a
-# changed visibility preference, a rename of the anchor). Deleting the anchor
-# Deletes the Note, and the newest surviving play re-publishes under its own
-# rkey; deleting any other play just re-derives (and almost always sends
-# nothing). A play whose release cannot be identified mints no work and is
-# archived without AP emission — NeoDB has no track item to mark.
+# onto the item page of every NeoDB peer. Instead the plays of one (author,
+# release) are cut into SESSIONS, and every play of one session shares ONE
+# Note, anchored on the play that published it first
+# (/users/<handle>/posts/<rkey>).
+#
+# A play joins the newest session of that release when it follows the session's
+# latest play by no more than `teal_window_days` (default 14). A longer silence
+# means the listener came back to the album later, which is worth its own post:
+# the play founds a new session and a new Create goes out, while the earlier
+# session keeps its own Note untouched. The session a play belongs to is
+# decided once, at ingest, and kept in Record.play_group ("<work_key>#<founder
+# rkey>"), so it never moves under a Note already published.
+#
+# Within a session the Note's content names only the album and its artists,
+# never a track or a count, so a further play derives an identical Note. It
+# still refreshes the mark — the Note says the author IS LISTENING to the album
+# — but at most once per `teal_update_hours` (default 24): an Update per
+# scrobbled track would flood relays for a mark that did not move. A real
+# change to the Note (a release title that arrived late, a changed visibility
+# preference, a rename of the anchor) is sent at once, never throttled.
+#
+# Deleting the anchor Deletes the Note, and the newest surviving play of the
+# SAME session re-publishes under its own rkey; deleting any other play just
+# re-derives (and sends nothing). A play whose release cannot be identified
+# mints no work and is archived without AP emission — NeoDB has no track item
+# to mark.
 
 
-def _active_plays(did: str, work_key: str):
-    """Base query: the active plays of one (author, release), newest first.
+def _play_time(record: dict, fallback: datetime) -> datetime:
+    """When a play happened: its ``playedTime``, else *fallback*.
+
+    ``playedTime`` is optional in the teal lexicon; the caller passes the
+    row's own ingest time (or the event time) for a play without one.
+    """
+    played = record.get("playedTime")
+    if isinstance(played, str) and played:
+        try:
+            parsed = datetime.fromisoformat(played)
+        except ValueError:
+            return fallback
+        return _aware(parsed)
+    return fallback
+
+
+def _aware(moment: datetime) -> datetime:
+    """A timestamp as UTC-aware: SQLite hands a DATETIME column back naive."""
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+def _event_datetime(event_time: str | None) -> datetime:
+    """The firehose event time as a datetime, falling back to *now*.
+
+    Only the fallback play time of a play without ``playedTime`` — a session
+    is cut on when the listening happened, and the event time is the closest
+    stand-in the record offers.
+    """
+    if event_time:
+        try:
+            return _aware(datetime.fromisoformat(event_time))
+        except ValueError:
+            pass
+    return utcnow()
+
+
+def _row_play_time(row: Record) -> datetime:
+    """The play time of an archived play row (ingest time as the fallback)."""
+    return _play_time(_source_dict(row.source_json) or {}, _aware(row.created_at))
+
+
+def _play_group(*, did: str, work_key: str, rkey: str, at_uri: str, played: datetime) -> str:
+    """The listening session a play belongs to, as ``"<work_key>#<rkey>"``.
+
+    The newest other active play of the same release decides it: within
+    ``teal_window_days`` of *played* the new play joins that play's session,
+    beyond it (or with no other play at all) it founds its own. One bounded
+    query — a heavy listener's album can hold thousands of plays.
+
+    Sessions are cut on arrival order, which for both live ingest and a
+    backfill replay is play order (backfill replays oldest-first by write
+    time). A play that arrives late and lands inside an older silence founds
+    its own session rather than merging the two around it; likewise deleting
+    the plays in the middle of a session never splits it. Both keep an already
+    published Note where peers saw it, which matters more than a perfectly cut
+    history.
+    """
+    window = timedelta(days=get_settings().teal_window_days)
+    with session_scope() as session:
+        newest = session.scalars(
+            select(Record)
+            .where(
+                Record.did == did,
+                Record.work_key == work_key,
+                Record.collection.in_(teal.PLAY_COLLECTIONS),
+                Record.at_uri != at_uri,
+                Record.play_group.is_not(None),
+                Record.deleted_at.is_(None),
+            )
+            .order_by(Record.rkey.desc(), Record.at_uri.desc())
+            .limit(1)
+        ).first()
+        if newest is not None and abs(played - _row_play_time(newest)) <= window:
+            return newest.play_group or f"{work_key}#{rkey}"
+    return f"{work_key}#{rkey}"
+
+
+def _prior_play_state(at_uri: str) -> tuple[str | None, str | None]:
+    """(published Note id, play_group) of a play before this event.
+
+    The play equivalent of :func:`_prior_state`, which reports the work rather
+    than the session: a play's Note is shared per session, so that is the key
+    the retraction and re-derivation paths need.
+    """
+    with session_scope() as session:
+        row = session.get(Record, at_uri)
+        if row is None or row.deleted_at is not None:
+            return None, None
+        return _stored_note_id(row.ap_object_json), row.play_group
+
+
+def _active_plays(did: str, play_group: str):
+    """Base query: the active plays of one listening session, newest first.
 
     Play rkeys are TIDs, which sort by write time as strings, so the first row
     is the most recent play — the one that re-anchors the Note when the
-    current anchor is deleted. Callers always add a ``LIMIT``: a heavy
-    listener's album can hold thousands of plays, and derivation needs one.
+    current anchor is deleted. Callers always add a ``LIMIT``: a session can
+    hold thousands of plays, and derivation needs one.
     """
     return (
         select(Record)
         .where(
             Record.did == did,
-            Record.work_key == work_key,
+            Record.play_group == play_group,
             Record.collection.in_(teal.PLAY_COLLECTIONS),
             Record.deleted_at.is_(None),
         )
@@ -721,37 +828,37 @@ def _active_plays(did: str, work_key: str):
     )
 
 
-def _play_holder(did: str, work_key: str, *, exclude_uri: str | None = None) -> Record | None:
-    """The play currently holding the group's published Note (other than
+def _play_holder(did: str, play_group: str, *, exclude_uri: str | None = None) -> Record | None:
+    """The play currently holding the session's published Note (other than
     *exclude_uri*, when given)."""
-    query = _active_plays(did, work_key).where(Record.ap_object_json.is_not(None))
+    query = _active_plays(did, play_group).where(Record.ap_object_json.is_not(None))
     if exclude_uri is not None:
         query = query.where(Record.at_uri != exclude_uri)
     with session_scope() as session:
         return session.scalars(query.limit(1)).first()
 
 
-def _play_anchor(did: str, work_key: str) -> tuple[Record | None, str]:
-    """``(anchor, operation)`` for the group's Note; ``(None, ...)`` if empty.
+def _play_anchor(did: str, play_group: str) -> tuple[Record | None, str]:
+    """``(anchor, operation)`` for the session's Note; ``(None, ...)`` if empty.
 
     The play holding the published Note anchors an ``update``. Otherwise the
     newest play whose object id peers never saw Deleted anchors a ``create``
     (a row in the pending-retraction shape carries a Delete and no Note);
     when every survivor is burned, the newest one is reused — same known
-    limit as _persist. Three bounded queries, never the whole group.
+    limit as _persist. Three bounded queries, never the whole session.
     """
-    holder = _play_holder(did, work_key)
+    holder = _play_holder(did, play_group)
     if holder is not None:
         return holder, "update"
     with session_scope() as session:
         fresh = session.scalars(
-            _active_plays(did, work_key)
+            _active_plays(did, play_group)
             .where(Record.ap_object_json.is_(None), Record.ap_activity_json.is_(None))
             .limit(1)
         ).first()
         if fresh is not None:
             return fresh, "create"
-        return session.scalars(_active_plays(did, work_key).limit(1)).first(), "create"
+        return session.scalars(_active_plays(did, play_group).limit(1)).first(), "create"
 
 
 def _without_volatile(obj: Any) -> Any:
@@ -773,24 +880,41 @@ def _same_note(stored_json: str | None, note: dict) -> bool:
     return stored is not None and _without_volatile(stored) == _without_volatile(note)
 
 
-def _derive_play_group(*, did: str, work_key: str, handle: str) -> DerivedPair | None:
-    """Derive the single Note for every active play of one (author, release).
+def _refresh_due(anchor_uri: str) -> bool:
+    """Has ``teal_update_hours`` passed since the session's Note went out?
+
+    The clock is the anchor row's own ``updated_at``, which _update_ap bumps
+    every time the Note is published or refreshed — the moment peers last
+    received it. It costs no extra state and survives a restart, unlike a
+    timer held in memory. It is deliberately NOT the Note's ``published``:
+    that is the play time, which a tracker may report long after the fact.
+    A row that has gone missing reads as due; one Update too many is
+    harmless, a mark frozen for ever is not.
+    """
+    interval = timedelta(hours=get_settings().teal_update_hours)
+    if not interval:
+        return True
+    with session_scope() as session:
+        row = session.get(Record, anchor_uri)
+        sent = _aware(row.updated_at) if row is not None else None
+    return sent is None or utcnow() - sent >= interval
+
+
+def _derive_play_group(*, did: str, play_group: str, handle: str) -> DerivedPair | None:
+    """Derive the single Note for every active play of one listening session.
 
     Anchored on the play holding the published Note; with none published, the
     newest play whose object id was never tombstoned becomes the anchor
     (Create) — see _play_anchor. Returns ``None`` when no active play remains.
     """
-    anchor, operation = _play_anchor(did, work_key)
+    anchor, operation = _play_anchor(did, play_group)
     if anchor is None:
         return None
     source = json.loads(anchor.source_json or "{}")
     # `playedTime` is optional in the lexicon. Without it `published` would
-    # fall back to *now* on every derivation, differ every time, and turn each
-    # further play into an Update — so the anchor row's own (fixed) ingest
-    # time is the fallback instead. SQLite hands the column back naive.
-    ingested = anchor.created_at
-    if ingested.tzinfo is None:
-        ingested = ingested.replace(tzinfo=UTC)
+    # fall back to *now* on every derivation and differ every time, which
+    # _same_note would read as a real change — so the anchor row's own (fixed)
+    # ingest time is the fallback instead.
     note, activity = neodb.translate(
         did=did,
         unlisted=_unlisted(did),
@@ -799,7 +923,7 @@ def _derive_play_group(*, did: str, work_key: str, handle: str) -> DerivedPair |
         rkey=anchor.rkey,
         record=source,
         operation=operation,
-        event_time=ingested.isoformat(),
+        event_time=_aware(anchor.created_at).isoformat(),
         ref=works.mint(source),
         prior_object_id=_stored_note_id(anchor.ap_object_json) if operation == "update" else None,
     )
@@ -807,18 +931,24 @@ def _derive_play_group(*, did: str, work_key: str, handle: str) -> DerivedPair |
     return DerivedPair(anchor.at_uri, anchor.ap_object_json, note, activity)
 
 
-def _sync_play_group(*, did: str, work_key: str, handle: str) -> DerivedPair | None:
-    """Re-derive the group's Note and persist it — only if it changed.
+def _sync_play_group(*, did: str, play_group: str, handle: str) -> DerivedPair | None:
+    """Re-derive the session's Note and persist it — if it is worth sending.
 
-    Returns ``None`` both when the group is empty and when the derived Note
-    equals the stored one apart from its ``updated`` stamps: nothing is
-    written and the caller sends nothing, which is what keeps a scrobbler's
-    every play from becoming an Update on the fediverse.
+    Returns ``None`` when the session is empty, and when the derived Note
+    equals the stored one apart from its ``updated`` stamps while that stamp
+    is younger than ``teal_update_hours``: nothing is written and the caller
+    sends nothing, which is what keeps a scrobbler's every play from becoming
+    an Update on the fediverse. Past that interval the unchanged Note IS sent
+    again, to refresh the "is listening" mark on NeoDB peers.
     """
-    derived = _derive_play_group(did=did, work_key=work_key, handle=handle)
+    derived = _derive_play_group(did=did, play_group=play_group, handle=handle)
     if derived is None:
         return None
-    if derived.stored_note_json is not None and _same_note(derived.stored_note_json, derived.note):
+    if (
+        derived.stored_note_json is not None
+        and _same_note(derived.stored_note_json, derived.note)
+        and not _refresh_due(derived.anchor_uri)
+    ):
         return None
     _update_ap(derived.anchor_uri, derived.note, derived.activity)
     return derived
@@ -836,23 +966,37 @@ async def _process_play(
     operation: str,
     seq: int | None,
     cid: str | None,
+    event_time: str | None,
     worker: DeliveryWorker | None,
 ) -> Processed:
     """Create/update of one teal.fm play; see the section comment above.
 
     The play is archived first (keeping any Note this row already anchors),
-    then the Note of the release it now belongs to is re-derived, and so is
-    the Note of the release it left if an update moved it. A play that
-    anchors a Note but loses its release, or moves into a group whose Note
-    another play already holds, has its own Note retracted first — one
-    (author, release) must never end up with two published Notes.
+    then the Note of the session it now belongs to is re-derived, and so is
+    the Note of the session it left if an update moved it. A play that anchors
+    a Note but loses its release, or moves into a session whose Note another
+    play already holds, has its own Note retracted first — one session must
+    never end up with two published Notes.
     """
-    note_id, prior_key = _prior_state(at_uri)
-    new_key = ref.work_key if ref is not None else None
+    note_id, prior_group = _prior_play_state(at_uri)
+    new_group = (
+        _play_group(
+            did=did,
+            work_key=ref.work_key,
+            rkey=rkey,
+            at_uri=at_uri,
+            played=_play_time(record, _event_datetime(event_time)),
+        )
+        if ref is not None
+        else None
+    )
     retraction = None
     if note_id is not None and (
-        new_key is None
-        or (prior_key != new_key and _play_holder(did, new_key, exclude_uri=at_uri) is not None)
+        new_group is None
+        or (
+            prior_group != new_group
+            and _play_holder(did, new_group, exclude_uri=at_uri) is not None
+        )
     ):
         _, retraction = neodb.translate(
             did=did,
@@ -876,7 +1020,8 @@ async def _process_play(
         note=None,
         activity=retraction,
         operation=operation,
-        work_key=new_key,
+        work_key=ref.work_key if ref is not None else None,
+        play_group=new_group,
         # The retraction replaces the stored AP forms (pending-Delete shape);
         # otherwise the row keeps the Note it may anchor for _derive_play_group.
         preserve_ap=retraction is None,
@@ -885,21 +1030,21 @@ async def _process_play(
     if worker is not None and retraction is not None:
         delivered += await fanout(worker, record_uri=at_uri, did=did, activity=retraction)
     activity = retraction
-    if new_key is not None:
-        group = _sync_play_group(did=did, work_key=new_key, handle=handle)
+    if new_group is not None:
+        group = _sync_play_group(did=did, play_group=new_group, handle=handle)
         if group is not None:
             activity = group.activity
             if worker is not None:
                 delivered += await fanout(
                     worker, record_uri=group.anchor_uri, did=did, activity=group.activity
                 )
-    if prior_key and prior_key != new_key:
-        # The play left another release's group (an update re-identified it):
-        # that group may have lost its anchor and needs a survivor to publish.
-        prior_group = _sync_play_group(did=did, work_key=prior_key, handle=handle)
-        if worker is not None and prior_group is not None:
+    if prior_group and prior_group != new_group:
+        # The play left another session (an update re-identified it): that
+        # session may have lost its anchor and needs a survivor to publish.
+        prior = _sync_play_group(did=did, play_group=prior_group, handle=handle)
+        if worker is not None and prior is not None:
             delivered += await fanout(
-                worker, record_uri=prior_group.anchor_uri, did=did, activity=prior_group.activity
+                worker, record_uri=prior.anchor_uri, did=did, activity=prior.activity
             )
     return Processed(at_uri, operation, collection, activity or {}, delivered)
 
@@ -1220,6 +1365,7 @@ async def _process_delete(
         row_exists = row is not None
         had_note = row is not None and row.ap_object_json is not None
         work_key = row.work_key if row is not None else None
+        play_group = row.play_group if row is not None else None
         stored_id = _stored_note_id(row.ap_object_json) if row is not None else None
     # Name the object id peers actually received. Recomputing it from the
     # current handle would tombstone a URL that was never published once the
@@ -1252,10 +1398,11 @@ async def _process_delete(
         delivered = 0
         if worker is not None:
             delivered = await fanout(worker, record_uri=at_uri, did=did, activity=activity)
-        if collection in teal.PLAY_COLLECTIONS and work_key:
-            # The anchor of a play group is gone: the newest surviving play of
-            # the same release re-publishes the group's Note under its own rkey.
-            group = _sync_play_group(did=did, work_key=work_key, handle=handle)
+        if collection in teal.PLAY_COLLECTIONS and play_group:
+            # The anchor of a listening session is gone: the newest surviving
+            # play of the SAME session re-publishes its Note under that play's
+            # own rkey. An earlier session of the album is never touched.
+            group = _sync_play_group(did=did, play_group=play_group, handle=handle)
             if worker is not None and group is not None:
                 delivered += await fanout(
                     worker, record_uri=group.anchor_uri, did=did, activity=group.activity
@@ -1276,10 +1423,10 @@ async def _process_delete(
     pair = None
     if collection in _PAIRED_COLLECTIONS and work_key and _contributes(collection, source):
         pair = _sync_pair(did=did, work_key=work_key, handle=handle, trigger_uri=at_uri)
-    elif collection in teal.PLAY_COLLECTIONS and work_key:
-        # A non-anchor play: the group's Note is re-derived from what remains
+    elif collection in teal.PLAY_COLLECTIONS and play_group:
+        # A non-anchor play: the session's Note is re-derived from what remains
         # and, its content not depending on this play, almost always unchanged.
-        pair = _sync_play_group(did=did, work_key=work_key, handle=handle)
+        pair = _sync_play_group(did=did, play_group=play_group, handle=handle)
     delivered = 0
     if worker is not None and pair is not None:
         delivered = await fanout(
@@ -1303,6 +1450,7 @@ def _persist(
     operation: str,
     work_key: str | None,
     seq: int | None = None,
+    play_group: str | None = None,
     preserve_ap: bool = False,
 ) -> None:
     with session_scope() as session:
@@ -1330,5 +1478,7 @@ def _persist(
             row.ap_activity_json = json.dumps(activity) if activity is not None else None
         row.op = operation
         row.work_key = work_key
+        # Only a teal.fm play carries one; every other collection passes None.
+        row.play_group = play_group
         row.deleted_at = None
         row.updated_at = utcnow()
