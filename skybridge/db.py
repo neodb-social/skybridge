@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -12,6 +14,8 @@ from sqlalchemy.pool import StaticPool
 
 from skybridge.config import get_settings
 from skybridge.models import Base
+
+log = logging.getLogger("skybridge.db")
 
 _engine: Engine | None = None
 _Session: sessionmaker[Session] | None = None
@@ -39,6 +43,9 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("bridged_actor", "hide_from_recommendations", "BOOLEAN NOT NULL DEFAULT 0"),
     ("bridged_actor", "no_unauthenticated", "BOOLEAN NOT NULL DEFAULT 0"),
     ("bridged_actor", "last_visibility_seq", "INTEGER"),
+    ("record", "play_group", "VARCHAR"),
+    ("record", "played_at", "DATETIME"),
+    ("record", "ap_sent_at", "DATETIME"),
 )
 
 
@@ -63,8 +70,28 @@ def _configure_connection(engine: Engine) -> None:
             cursor.close()
 
 
+# Indexes on columns added after the initial release. create_all() builds the
+# indexes of a table it creates and nothing else, so a column _ensure_columns
+# adds to an existing table arrives unindexed however the model declares it —
+# and the teal.fm session lookups would then scan an author's whole play
+# history. Named as SQLAlchemy names them, so a fresh database and an upgraded
+# one end up with the same schema.
+_ADDED_INDEXES: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
+    ("ix_record_play_window", "record", ("did", "work_key", "played_at"), ""),
+    ("ix_record_play_session", "record", ("did", "play_group", "rkey"), ""),
+    # Partial: the rows holding a session's published Note, one per session.
+    (
+        "ix_record_play_holder",
+        "record",
+        ("did", "play_group", "rkey"),
+        "ap_object_json IS NOT NULL AND deleted_at IS NULL",
+    ),
+)
+
+
 def _ensure_columns(engine: Engine) -> None:
-    """Add any post-release columns missing from an existing database."""
+    """Add any post-release columns, and their indexes, missing from an
+    existing database."""
     with engine.begin() as conn:
         for table, column, coltype in _ADDED_COLUMNS:
             existing = {
@@ -72,6 +99,16 @@ def _ensure_columns(engine: Engine) -> None:
             }
             if existing and column not in existing:
                 conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+        for name, table, columns, predicate in _ADDED_INDEXES:
+            present = {
+                row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
+            }
+            if set(columns) <= present:
+                spec = ", ".join(columns)
+                where = f" WHERE {predicate}" if predicate else ""
+                conn.exec_driver_sql(
+                    f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({spec}){where}"
+                )
 
 
 def _make_engine() -> Engine:
@@ -125,6 +162,43 @@ def get_engine() -> Engine:
         init_db()
     assert _engine is not None
     return _engine
+
+
+# How much of each index ANALYZE samples. SQLite's own recommendation for a
+# live database: enough rows to tell a selective index from a useless one,
+# few enough that the pass never blocks writers for long.
+_ANALYSIS_LIMIT = 400
+OPTIMIZE_INTERVAL = 24 * 60 * 60
+
+
+def optimize() -> None:
+    """Refresh the query planner's statistics.
+
+    Without them SQLite guesses between indexes by shape alone, and it guesses
+    wrong where two index the same columns: the teal.fm holder lookup takes
+    the full ix_record_play_session over the partial ix_record_play_holder and
+    walks a whole listening session, per scrobble. One pass over a populated
+    table settles it. ``PRAGMA optimize`` analyses only what has changed
+    enough to be worth it, so most passes do nothing at all.
+    """
+    with get_engine().begin() as conn:
+        conn.exec_driver_sql(f"PRAGMA analysis_limit={_ANALYSIS_LIMIT}")
+        conn.exec_driver_sql("PRAGMA optimize")
+
+
+async def optimize_loop(interval: float = OPTIMIZE_INTERVAL) -> None:
+    """Keep those statistics current; started by the app lifespan.
+
+    A pass at startup, then daily: the tables that matter grow by ingestion,
+    so a database that was empty when the process started is not the one it is
+    querying a week later.
+    """
+    while True:
+        try:
+            await asyncio.to_thread(optimize)
+        except Exception:
+            log.exception("database optimize failed")
+        await asyncio.sleep(interval)
 
 
 @contextmanager

@@ -1,7 +1,8 @@
 # 🌁 NeoDB Sky Bridge
 
-NeoDB Sky Bridge relays public AT Protocol records (e.g. popfeed and
-[BookHive](https://github.com/nperez0111/bookhive)) into the Fediverse
+NeoDB Sky Bridge relays public AT Protocol records (e.g. popfeed,
+[BookHive](https://github.com/nperez0111/bookhive) and
+[teal.fm](https://github.com/teal-fm/teal)) into the Fediverse
 as NeoDB-compatible ActivityPub activities. 
 
 Any AT Protocol user may opt out by themselves (verified via atproto OAuth).
@@ -202,9 +203,9 @@ Visibility preferences above): unlike a profile edit it is a rare, low-volume
 record, and like one it only ever updates an actor we already bridge.
 
 `uv run python -m skybridge discover` keeps this list honest: it subscribes to
-`social.popfeed.*` / `buzz.bookhive.*` (Jetstream v2 accepts namespace
-wildcards) and reports every collection seen, flagging the ones we don't
-bridge. Ingestion itself still asks for the explicit list — a wildcard
+`social.popfeed.*` / `buzz.bookhive.*` / `fm.teal.*` (Jetstream v2 accepts
+namespace wildcards) and reports every collection seen, flagging the ones we
+don't bridge. Ingestion itself still asks for the explicit list — a wildcard
 subscription would also pull in `buzz.bookhive.catalogBook`, whose records
 carry multi-KB author biographies we have no use for.
 
@@ -234,6 +235,108 @@ Known but not bridged:
   entries, not user activity)
 - the `cover` blob (a PDS blob, not a URL): no poster is derived yet, so the
   Note relies on the catalog-item tag for imagery
+
+### teal.fm
+
+[teal.fm](https://github.com/teal-fm/teal) is a music scrobbler on atproto:
+one `fm.teal.feed.play` record is written for every track a user listens to,
+naming the track, the artists and the release (album), with MusicBrainz ids
+(`mbid:<uuid>`) when the tracker could match them. Two NSIDs are live on the
+network and both are bridged: `fm.teal.feed.play` and the pre-July-2026
+`fm.teal.alpha.feed.play`, which older trackers still write; the record shapes
+agree on every field used here.
+
+The bridged work is the **release**, as a NeoDB `Album` (category `music`).
+Its identity is `releaseMbId`, exposed as a `https://musicbrainz.org/release/…`
+external resource that NeoDB resolves; when a play carries no MusicBrainz id
+but its `originUri` is an Apple Music track URL, the album id in that URL
+identifies the release instead (`https://music.apple.com/album/…`, also
+resolved by NeoDB). A play that names no release — only a recording id, or a
+Last.fm track page — mints no work and is archived without AP emission: NeoDB
+has no track item to mark, and a scrobbler makes many of these.
+
+A scrobbler writes one record per track, so bridging each play as its own Note
+would post a 12-track album twelve times. Plays of one release are instead cut
+into **listening sessions**, and each session is bridged as **ONE `Note`**:
+
+- A play joins the session of its nearest neighbour in time among that
+  release's plays, when the two are no more than `SKYBRIDGE_TEAL_WINDOW_DAYS`
+  apart (default 14). A longer silence on both sides means the listener came
+  back to the album later, which is worth its own post: that play founds a new
+  session and a new `Create` goes out, while the other sessions keep their own
+  Notes unchanged. Neighbours are looked up on both sides, so importing a
+  history behind plays already archived joins those imported plays to each
+  other instead of giving each track a Note.
+- The first play of a session publishes the Note (`Create`), anchored on that
+  play's rkey. Its content names only the album and the artists of that play
+  (never a track or a play count) and carries a `Status` of `progress`
+  (NeoDB's "listening"); there is no `Rating` and no `Comment`. Nothing later
+  marks a session complete: a scrobble reports that the author is playing the
+  album, never that they reached its end.
+- Every further play of the same session is archived and refreshes the Note
+  with an `Update` — but only a play refreshes it, and at most one `Update` per
+  `SKYBRIDGE_TEAL_UPDATE_HOURS` (default 24), since an `Update` per scrobbled
+  track would flood relays for a mark that did not move. The throttle clock is
+  `record.ap_sent_at`, stamped when the Note is actually published or
+  refreshed, so it survives a restart, needs no timer in memory, and no
+  re-import or source edit can postpone it.
+- A real change to the Note is never throttled: the Note is re-derived and
+  compared with the stored one (ignoring `updated` stamps), and an `Update`
+  goes out at once when it actually differs — a release title that only a
+  later play supplied, or a visibility preference that changed since
+  (re-derivation happens on the next event for that release, not when the
+  preference flips).
+- Deleting the anchoring play `Delete`s the Note; the newest surviving play of
+  **the same session** re-publishes it under its own rkey. Deleting any other
+  play just re-derives the Note, which almost always changes nothing.
+
+A play's session is decided once, when the play is first ingested, and kept in
+`record.play_group` (`"<work_key>#<founder rkey>"`), so it never moves under a
+Note that peers already hold: a later update or replay of that play keeps its
+session unless the release itself changed. The play time the window measures
+is kept alongside it, in `record.played_at`, so an incoming play and an
+archived one are always compared on the same footing. The founder is named by
+its rkey alone, matching the Note id the session publishes under
+(`/users/<handle>/posts/<rkey>`, as for every other collection), so two plays
+that somehow shared an rkey would share one session — they could only ever
+share one Note. Both lookups a scrobble
+runs — the nearest play of the release in time, and the newest play of a
+session — are single index seeks, so per-play cost does not grow with the
+history behind them. Sessions are therefore cut on arrival order,
+which for both live ingest and a backfill replay is play order (backfill
+replays oldest-first by write time). A play that arrives late and lands inside
+an older silence founds its own session rather than merging the two around it,
+and deleting the plays in the middle of a session never splits it.
+
+| teal.fm record | becomes |
+|---|---|
+| `fm.teal.feed.play` / `fm.teal.alpha.feed.play` | one `Note` per listening session: "Listening to *Album* by *Artists*" with a `Status` of `progress` `withRegardTo` the album; further plays of the session refresh it at most once a day |
+
+`published` is the session-anchoring play's `playedTime` (a play has no
+`createdAt`), falling back to the bridge's own ingest time of that play when it
+is absent. The same `playedTime` decides which session a play joins, and the
+same fallback applies there: a play without one counts as played when the
+bridge first saw it, never at the firehose event time, so a replay arriving
+late cannot cut a session at every play.
+
+One consequence for an import that reaches further back than the window: two
+listenings of one album weeks apart are two sessions, so a heavy listener's
+history federates as a handful of Notes per album, not one, and not one per
+track.
+
+One consequence for imports: a history import that does not deliver (the
+default) publishes each session's Note silently. A later live play of that
+album federates it only once it opens a new session, or once the refresh
+interval has passed, or once something about the Note actually changes.
+
+Known but not bridged:
+- `fm.teal.actor.status` / `fm.teal.alpha.actor.status` ("now playing": rkey
+  `self`, rewritten on every track, expiring ten minutes later)
+- `fm.teal.actor.profile` (display name + avatar blob; the bridged actor's
+  identity comes from the bsky profile fallback) and
+  `fm.teal.actor.profileStatus` (onboarding progress)
+- `recordingMbId` / `trackMbId` / `isrc`: track-level ids with no NeoDB item
+  type to land on
 
 ### Account lifecycle
 
@@ -323,6 +426,8 @@ until they re-fetch the actor.
 | `SKYBRIDGE_INGEST` | unset | set to `1` to start live ingestion inside `serve` |
 | `SKYBRIDGE_BACKFILL_LIMIT` | `1000` | max records fetched per user-triggered "Import recent activity" run (total; reviews and shelf items are budgeted before archive-only lists) |
 | `SKYBRIDGE_BACKFILL_DAYS` | `7` | only records written within the last N days (by TID rkey, falling back to `createdAt`) are re-published by an import |
+| `SKYBRIDGE_TEAL_WINDOW_DAYS` | `14` | teal.fm: plays of one album more than N days apart start a new listening session, with its own `Note` |
+| `SKYBRIDGE_TEAL_UPDATE_HOURS` | `24` | teal.fm: shortest interval between two `Update`s refreshing one session's `Note`; a real change to the Note ignores it |
 | `SKYBRIDGE_LOG` | `INFO` | log level |
 | `SKYBRIDGE_SENTRY_DSN` | unset | optional; enables Sentry error reporting and a `atproto.record_ingested` counter metric with `collection`/`operation` attributes |
 

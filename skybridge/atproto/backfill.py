@@ -31,7 +31,7 @@ from skybridge.activitypub.delivery import DeliveryWorker
 from skybridge.atproto import identity
 from skybridge.config import get_settings
 from skybridge.pipeline import ARCHIVE_ONLY_COLLECTIONS, Processed, process_event
-from skybridge.translate import bookhive
+from skybridge.translate import bookhive, teal
 
 log = logging.getLogger("skybridge.backfill")
 
@@ -45,6 +45,8 @@ _FETCH_PRIORITY = (
     "social.popfeed.feed.review",
     "social.popfeed.feed.listItem",
     bookhive.BOOK_COLLECTION,
+    teal.PLAY_COLLECTION,
+    teal.ALPHA_PLAY_COLLECTION,
 )
 
 # TID encoding: 13 chars of base32-sortable, 1 zero bit + 53-bit microseconds

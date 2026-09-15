@@ -1,0 +1,808 @@
+"""teal.fm (``fm.teal.feed.play`` / ``fm.teal.alpha.feed.play``) -> NeoDB AP.
+
+One Note per listening session: the first play of a session publishes it,
+further plays of the same session refresh it at most once a day, a play after
+a silence longer than the window starts a new session (and a new Note), and the
+anchor's deletion hands the Note to the newest survivor of the same session.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from skybridge.activitypub import objects
+from skybridge.atproto import backfill
+from skybridge.db import _ensure_columns, get_engine, session_scope
+from skybridge.models import Record, Work, utcnow
+from skybridge.pipeline import process_event
+from skybridge.translate import neodb, teal, works
+from sqlalchemy import func, insert, select
+
+DID = "did:plc:listener"
+KINTSUGI = "2deefc93-3d50-43b6-a380-de0de3d86ba1"
+
+PLAY = {
+    "$type": teal.PLAY_COLLECTION,
+    "trackName": "The Ghosts of Beverly Drive",
+    "artists": [{"artistName": "Death Cab for Cutie"}],
+    "duration": None,
+    "playedTime": "2026-09-07T15:22:28.000Z",
+    "recordingMbId": "mbid:0256ba09-b1ca-47ed-94b3-cc0029f168e9",
+    "releaseMbId": f"mbid:{KINTSUGI}",
+    "releaseName": "Kintsugi",
+    "submissionClientAgent": "multi-scrobbler/0.16.4",
+}
+
+# Same album, another track, a minute later.
+PLAY_2 = {
+    **PLAY,
+    "trackName": "Black Sun",
+    "recordingMbId": "mbid:6b7f0f6a-2f8e-4d61-9a0e-0d2c1a9b3c11",
+    "playedTime": "2026-09-07T15:27:00.000Z",
+}
+
+APPLE_PLAY = {
+    "$type": teal.PLAY_COLLECTION,
+    "trackName": "TAKE ME BACK",
+    "artists": [{"artistName": "Lucy Bedroque"}],
+    "duration": 171,
+    "musicServiceUri": "https://music.apple.com",
+    "originUri": "https://music.apple.com/us/album/take-me-back/6797714291?i=6797714297",
+    "playedTime": "2026-09-07T15:25:48Z",
+    "releaseName": "SISTERHOOD",
+    "submissionClientAgent": "piper/v0.0.11",
+}
+
+# No release identifier of any kind: only a Last.fm track page.
+UNIDENTIFIED_PLAY = {
+    "$type": teal.PLAY_COLLECTION,
+    "trackName": "Bitter End",
+    "artists": [{"artistName": "Solipsy"}],
+    "musicServiceUri": "https://last.fm",
+    "originUri": "https://www.last.fm/music/Solipsy/_/Bitter+End",
+    "playedTime": "2026-09-07T15:24:15Z",
+    "releaseName": "Bitter End",
+}
+
+
+def _json(value: str | None) -> dict:
+    """Parse a stored AP form, asserting the row actually holds one."""
+    assert value is not None
+    return json.loads(value)
+
+
+def _alpha(record: dict) -> dict:
+    return {**record, "$type": teal.ALPHA_PLAY_COLLECTION}
+
+
+def _translate(record, *, collection=teal.PLAY_COLLECTION, rkey="3lplay000001", operation="create"):
+    ref = works.mint(record)
+    return neodb.translate(
+        did=DID,
+        handle="listener.test",
+        collection=collection,
+        rkey=rkey,
+        record=record,
+        operation=operation,
+        event_time=None,
+        ref=ref,
+    )
+
+
+# --- record shape -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (f"mbid:{KINTSUGI}", KINTSUGI),
+        (KINTSUGI, KINTSUGI),  # bare uuid
+        (f"MBID:{KINTSUGI.upper()}", KINTSUGI),  # case-insensitive
+        ("mbid:", None),
+        ("mbid:not-a-uuid", None),
+        ("https://musicbrainz.org/release/" + KINTSUGI, None),
+        (None, None),
+        (42, None),
+    ],
+)
+def test_mbid_parsing(value, expected):
+    assert teal.mbid(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("uri", "expected"),
+    [
+        ("https://music.apple.com/us/album/take-me-back/6797714291?i=6797714297", "6797714291"),
+        ("https://music.apple.com/gb/album/wild-love/6789444108", "6789444108"),
+        ("https://music.apple.com/album/6789444108", "6789444108"),
+        ("https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC", None),  # a track, not an album
+        ("https://www.last.fm/music/Solipsy/_/Bitter+End", None),
+        (None, None),
+    ],
+)
+def test_apple_album_id(uri, expected):
+    assert teal.apple_album_id(uri) == expected
+
+
+def test_artist_names_prefers_refs_and_falls_back_to_deprecated_array():
+    assert teal.artist_names(PLAY) == ["Death Cab for Cutie"]
+    assert teal.artist_names(
+        {"artists": [{"artistName": "Calcou"}, {"artistName": " Jody Wisternoff "}]}
+    ) == ["Calcou", "Jody Wisternoff"]
+    assert teal.artist_names({"artists": [], "artistNames": ["Passenger"]}) == ["Passenger"]
+    assert teal.artist_names({}) == []
+
+
+def test_is_play_detection():
+    assert teal.is_play(PLAY)
+    assert teal.is_play(_alpha(PLAY))
+    assert not teal.is_play({"$type": "fm.teal.actor.status"})
+    assert not teal.is_play({"$type": "buzz.bookhive.book"})
+
+
+# --- work identity ----------------------------------------------------------
+
+
+@pytest.mark.parametrize("record", [PLAY, _alpha(PLAY)])
+def test_play_mints_album_work_on_the_release(settings, record):
+    ref = works.mint(record)
+    assert ref is not None
+    assert ref.work_type == "music"
+    assert works.ap_type_for(ref.work_type) == "Album"
+    assert works.category_for(ref.work_type) == "music"
+    # the bare uuid keys the work (never the "mbid:" prefix)
+    assert ref.work_id == f"mbReleaseId-{KINTSUGI}"
+    assert ref.title == "Kintsugi"
+
+
+def test_catalog_object_exposes_musicbrainz_release_url(settings):
+    works.mint(PLAY)
+    ref = works.work_ref(PLAY)
+    assert ref is not None
+    doc = objects.get_work_object(ref.work_type, ref.work_id)
+    assert doc is not None
+    assert doc["type"] == "Album"
+    assert doc["display_title"] == "Kintsugi"
+    urls = [e["url"] for e in doc["external_resources"]]
+    assert urls == [f"https://musicbrainz.org/release/{KINTSUGI}"]
+
+
+def test_apple_music_origin_identifies_the_album_when_no_mbid(settings):
+    ref = works.mint(APPLE_PLAY)
+    assert ref is not None
+    assert ref.work_id == "appleMusicAlbumId-6797714291"
+    assert ref.title == "SISTERHOOD"
+    doc = objects.get_work_object(ref.work_type, ref.work_id)
+    assert doc is not None
+    assert [e["url"] for e in doc["external_resources"]] == [
+        "https://music.apple.com/album/6797714291"
+    ]
+
+
+def test_recording_only_or_unidentified_play_mints_no_work(settings):
+    # NeoDB has no track item type: a recording id must not stand in for an
+    # album, and a Last.fm track page names nothing resolvable.
+    recording_only = {k: v for k, v in PLAY.items() if k != "releaseMbId"}
+    assert works.mint(recording_only) is None
+    assert works.mint(UNIDENTIFIED_PLAY) is None
+    with session_scope() as session:
+        assert (session.scalar(select(func.count()).select_from(Work)) or 0) == 0
+
+
+def test_play_and_popfeed_release_dedup_by_musicbrainz_release(settings):
+    popfeed_album = {
+        "$type": "social.popfeed.feed.review",
+        "title": "Kintsugi",
+        "creativeWorkType": "music",
+        "identifiers": {"mbReleaseId": KINTSUGI},
+        "rating": 8,
+        "createdAt": "2026-07-01T00:00:00.000Z",
+    }
+    ref_popfeed = works.mint(popfeed_album)
+    ref_play = works.mint(PLAY)
+    assert ref_popfeed is not None and ref_play is not None
+    assert ref_popfeed.work_key == ref_play.work_key
+
+
+# --- Note shape -------------------------------------------------------------
+
+
+@pytest.mark.parametrize("collection", sorted(teal.PLAY_COLLECTIONS))
+def test_play_becomes_listening_status_only(settings, collection):
+    record = {**PLAY, "$type": collection}
+    note, activity = _translate(record, collection=collection)
+    assert note is not None
+    ref = works.work_ref(record)
+    assert ref is not None
+
+    kinds = [r["type"] for r in note["relatedWith"]]
+    assert kinds == ["Status"]
+    assert note["relatedWith"][0]["status"] == "progress"
+    assert note["relatedWith"][0]["withRegardTo"] == ref.url
+
+    # names the album (linked with the ~neodb~ marker) and the artists — and
+    # NOT the track, so every play of the release derives the same Note
+    assert note["content"] == (
+        f'<p>Listening to <a href="{neodb._marker_url(ref.url)}">Kintsugi</a>'
+        " by Death Cab for Cutie</p>"
+    )
+    assert "Ghosts of Beverly Drive" not in note["content"]
+    assert "name" not in note
+    albums = [t for t in note["tag"] if t.get("type") == "Album"]
+    assert len(albums) == 1 and albums[0]["href"] == ref.url and albums[0]["name"] == "Kintsugi"
+    assert {"type": "Hashtag", "name": "#music"} in note["tag"]
+    assert activity["type"] == "Create"
+    # playedTime is the moment the Note is about (a play has no createdAt)
+    assert note["published"] == PLAY["playedTime"]
+
+
+def test_note_without_artists_or_release_name(settings):
+    record = {**PLAY, "artists": [], "releaseName": ""}
+    note, _ = _translate(record)
+    assert note is not None
+    ref = works.work_ref(record)
+    assert ref is not None
+    # the album is never labelled with the track name
+    assert (
+        note["content"]
+        == f'<p>Listening to <a href="{neodb._marker_url(ref.url)}">an album</a></p>'
+    )
+
+
+# --- pipeline: one Note per listening session -------------------------------
+
+
+def _commit(rkey, record, operation="create", collection=None):
+    return {
+        "did": DID,
+        "kind": "commit",
+        "commit": {
+            "operation": operation,
+            "collection": collection or record.get("$type") or teal.PLAY_COLLECTION,
+            "rkey": rkey,
+            "record": record,
+        },
+    }
+
+
+def _run(event):
+    return asyncio.run(process_event(event, allow_network=False))
+
+
+def _row(at_uri) -> Record:
+    with session_scope() as session:
+        row = session.get(Record, at_uri)
+        assert row is not None
+        session.expunge(row)
+        return row
+
+
+def test_first_play_publishes_and_later_plays_of_the_release_send_nothing(settings):
+    first = _run(_commit("3lplay000001", PLAY))
+    assert first is not None and first.activity["type"] == "Create"
+    anchor = _row(first.at_uri)
+    assert anchor.ap_object_json is not None
+    note_id = _json(anchor.ap_object_json)["id"]
+    assert note_id.endswith("/posts/3lplay000001")
+
+    second = _run(_commit("3lplay000002", PLAY_2))
+    assert second is not None
+    assert second.activity == {}  # nothing to deliver
+    assert second.delivered == 0
+    # the second play is archived, grouped on the same work, and holds no
+    # Note of its own
+    other = _row(second.at_uri)
+    assert other.work_key == anchor.work_key
+    assert other.ap_object_json is None and other.ap_activity_json is None
+    # ...and the anchor's stored forms were not rewritten into an Update
+    anchor_after = _row(first.at_uri)
+    assert anchor_after.ap_object_json == anchor.ap_object_json
+    assert _json(anchor_after.ap_activity_json)["type"] == "Create"
+
+    # the alpha NSID joins the same group
+    third = _run(_commit("3lplay000003", _alpha(PLAY_2)))
+    assert third is not None and third.activity == {}
+    assert _row(third.at_uri).work_key == anchor.work_key
+
+
+def test_plays_without_played_time_still_send_nothing_after_the_first(settings):
+    # playedTime is optional in the lexicon. Without it `published` must come
+    # from something fixed (the anchor's ingest time), or every re-derivation
+    # would differ by a fresh timestamp and each play would become an Update.
+    first = _run(_commit("3lplay000001", {k: v for k, v in PLAY.items() if k != "playedTime"}))
+    assert first is not None and first.activity["type"] == "Create"
+    before = _row(first.at_uri)
+    second = _run(_commit("3lplay000002", {k: v for k, v in PLAY_2.items() if k != "playedTime"}))
+    assert second is not None and second.activity == {} and second.delivered == 0
+    after = _row(first.at_uri)
+    assert after.ap_object_json == before.ap_object_json
+    assert after.ap_activity_json == before.ap_activity_json
+    assert _row(second.at_uri).ap_object_json is None
+
+
+def test_a_different_release_gets_its_own_note(settings):
+    _run(_commit("3lplay000001", PLAY))
+    other = _run(_commit("3lplay000002", APPLE_PLAY))
+    assert other is not None and other.activity["type"] == "Create"
+    assert _json(_row(other.at_uri).ap_object_json)["id"].endswith("/posts/3lplay000002")
+
+
+def test_late_release_title_updates_the_note_once(settings):
+    # First play knows the release only by id; a later one names it.
+    untitled = {k: v for k, v in PLAY.items() if k != "releaseName"}
+    first = _run(_commit("3lplay000001", untitled))
+    assert first is not None and first.activity["type"] == "Create"
+    assert "an album" in _json(_row(first.at_uri).ap_object_json)["content"]
+
+    second = _run(_commit("3lplay000002", PLAY_2))
+    assert second is not None and second.activity["type"] == "Update"
+    # the Update rides on the anchor's id, not the second play's
+    assert second.activity["object"]["id"].endswith("/posts/3lplay000001")
+    note = _json(_row(first.at_uri).ap_object_json)
+    assert "Kintsugi" in note["content"] and "an album" not in note["content"]
+    assert _row(second.at_uri).ap_object_json is None
+
+    # now that nothing differs, a third play is silent again
+    third = _run(_commit("3lplay000003", {**PLAY_2, "trackName": "Little Wanderer"}))
+    assert third is not None and third.activity == {}
+
+
+def test_deleting_a_non_anchor_play_sends_nothing(settings):
+    first = _run(_commit("3lplay000001", PLAY))
+    second = _run(_commit("3lplay000002", PLAY_2))
+    assert first is not None and second is not None
+    deleted = _run(_commit("3lplay000002", {}, "delete"))
+    assert deleted is not None
+    assert deleted.activity == {} and deleted.delivered == 0
+    assert _row(second.at_uri).deleted_at is not None
+    assert _row(first.at_uri).ap_object_json is not None
+
+
+def test_deleting_the_anchor_hands_the_note_to_the_newest_survivor(settings):
+    first = _run(_commit("3lplay000001", PLAY))
+    second = _run(_commit("3lplay000002", PLAY_2))
+    third = _run(_commit("3lplay000003", {**PLAY_2, "trackName": "Little Wanderer"}))
+    assert first is not None and second is not None and third is not None
+
+    deleted = _run(_commit("3lplay000001", {}, "delete"))
+    assert deleted is not None and deleted.activity["type"] == "Delete"
+    tomb = _row(first.at_uri)
+    assert tomb.deleted_at is not None
+    assert _json(tomb.ap_activity_json)["object"]["id"].endswith("/posts/3lplay000001")
+
+    # the newest surviving play (highest TID) now holds a fresh Create
+    survivor = _row(third.at_uri)
+    assert survivor.ap_object_json is not None
+    assert _json(survivor.ap_object_json)["id"].endswith("/posts/3lplay000003")
+    assert _json(survivor.ap_activity_json)["type"] == "Create"
+    assert _row(second.at_uri).ap_object_json is None
+
+
+def test_deleting_the_last_play_leaves_only_a_tombstone(settings):
+    first = _run(_commit("3lplay000001", PLAY))
+    assert first is not None
+    deleted = _run(_commit("3lplay000001", {}, "delete"))
+    assert deleted is not None and deleted.activity["type"] == "Delete"
+    with session_scope() as session:
+        live = session.scalars(select(Record).where(Record.deleted_at.is_(None))).all()
+        assert live == []
+
+
+def test_unidentified_play_is_archived_without_ap(settings):
+    result = _run(_commit("3lplay000001", UNIDENTIFIED_PLAY))
+    assert result is not None and result.activity == {}
+    row = _row(result.at_uri)
+    assert row.work_key is None
+    assert row.ap_object_json is None and row.ap_activity_json is None
+    # raw teal source is archived verbatim (not the normalized work shape)
+    assert json.loads(row.source_json)["$type"] == teal.PLAY_COLLECTION
+    # nothing to dereference at the post URL
+    assert objects.get_post_object("listener.test", "3lplay000001") is None
+
+
+def test_update_moving_a_play_to_another_release_reanchors_both_groups(settings):
+    first = _run(_commit("3lplay000001", PLAY))
+    second = _run(_commit("3lplay000002", PLAY_2))
+    assert first is not None and second is not None
+
+    # The anchor is re-identified as a different album: its Note follows it
+    # (an Update on the same id), and the release it left is re-published
+    # by the survivor under its own rkey.
+    moved = _run(_commit("3lplay000001", APPLE_PLAY, "update"))
+    assert moved is not None and moved.activity["type"] == "Update"
+    moved_note = _json(_row(first.at_uri).ap_object_json)
+    assert moved_note["id"].endswith("/posts/3lplay000001")
+    assert "SISTERHOOD" in moved_note["content"]
+    survivor = _row(second.at_uri)
+    assert survivor.ap_object_json is not None
+    assert _json(survivor.ap_activity_json)["type"] == "Create"
+    assert "Kintsugi" in _json(survivor.ap_object_json)["content"]
+
+
+def test_update_into_a_group_with_a_holder_retracts_the_moving_note(settings):
+    first = _run(_commit("3lplay000001", PLAY))
+    apple = _run(_commit("3lplay000002", APPLE_PLAY))
+    assert first is not None and apple is not None
+
+    # The Apple play is re-identified as Kintsugi, which already has a Note:
+    # its own Note is retracted rather than leaving two for one release.
+    moved = _run(_commit("3lplay000002", PLAY_2, "update"))
+    assert moved is not None
+    row = _row(apple.at_uri)
+    assert row.work_key == _row(first.at_uri).work_key
+    assert row.ap_object_json is None
+    assert _json(row.ap_activity_json)["type"] == "Delete"
+    assert _json(_row(first.at_uri).ap_activity_json)["type"] == "Create"
+
+
+# --- pipeline: listening sessions -------------------------------------------
+
+
+def _played(record: dict, moment: datetime) -> dict:
+    return {**record, "playedTime": moment.isoformat().replace("+00:00", "Z")}
+
+
+def _age_anchor(at_uri: str, hours: float) -> None:
+    """Backdate when the bridge last sent a session's Note.
+
+    The refresh throttle reads the anchor row's ``ap_sent_at``; moving it back
+    is how a test reaches "a day later" without waiting.
+    """
+    with session_scope() as session:
+        row = session.get(Record, at_uri)
+        assert row is not None
+        assert row.ap_sent_at is not None  # the Note has been published
+        row.ap_sent_at = utcnow() - timedelta(hours=hours)
+
+
+def test_a_play_after_the_window_starts_a_new_note(settings):
+    start = datetime(2026, 9, 7, 15, 22, tzinfo=UTC)
+    first = _run(_commit("3lplay000001", _played(PLAY, start)))
+    assert first is not None and first.activity["type"] == "Create"
+    anchor = _row(first.at_uri)
+
+    # 15 days later, past the 14-day window: the listener came back to the
+    # album, which is its own post rather than an edit of the old one.
+    later = _run(_commit("3lplay000009", _played(PLAY_2, start + timedelta(days=15))))
+    assert later is not None and later.activity["type"] == "Create"
+    new_anchor = _row(later.at_uri)
+    assert _json(new_anchor.ap_object_json)["id"].endswith("/posts/3lplay000009")
+    # same album, different session
+    assert new_anchor.work_key == anchor.work_key
+    assert new_anchor.play_group != anchor.play_group
+
+    # the first session's Note is untouched — still its own Create
+    unchanged = _row(first.at_uri)
+    assert unchanged.ap_object_json == anchor.ap_object_json
+    assert _json(unchanged.ap_activity_json)["type"] == "Create"
+
+
+def test_a_play_at_the_window_edge_joins_the_session(settings):
+    start = datetime(2026, 9, 7, 15, 22, tzinfo=UTC)
+    first = _run(_commit("3lplay000001", _played(PLAY, start)))
+    assert first is not None
+    # exactly 14 days: still the same session (the bound is inclusive)
+    edge = _run(_commit("3lplay000009", _played(PLAY_2, start + timedelta(days=14))))
+    assert edge is not None
+    assert _row(edge.at_uri).play_group == _row(first.at_uri).play_group
+    assert _row(edge.at_uri).ap_object_json is None
+
+
+def test_the_window_is_measured_from_the_latest_play_not_the_first(settings):
+    # A daily listener never leaves the session, however long the run.
+    start = datetime(2026, 9, 7, 15, 22, tzinfo=UTC)
+    first = _run(_commit("3lplay000001", _played(PLAY, start)))
+    assert first is not None
+    group = _row(first.at_uri).play_group
+    for day in range(1, 25):
+        step = _run(
+            _commit(f"3lplay0000{day + 9:02d}", _played(PLAY_2, start + timedelta(days=day)))
+        )
+        assert step is not None
+        assert _row(step.at_uri).play_group == group
+
+
+def test_a_repeat_play_refreshes_the_note_once_per_interval(settings):
+    first = _run(_commit("3lplay000001", PLAY))
+    assert first is not None and first.activity["type"] == "Create"
+    note_json = _row(first.at_uri).ap_object_json
+
+    # Straight away: the Note has not changed and was just sent, so nothing
+    # goes out — a scrobbler's per-track records must not become per-track
+    # Updates.
+    second = _run(_commit("3lplay000002", PLAY_2))
+    assert second is not None and second.activity == {} and second.delivered == 0
+    assert _row(first.at_uri).ap_object_json == note_json
+
+    # A day later the same unchanged Note IS sent again, to refresh the
+    # "is listening" mark on NeoDB peers. It rides on the anchor's id.
+    _age_anchor(first.at_uri, hours=25)
+    third = _run(_commit("3lplay000003", PLAY_2))
+    assert third is not None and third.activity["type"] == "Update"
+    assert third.activity["object"]["id"].endswith("/posts/3lplay000001")
+    assert _row(third.at_uri).ap_object_json is None
+
+    # ...and the interval starts again from that refresh.
+    fourth = _run(_commit("3lplay000004", PLAY_2))
+    assert fourth is not None and fourth.activity == {}
+
+
+def test_a_delete_after_the_interval_does_not_refresh_the_note(settings):
+    # Only a play refreshes the mark. A re-derivation that no play triggered
+    # has nothing new to report, however long ago the Note last went out.
+    first = _run(_commit("3lplay000001", PLAY))
+    second = _run(_commit("3lplay000002", PLAY_2))
+    assert first is not None and second is not None
+    before = _row(first.at_uri)
+    _age_anchor(first.at_uri, hours=25)
+
+    deleted = _run(_commit("3lplay000002", {}, "delete"))
+    assert deleted is not None and deleted.activity == {} and deleted.delivered == 0
+    after = _row(first.at_uri)
+    assert after.ap_object_json == before.ap_object_json
+    assert _json(after.ap_activity_json)["type"] == "Create"
+
+
+def test_replaying_an_unchanged_play_keeps_its_session(settings):
+    # Sessions on Sep 7 (two plays) and, after a 23-day silence, Sep 30. A
+    # replay of the Sep 7 follow-up must not be re-measured against the Sep 30
+    # play: it would walk out of its own session and publish a second Note for
+    # one listening.
+    start = datetime(2026, 9, 7, 15, 22, tzinfo=UTC)
+    first = _run(_commit("3lplay000001", _played(PLAY, start)))
+    second = _run(_commit("3lplay000002", _played(PLAY_2, start + timedelta(minutes=5))))
+    later = _run(_commit("3lplay000009", _played(PLAY, start + timedelta(days=23))))
+    assert first is not None and second is not None and later is not None
+    assert _row(second.at_uri).play_group == _row(first.at_uri).play_group
+    assert _row(later.at_uri).play_group != _row(first.at_uri).play_group
+
+    replay = _run(_commit("3lplay000002", _played(PLAY_2, start + timedelta(minutes=5)), "update"))
+    assert replay is not None and replay.activity == {}
+    assert _row(second.at_uri).play_group == _row(first.at_uri).play_group
+    assert _row(second.at_uri).ap_object_json is None
+    with session_scope() as session:
+        published = session.scalars(
+            select(func.count()).select_from(Record).where(Record.ap_object_json.is_not(None))
+        ).one()
+    assert published == 2  # one Note per session, still
+
+
+def test_a_stale_event_time_does_not_cut_a_session(settings):
+    # No playedTime on either side, and the second event is a firehose replay
+    # carrying a three-week-old event time. Both plays reached the bridge
+    # seconds apart and are dated that way: an incoming event time compared
+    # against an archived ingest time would cut a session at every play, and
+    # a scrobbler makes many plays.
+    untimed = {k: v for k, v in PLAY.items() if k != "playedTime"}
+    untimed_2 = {k: v for k, v in PLAY_2.items() if k != "playedTime"}
+    first = _run(_commit("3lplay000001", untimed))
+    assert first is not None and first.activity["type"] == "Create"
+    stale = _commit("3lplay000002", untimed_2)
+    stale["time_us"] = int((utcnow() - timedelta(days=21)).timestamp() * 1_000_000)
+    second = _run(stale)
+    assert second is not None and second.activity == {}
+    assert _row(second.at_uri).play_group == _row(first.at_uri).play_group
+    assert _row(second.at_uri).ap_object_json is None
+
+
+def test_re_persisting_the_anchor_does_not_postpone_a_due_refresh(settings):
+    # _persist rewrites updated_at for a source edit or a re-import that sends
+    # nothing. That must not reset the refresh clock, or an import could hold
+    # the "is listening" mark back for ever.
+    first = _run(_commit("3lplay000001", PLAY))
+    assert first is not None and first.activity["type"] == "Create"
+    _age_anchor(first.at_uri, hours=25)
+
+    # An update of the anchor play itself derives the same Note. It is still a
+    # play, so the refresh that is due goes out — it is not swallowed by the
+    # row being re-persisted moments earlier.
+    touched = _run(_commit("3lplay000001", {**PLAY, "duration": 231}, "update"))
+    assert touched is not None and touched.activity["type"] == "Update"
+    assert touched.activity["object"]["id"].endswith("/posts/3lplay000001")
+
+    # ...and that send, not the re-persisting, is what restarts the interval.
+    played = _run(_commit("3lplay000002", PLAY_2))
+    assert played is not None and played.activity == {}
+
+
+def test_importing_older_plays_after_a_newer_one_groups_them_together(settings):
+    # A live play is already archived when the user imports their history.
+    # Every imported play would otherwise be measured against that newest
+    # play, found its own session, and publish a Note per track.
+    start = datetime(2026, 9, 7, 15, 22, tzinfo=UTC)
+    live = _run(_commit("3lplay000009", _played(PLAY, start + timedelta(days=23))))
+    assert live is not None and live.activity["type"] == "Create"
+
+    first = _run(_commit("3lplay000001", _played(PLAY, start)))
+    second = _run(_commit("3lplay000002", _played(PLAY_2, start + timedelta(minutes=5))))
+    assert first is not None and second is not None
+    assert first.activity["type"] == "Create"  # its own session, 23 days back
+    assert second.activity == {}  # ...which the next imported track joins
+    assert _row(second.at_uri).play_group == _row(first.at_uri).play_group
+    assert _row(first.at_uri).play_group != _row(live.at_uri).play_group
+
+    with session_scope() as session:
+        published = session.scalars(
+            select(func.count()).select_from(Record).where(Record.ap_object_json.is_not(None))
+        ).one()
+    assert published == 2  # two sessions, two Notes — not one per track
+
+
+def test_an_imported_play_joins_a_later_session_within_the_window(settings):
+    # The nearest neighbour may be the play AFTER this one: an import that
+    # reaches back a day from an already-archived session belongs to it.
+    start = datetime(2026, 9, 7, 15, 22, tzinfo=UTC)
+    live = _run(_commit("3lplay000009", _played(PLAY, start)))
+    assert live is not None
+    earlier = _run(_commit("3lplay000001", _played(PLAY_2, start - timedelta(days=1))))
+    assert earlier is not None and earlier.activity == {}
+    assert _row(earlier.at_uri).play_group == _row(live.at_uri).play_group
+
+
+def test_a_promoted_anchor_starts_its_own_refresh_interval(settings):
+    # Deleting an anchor promotes a survivor, which publishes a fresh Create.
+    # That Create is a send: the interval runs from it, however long ago the
+    # promoted play itself was ingested.
+    first = _run(_commit("3lplay000001", PLAY))
+    second = _run(_commit("3lplay000002", PLAY_2))
+    assert first is not None and second is not None
+    with session_scope() as session:  # the survivor was archived days ago
+        row = session.get(Record, second.at_uri)
+        assert row is not None
+        row.created_at = utcnow() - timedelta(days=3)
+
+    promoted = _run(_commit("3lplay000001", {}, "delete"))
+    assert promoted is not None and promoted.activity["type"] == "Delete"
+    assert _json(_row(second.at_uri).ap_activity_json)["type"] == "Create"
+
+    third = _run(_commit("3lplay000003", PLAY_2))
+    assert third is not None and third.activity == {}
+
+
+def test_an_upgraded_database_indexes_the_session_columns(settings):
+    # create_all() indexes only the tables it creates, so a database upgraded
+    # in place gets the new columns without the composite indexes the session
+    # lookups need, and every scrobble would scan the author's whole play
+    # history. Dropping them and re-running the column migration is that
+    # upgrade.
+    wanted = {"ix_record_play_window", "ix_record_play_session"}
+    engine = get_engine()
+    with engine.begin() as conn:
+        for name in wanted:
+            conn.exec_driver_sql(f"DROP INDEX IF EXISTS {name}")
+    _ensure_columns(engine)
+    with engine.begin() as conn:
+        names = {row[1] for row in conn.exec_driver_sql("PRAGMA index_list(record)").fetchall()}
+    assert wanted <= names
+
+
+def test_replaying_an_untimed_play_keeps_its_first_seen_time(settings):
+    # A play without playedTime is dated when the bridge first saw it. A
+    # replay must not re-date it to now: that moves the anchor's `published`,
+    # which reads as a real change and sends an Update nothing asked for.
+    untimed = {k: v for k, v in PLAY.items() if k != "playedTime"}
+    first = _run(_commit("3lplay000001", untimed))
+    assert first is not None and first.activity["type"] == "Create"
+    before = _row(first.at_uri)
+    assert before.played_at is not None
+
+    replay = _run(_commit("3lplay000001", untimed, "update"))
+    assert replay is not None and replay.activity == {}
+    after = _row(first.at_uri)
+    assert after.played_at == before.played_at
+    assert after.ap_object_json == before.ap_object_json
+
+
+def test_played_time_offsets_are_compared_in_utc(settings):
+    # SQLite drops the offset of a DATETIME, so a play stamped in a non-UTC
+    # zone has to be converted before it is stored, or it reads back hours
+    # adrift and lands in the wrong session. Two plays exactly 14 days apart,
+    # both at -10:00, are one session.
+    start = {**PLAY, "playedTime": "2026-09-01T00:00:00-10:00"}
+    fortnight = {**PLAY_2, "playedTime": "2026-09-15T00:00:00-10:00"}
+    first = _run(_commit("3lplay000001", start))
+    assert first is not None and first.activity["type"] == "Create"
+    assert _row(first.at_uri).played_at == datetime(2026, 9, 1, 10, 0, tzinfo=UTC).replace(
+        tzinfo=None
+    )
+    second = _run(_commit("3lplay000009", fortnight))
+    assert second is not None and second.activity == {}
+    assert _row(second.at_uri).play_group == _row(first.at_uri).play_group
+
+
+def test_the_holder_lookup_does_not_walk_a_long_session(settings):
+    # The holder of a session's Note is its OLDEST play, and the lookup runs
+    # newest-first per scrobble: without an index that holds only the
+    # published rows, a session costs more to extend the longer it gets.
+    from skybridge.db import get_engine, optimize
+    from skybridge.pipeline import _active_plays
+
+    group = "music:album#0000000000001"
+    rows = [
+        {
+            "at_uri": f"at://{DID}/{teal.PLAY_COLLECTION}/{i:013d}",
+            "did": DID,
+            "collection": teal.PLAY_COLLECTION,
+            "rkey": f"{i:013d}",
+            "play_group": group,
+            "ap_object_json": '{"id": "x"}' if i == 0 else None,
+            "source_json": "{}",
+            "op": "create",
+            "created_at": utcnow(),
+            "updated_at": utcnow(),
+        }
+        for i in range(2000)
+    ]
+    with session_scope() as session:
+        session.execute(insert(Record), rows)
+    optimize()  # the planner picks the partial index only with statistics
+
+    query = _active_plays(DID, group).where(Record.ap_object_json.is_not(None)).limit(1)
+    engine = get_engine()
+    sql = str(query.compile(engine, compile_kwargs={"literal_binds": True}))
+    with engine.begin() as conn:
+        plan = " ".join(row[-1] for row in conn.exec_driver_sql("EXPLAIN QUERY PLAN " + sql))
+    assert "ix_record_play_holder" in plan
+    assert "SCAN record" not in plan
+
+
+def test_the_same_rkey_under_both_nsids_shares_one_session(settings):
+    # Every object the bridge mints is /users/<handle>/posts/<rkey>, whatever
+    # collection it came from, so two plays sharing an rkey can only ever
+    # share one Note — and must therefore share one session, or both would
+    # claim the same id. (Only a tracker copying its records off the alpha
+    # namespace would produce this, and those copies carry one playedTime.)
+    start = datetime(2026, 9, 7, 15, 22, tzinfo=UTC)
+    first = _run(_commit("3lplay000001", _played(PLAY, start)))
+    assert first is not None and first.activity["type"] == "Create"
+    copied = _run(_commit("3lplay000001", _played(_alpha(PLAY), start)))
+    assert copied is not None and copied.activity == {}
+    assert _row(copied.at_uri).play_group == _row(first.at_uri).play_group
+    assert _row(copied.at_uri).ap_object_json is None  # one Note, on the original
+
+    # A play under the other NSID with an rkey of its own is free to found a
+    # session a month later, and publishes under that rkey.
+    alpha = _run(_commit("3lplay000002", _played(_alpha(PLAY_2), start + timedelta(days=30))))
+    assert alpha is not None and alpha.activity["type"] == "Create"
+    assert _row(alpha.at_uri).play_group != _row(first.at_uri).play_group
+    assert _json(_row(alpha.at_uri).ap_object_json)["id"].endswith("/posts/3lplay000002")
+
+
+def test_a_real_change_is_not_held_back_by_the_refresh_interval(settings):
+    # The release name arrives only with the second play, minutes after the
+    # first: a changed Note goes out at once, throttle or no throttle.
+    untitled = {k: v for k, v in PLAY.items() if k != "releaseName"}
+    first = _run(_commit("3lplay000001", untitled))
+    assert first is not None and first.activity["type"] == "Create"
+    second = _run(_commit("3lplay000002", PLAY_2))
+    assert second is not None and second.activity["type"] == "Update"
+    assert "Kintsugi" in _json(_row(first.at_uri).ap_object_json)["content"]
+
+
+def test_deleting_an_anchor_never_reanchors_onto_an_older_session(settings):
+    start = datetime(2026, 9, 7, 15, 22, tzinfo=UTC)
+    old = _run(_commit("3lplay000001", _played(PLAY, start)))
+    new = _run(_commit("3lplay000009", _played(PLAY_2, start + timedelta(days=15))))
+    assert old is not None and new is not None
+    old_forms = _row(old.at_uri)
+
+    deleted = _run(_commit("3lplay000009", {}, "delete"))
+    assert deleted is not None and deleted.activity["type"] == "Delete"
+    assert deleted.activity["object"]["id"].endswith("/posts/3lplay000009")
+    # The newer session is empty now. Its Note is not handed to the older
+    # session's play, which keeps its own Note exactly as peers hold it.
+    after = _row(old.at_uri)
+    assert after.ap_object_json == old_forms.ap_object_json
+    assert _json(after.ap_activity_json)["type"] == "Create"
+
+
+# --- backfill ---------------------------------------------------------------
+
+
+def test_backfill_fetches_plays_before_archive_only_lists(settings):
+    order = backfill._content_collections()
+    for collection in teal.PLAY_COLLECTIONS:
+        assert order.index(collection) < order.index("social.popfeed.feed.list")
