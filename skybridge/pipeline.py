@@ -699,9 +699,9 @@ def _pair_trigger(did: str, work_key: str) -> str | None:
 # the album later, which is worth its own post: the play founds a new session
 # and a new Create goes out, while the other sessions keep their own Notes
 # untouched. The session a play belongs to is decided once, when it is first
-# ingested, and kept in Record.play_group ("<work_key>#<founder rkey>"), so it
-# never moves under a Note already published — a later update or replay of that
-# play keeps its session unless the release itself changed. Record.played_at
+# ingested, and kept in Record.play_group ("<work_key>#<founder record>"), so
+# it never moves under a Note already published — a later update or replay of
+# that play keeps its session unless the release changed. Record.played_at
 # keeps the time the window measures, so an incoming play and an archived one
 # are always compared on the same footing.
 #
@@ -762,8 +762,15 @@ def _row_play_time(row: Record) -> datetime:
     return _aware(row.played_at) if row.played_at is not None else _aware(row.created_at)
 
 
-def _play_group(*, did: str, work_key: str, rkey: str, at_uri: str, played: datetime) -> str:
-    """The listening session a play belongs to, as ``"<work_key>#<rkey>"``.
+def _play_group(
+    *, did: str, work_key: str, collection: str, rkey: str, at_uri: str, played: datetime
+) -> str:
+    """The session a play belongs to, as ``"<work_key>#<collection>/<rkey>"``.
+
+    The founder is named by collection AND rkey because an rkey is scoped to
+    its collection: the same one can appear under both play NSIDs — which a
+    tracker migrating its records off the alpha namespace would do — and two
+    listenings months apart would then share a session key, and a Note.
 
     Its nearest neighbour in time among the other active plays of the release
     decides it: within ``teal_window_days`` of *played* the new play joins that
@@ -814,7 +821,7 @@ def _play_group(*, did: str, work_key: str, rkey: str, at_uri: str, played: date
         )
         if nearest and nearest[0][0] <= window:
             return nearest[0][1]
-    return f"{work_key}#{rkey}"
+    return f"{work_key}#{collection}/{rkey}"
 
 
 @dataclass
@@ -1044,6 +1051,7 @@ async def _process_play(
         new_group = _play_group(
             did=did,
             work_key=ref.work_key,
+            collection=collection,
             rkey=rkey,
             at_uri=at_uri,
             played=played,
