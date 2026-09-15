@@ -777,6 +777,16 @@ def _play_group(*, did: str, work_key: str, rkey: str, at_uri: str, played: date
     Two bounded, indexed queries: a heavy listener's album can hold thousands
     of plays, and this needs the one on either side.
 
+    The founder is named by its rkey alone, not by collection and rkey, to
+    agree with the Note id a session publishes under: every object the bridge
+    mints is /users/<handle>/posts/<rkey>, whatever collection it came from
+    (see objects._record_for, which dereferences on did and rkey). So if the
+    same rkey ever did appear under both play NSIDs for one release — a
+    tracker copying its records off the alpha namespace is the only way it
+    plausibly could, and those copies carry the same playedTime and land in
+    the same session anyway — the two share one session because they can only
+    ever share one Note.
+
     A play that lands in a silence between two sessions joins the nearer of
     them rather than merging the two, and deleting the plays in the middle of a
     session never splits it. Both keep an already published Note where peers

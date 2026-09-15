@@ -749,6 +749,28 @@ def test_the_holder_lookup_does_not_walk_a_long_session(settings):
     assert "SCAN record" not in plan
 
 
+def test_the_same_rkey_under_both_nsids_shares_one_session(settings):
+    # Every object the bridge mints is /users/<handle>/posts/<rkey>, whatever
+    # collection it came from, so two plays sharing an rkey can only ever
+    # share one Note — and must therefore share one session, or both would
+    # claim the same id. (Only a tracker copying its records off the alpha
+    # namespace would produce this, and those copies carry one playedTime.)
+    start = datetime(2026, 9, 7, 15, 22, tzinfo=UTC)
+    first = _run(_commit("3lplay000001", _played(PLAY, start)))
+    assert first is not None and first.activity["type"] == "Create"
+    copied = _run(_commit("3lplay000001", _played(_alpha(PLAY), start)))
+    assert copied is not None and copied.activity == {}
+    assert _row(copied.at_uri).play_group == _row(first.at_uri).play_group
+    assert _row(copied.at_uri).ap_object_json is None  # one Note, on the original
+
+    # A play under the other NSID with an rkey of its own is free to found a
+    # session a month later, and publishes under that rkey.
+    alpha = _run(_commit("3lplay000002", _played(_alpha(PLAY_2), start + timedelta(days=30))))
+    assert alpha is not None and alpha.activity["type"] == "Create"
+    assert _row(alpha.at_uri).play_group != _row(first.at_uri).play_group
+    assert _json(_row(alpha.at_uri).ap_object_json)["id"].endswith("/posts/3lplay000002")
+
+
 def test_a_real_change_is_not_held_back_by_the_refresh_interval(settings):
     # The release name arrives only with the second play, minutes after the
     # first: a changed Note goes out at once, throttle or no throttle.

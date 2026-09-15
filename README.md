@@ -295,7 +295,11 @@ A play's session is decided once, when the play is first ingested, and kept in
 Note that peers already hold: a later update or replay of that play keeps its
 session unless the release itself changed. The play time the window measures
 is kept alongside it, in `record.played_at`, so an incoming play and an
-archived one are always compared on the same footing. Both lookups a scrobble
+archived one are always compared on the same footing. The founder is named by
+its rkey alone, matching the Note id the session publishes under
+(`/users/<handle>/posts/<rkey>`, as for every other collection), so two plays
+that somehow shared an rkey would share one session — they could only ever
+share one Note. Both lookups a scrobble
 runs — the nearest play of the release in time, and the newest play of a
 session — are single index seeks, so per-play cost does not grow with the
 history behind them. Sessions are therefore cut on arrival order,
