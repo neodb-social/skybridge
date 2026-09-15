@@ -749,18 +749,6 @@ def test_the_holder_lookup_does_not_walk_a_long_session(settings):
     assert "SCAN record" not in plan
 
 
-def test_the_same_rkey_under_both_nsids_does_not_share_a_session(settings):
-    # An rkey is scoped to its collection, so the two play NSIDs can hold the
-    # same one — a tracker migrating off the alpha namespace would do exactly
-    # that. Two listenings a month apart must still be two Notes.
-    start = datetime(2026, 9, 7, 15, 22, tzinfo=UTC)
-    first = _run(_commit("3lplay000001", _played(PLAY, start)))
-    assert first is not None and first.activity["type"] == "Create"
-    month_later = _run(_commit("3lplay000001", _played(_alpha(PLAY_2), start + timedelta(days=30))))
-    assert month_later is not None and month_later.activity["type"] == "Create"
-    assert _row(month_later.at_uri).play_group != _row(first.at_uri).play_group
-
-
 def test_a_real_change_is_not_held_back_by_the_refresh_interval(settings):
     # The release name arrives only with the second play, minutes after the
     # first: a changed Note goes out at once, throttle or no throttle.

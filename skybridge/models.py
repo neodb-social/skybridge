@@ -222,8 +222,8 @@ class Record(Base):
     op: Mapped[str] = mapped_column(String, default="create")  # create|update|delete
     work_key: Mapped[str | None] = mapped_column(String, index=True, default=None)
     # teal.fm plays only: which listening session of (author, release) this
-    # play belongs to, as "<work_key>#<founder collection>/<rkey>". Plays of one
-    # release share a session — and so ONE Note — while consecutive plays are no
+    # play belongs to, as "<work_key>#<founder rkey>". Plays of one release
+    # share a session — and so share ONE Note — while consecutive plays are no
     # more than `teal_window_days` apart; a longer silence starts a new session
     # under a new Note. Assigned once, at ingest; see pipeline._play_group.
     play_group: Mapped[str | None] = mapped_column(String, default=None)

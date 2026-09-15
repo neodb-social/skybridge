@@ -291,9 +291,8 @@ into **listening sessions**, and each session is bridged as **ONE `Note`**:
   play just re-derives the Note, which almost always changes nothing.
 
 A play's session is decided once, when the play is first ingested, and kept in
-`record.play_group` (`"<work_key>#<founder collection>/<rkey>"` — an rkey alone
-would not do, since the same one can appear under both play NSIDs), so it never
-moves under a Note that peers already hold: a later update or replay of that play keeps its
+`record.play_group` (`"<work_key>#<founder rkey>"`), so it never moves under a
+Note that peers already hold: a later update or replay of that play keeps its
 session unless the release itself changed. The play time the window measures
 is kept alongside it, in `record.played_at`, so an incoming play and an
 archived one are always compared on the same footing. Both lookups a scrobble
