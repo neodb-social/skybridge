@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -188,6 +188,16 @@ class Record(Base):
     """
 
     __tablename__ = "record"
+    # The teal.fm session lookups run per scrobble, so each is one index seek
+    # rather than a scan of the author's history: _play_group asks for the
+    # play nearest in time among one release's plays, _active_plays for the
+    # newest play of one session. Both lead with `did` and end on the column
+    # they order by, so SQLite needs no temporary B-tree. Mirrored in
+    # db._ADDED_INDEXES for databases upgraded in place.
+    __table_args__ = (
+        Index("ix_record_play_window", "did", "work_key", "played_at"),
+        Index("ix_record_play_session", "did", "play_group", "rkey"),
+    )
 
     at_uri: Mapped[str] = mapped_column(String, primary_key=True)
     did: Mapped[str] = mapped_column(String, index=True)
@@ -204,15 +214,14 @@ class Record(Base):
     # share a session — and so share ONE Note — while consecutive plays are no
     # more than `teal_window_days` apart; a longer silence starts a new session
     # under a new Note. Assigned once, at ingest; see pipeline._play_group.
-    play_group: Mapped[str | None] = mapped_column(String, index=True, default=None)
+    play_group: Mapped[str | None] = mapped_column(String, default=None)
     # teal.fm plays only: when the play happened — its `playedTime`, or the
     # moment the bridge first saw it when the record carries none. Persisted
     # (rather than re-read per query) so the session window compares the same
-    # value for an incoming play and an archived one, and indexed because
-    # _play_group looks up a play's nearest neighbours in time.
-    played_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), index=True, default=None
-    )
+    # value for an incoming play and an archived one, and indexed (see
+    # __table_args__) because _play_group looks up a play's nearest
+    # neighbours in time.
+    played_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     # When this row's AP object was last published or refreshed to peers, as
     # opposed to `updated_at`, which any re-persist of the source moves. The
     # teal.fm refresh throttle measures from here; NULL means never sent.

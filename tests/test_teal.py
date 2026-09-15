@@ -664,10 +664,11 @@ def test_a_promoted_anchor_starts_its_own_refresh_interval(settings):
 
 def test_an_upgraded_database_indexes_the_session_columns(settings):
     # create_all() indexes only the tables it creates, so a database upgraded
-    # in place gets the new columns without their indexes, and every scrobble
-    # would scan the author's whole play history. Dropping them and re-running
-    # the column migration is that upgrade.
-    wanted = {"ix_record_play_group", "ix_record_played_at"}
+    # in place gets the new columns without the composite indexes the session
+    # lookups need, and every scrobble would scan the author's whole play
+    # history. Dropping them and re-running the column migration is that
+    # upgrade.
+    wanted = {"ix_record_play_window", "ix_record_play_session"}
     engine = get_engine()
     with engine.begin() as conn:
         for name in wanted:

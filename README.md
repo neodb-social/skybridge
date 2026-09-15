@@ -295,7 +295,10 @@ A play's session is decided once, when the play is first ingested, and kept in
 Note that peers already hold: a later update or replay of that play keeps its
 session unless the release itself changed. The play time the window measures
 is kept alongside it, in `record.played_at`, so an incoming play and an
-archived one are always compared on the same footing. Sessions are therefore cut on arrival order,
+archived one are always compared on the same footing. Both lookups a scrobble
+runs — the nearest play of the release in time, and the newest play of a
+session — are single index seeks, so per-play cost does not grow with the
+history behind them. Sessions are therefore cut on arrival order,
 which for both live ingest and a backfill replay is play order (backfill
 replays oldest-first by write time). A play that arrives late and lands inside
 an older silence founds its own session rather than merging the two around it,

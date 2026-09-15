@@ -72,9 +72,9 @@ def _configure_connection(engine: Engine) -> None:
 # and the teal.fm session lookups would then scan an author's whole play
 # history. Named as SQLAlchemy names them, so a fresh database and an upgraded
 # one end up with the same schema.
-_ADDED_INDEXES: tuple[tuple[str, str, str], ...] = (
-    ("ix_record_play_group", "record", "play_group"),
-    ("ix_record_played_at", "record", "played_at"),
+_ADDED_INDEXES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("ix_record_play_window", "record", ("did", "work_key", "played_at")),
+    ("ix_record_play_session", "record", ("did", "play_group", "rkey")),
 )
 
 
@@ -88,12 +88,13 @@ def _ensure_columns(engine: Engine) -> None:
             }
             if existing and column not in existing:
                 conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
-        for name, table, column in _ADDED_INDEXES:
-            columns = {
+        for name, table, columns in _ADDED_INDEXES:
+            present = {
                 row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
             }
-            if column in columns:
-                conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({column})")
+            if set(columns) <= present:
+                spec = ", ".join(columns)
+                conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({spec})")
 
 
 def _make_engine() -> Engine:
