@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -191,12 +191,24 @@ class Record(Base):
     # The teal.fm session lookups run per scrobble, so each is one index seek
     # rather than a scan of the author's history: _play_group asks for the
     # play nearest in time among one release's plays, _active_plays for the
-    # newest play of one session. Both lead with `did` and end on the column
-    # they order by, so SQLite needs no temporary B-tree. Mirrored in
+    # newest play of one session, _play_holder for the one play of a session
+    # that holds its Note. Each leads with `did` and ends on the column it
+    # orders by, so SQLite needs no temporary B-tree. Mirrored in
     # db._ADDED_INDEXES for databases upgraded in place.
     __table_args__ = (
         Index("ix_record_play_window", "did", "work_key", "played_at"),
         Index("ix_record_play_session", "did", "play_group", "rkey"),
+        # The holder of a session's Note is usually its OLDEST play, so the
+        # newest-first lookup above would walk the whole session to reach it —
+        # per scrobble, which makes a long session quadratic. A partial index
+        # holds only the published rows: one per session.
+        Index(
+            "ix_record_play_holder",
+            "did",
+            "play_group",
+            "rkey",
+            sqlite_where=text("ap_object_json IS NOT NULL AND deleted_at IS NULL"),
+        ),
     )
 
     at_uri: Mapped[str] = mapped_column(String, primary_key=True)

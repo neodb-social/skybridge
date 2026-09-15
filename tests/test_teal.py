@@ -19,7 +19,7 @@ from skybridge.db import _ensure_columns, get_engine, session_scope
 from skybridge.models import Record, Work, utcnow
 from skybridge.pipeline import process_event
 from skybridge.translate import neodb, teal, works
-from sqlalchemy import func, select
+from sqlalchemy import func, insert, select
 
 DID = "did:plc:listener"
 KINTSUGI = "2deefc93-3d50-43b6-a380-de0de3d86ba1"
@@ -711,6 +711,42 @@ def test_played_time_offsets_are_compared_in_utc(settings):
     second = _run(_commit("3lplay000009", fortnight))
     assert second is not None and second.activity == {}
     assert _row(second.at_uri).play_group == _row(first.at_uri).play_group
+
+
+def test_the_holder_lookup_does_not_walk_a_long_session(settings):
+    # The holder of a session's Note is its OLDEST play, and the lookup runs
+    # newest-first per scrobble: without an index that holds only the
+    # published rows, a session costs more to extend the longer it gets.
+    from skybridge.db import get_engine, optimize
+    from skybridge.pipeline import _active_plays
+
+    group = "music:album#0000000000001"
+    rows = [
+        {
+            "at_uri": f"at://{DID}/{teal.PLAY_COLLECTION}/{i:013d}",
+            "did": DID,
+            "collection": teal.PLAY_COLLECTION,
+            "rkey": f"{i:013d}",
+            "play_group": group,
+            "ap_object_json": '{"id": "x"}' if i == 0 else None,
+            "source_json": "{}",
+            "op": "create",
+            "created_at": utcnow(),
+            "updated_at": utcnow(),
+        }
+        for i in range(2000)
+    ]
+    with session_scope() as session:
+        session.execute(insert(Record), rows)
+    optimize()  # the planner picks the partial index only with statistics
+
+    query = _active_plays(DID, group).where(Record.ap_object_json.is_not(None)).limit(1)
+    engine = get_engine()
+    sql = str(query.compile(engine, compile_kwargs={"literal_binds": True}))
+    with engine.begin() as conn:
+        plan = " ".join(row[-1] for row in conn.exec_driver_sql("EXPLAIN QUERY PLAN " + sql))
+    assert "ix_record_play_holder" in plan
+    assert "SCAN record" not in plan
 
 
 def test_a_real_change_is_not_held_back_by_the_refresh_interval(settings):

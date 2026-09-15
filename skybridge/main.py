@@ -34,7 +34,7 @@ from skybridge.activitypub.relays import reconcile_relays
 from skybridge.atproto import archive as archive_replay
 from skybridge.atproto import backfill, discover, identity, oauth
 from skybridge.config import get_settings
-from skybridge.db import init_db, session_scope
+from skybridge.db import init_db, optimize_loop, session_scope
 from skybridge.models import BridgedActor, Cursor, Record, Work
 from skybridge.stats import collect_stats, usage_refresh_loop
 from skybridge.translate import works
@@ -84,6 +84,11 @@ async def lifespan(app: FastAPI):
     # they are whole-table aggregates and nothing waits on them being current.
     usage_task = asyncio.create_task(usage_refresh_loop(), name="usage-refresh")
     app.state.usage_task = usage_task
+
+    # Keeps the query planner's statistics current as the archive grows; see
+    # db.optimize for what goes wrong without them.
+    optimize_task = asyncio.create_task(optimize_loop(), name="db-optimize")
+    app.state.optimize_task = optimize_task
     try:
         yield
     finally:
@@ -98,6 +103,9 @@ async def lifespan(app: FastAPI):
         usage_task.cancel()
         with suppress(asyncio.CancelledError):
             await usage_task
+        optimize_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await optimize_task
         if not relay_task.done():
             relay_task.cancel()
             with suppress(asyncio.CancelledError):
