@@ -316,7 +316,6 @@ async def process_event(
             operation=operation,
             seq=seq,
             cid=event.get("cid"),
-            event_time=event_time,
             worker=worker,
         )
 
@@ -699,8 +698,10 @@ def _pair_trigger(did: str, work_key: str) -> str | None:
 # means the listener came back to the album later, which is worth its own post:
 # the play founds a new session and a new Create goes out, while the earlier
 # session keeps its own Note untouched. The session a play belongs to is
-# decided once, at ingest, and kept in Record.play_group ("<work_key>#<founder
-# rkey>"), so it never moves under a Note already published.
+# decided once, when it is first ingested, and kept in Record.play_group
+# ("<work_key>#<founder rkey>"), so it never moves under a Note already
+# published — a later update or replay of that play keeps its session unless
+# the release itself changed.
 #
 # Within a session the Note's content names only the album and its artists,
 # never a track or a count, so a further play derives an identical Note. It
@@ -720,8 +721,12 @@ def _pair_trigger(did: str, work_key: str) -> str | None:
 def _play_time(record: dict, fallback: datetime) -> datetime:
     """When a play happened: its ``playedTime``, else *fallback*.
 
-    ``playedTime`` is optional in the teal lexicon; the caller passes the
-    row's own ingest time (or the event time) for a play without one.
+    ``playedTime`` is optional in the teal lexicon. A play without one counts
+    as played when the bridge first saw it, and *fallback* is that moment —
+    ``utcnow()`` for a play being ingested, the row's own ``created_at`` for
+    one already archived. The two MUST agree: a window measured between an
+    event time on one side and an ingest time on the other would cut a session
+    at every play once a replay ran late, and a scrobbler makes many plays.
     """
     played = record.get("playedTime")
     if isinstance(played, str) and played:
@@ -736,21 +741,6 @@ def _play_time(record: dict, fallback: datetime) -> datetime:
 def _aware(moment: datetime) -> datetime:
     """A timestamp as UTC-aware: SQLite hands a DATETIME column back naive."""
     return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
-
-
-def _event_datetime(event_time: str | None) -> datetime:
-    """The firehose event time as a datetime, falling back to *now*.
-
-    Only the fallback play time of a play without ``playedTime`` — a session
-    is cut on when the listening happened, and the event time is the closest
-    stand-in the record offers.
-    """
-    if event_time:
-        try:
-            return _aware(datetime.fromisoformat(event_time))
-        except ValueError:
-            pass
-    return utcnow()
 
 
 def _row_play_time(row: Record) -> datetime:
@@ -795,18 +785,19 @@ def _play_group(*, did: str, work_key: str, rkey: str, at_uri: str, played: date
     return f"{work_key}#{rkey}"
 
 
-def _prior_play_state(at_uri: str) -> tuple[str | None, str | None]:
-    """(published Note id, play_group) of a play before this event.
+def _prior_play_state(at_uri: str) -> tuple[str | None, str | None, str | None]:
+    """(published Note id, play_group, work_key) of a play before this event.
 
-    The play equivalent of :func:`_prior_state`, which reports the work rather
-    than the session: a play's Note is shared per session, so that is the key
-    the retraction and re-derivation paths need.
+    The play equivalent of :func:`_prior_state`, which reports the work alone:
+    a play's Note is shared per session, so the session is the key the
+    retraction and re-derivation paths need, and the work says whether that
+    session still applies.
     """
     with session_scope() as session:
         row = session.get(Record, at_uri)
         if row is None or row.deleted_at is not None:
-            return None, None
-        return _stored_note_id(row.ap_object_json), row.play_group
+            return None, None, None
+        return _stored_note_id(row.ap_object_json), row.play_group, row.work_key
 
 
 def _active_plays(did: str, play_group: str):
@@ -881,23 +872,39 @@ def _same_note(stored_json: str | None, note: dict) -> bool:
     return stored is not None and _without_volatile(stored) == _without_volatile(note)
 
 
-def _refresh_due(anchor_uri: str) -> bool:
+def _last_sent(anchor_uri: str, stored_json: str | None) -> datetime | None:
+    """When the session's Note last went out to peers, as best as it is known.
+
+    The Note's own ``updated`` stamp once it has been refreshed at least once
+    (neodb.translate writes it at the moment of the send), and the anchor
+    row's ``created_at`` before that — the row is created and its Create
+    published in one breath. Both are deliberately immune to ``_persist``,
+    which rewrites ``updated_at`` for a source edit or a re-import that sends
+    nothing: reading that would let an import postpone an overdue refresh
+    indefinitely. And neither is the Note's ``published``, which is the play
+    time a tracker may report long after the fact.
+    """
+    stamp = (_source_dict(stored_json) or {}).get("updated") if stored_json else None
+    if isinstance(stamp, str):
+        try:
+            return _aware(datetime.fromisoformat(stamp))
+        except ValueError:
+            pass
+    with session_scope() as session:
+        row = session.get(Record, anchor_uri)
+        return _aware(row.created_at) if row is not None else None
+
+
+def _refresh_due(anchor_uri: str, stored_json: str | None) -> bool:
     """Has ``teal_update_hours`` passed since the session's Note went out?
 
-    The clock is the anchor row's own ``updated_at``, which _update_ap bumps
-    every time the Note is published or refreshed — the moment peers last
-    received it. It costs no extra state and survives a restart, unlike a
-    timer held in memory. It is deliberately NOT the Note's ``published``:
-    that is the play time, which a tracker may report long after the fact.
-    A row that has gone missing reads as due; one Update too many is
-    harmless, a mark frozen for ever is not.
+    A send time that cannot be read at all counts as due: one Update too many
+    is harmless, a mark frozen for ever is not.
     """
     interval = timedelta(hours=get_settings().teal_update_hours)
     if not interval:
         return True
-    with session_scope() as session:
-        row = session.get(Record, anchor_uri)
-        sent = _aware(row.updated_at) if row is not None else None
+    sent = _last_sent(anchor_uri, stored_json)
     return sent is None or utcnow() - sent >= interval
 
 
@@ -954,7 +961,7 @@ def _sync_play_group(
     if (
         derived.stored_note_json is not None
         and _same_note(derived.stored_note_json, derived.note)
-        and not (refresh and _refresh_due(derived.anchor_uri))
+        and not (refresh and _refresh_due(derived.anchor_uri, derived.stored_note_json))
     ):
         return None
     _update_ap(derived.anchor_uri, derived.note, derived.activity)
@@ -973,7 +980,6 @@ async def _process_play(
     operation: str,
     seq: int | None,
     cid: str | None,
-    event_time: str | None,
     worker: DeliveryWorker | None,
 ) -> Processed:
     """Create/update of one teal.fm play; see the section comment above.
@@ -985,18 +991,24 @@ async def _process_play(
     play already holds, has its own Note retracted first — one session must
     never end up with two published Notes.
     """
-    note_id, prior_group = _prior_play_state(at_uri)
-    new_group = (
-        _play_group(
+    note_id, prior_group, prior_work_key = _prior_play_state(at_uri)
+    if ref is None:
+        new_group = None
+    elif prior_group is not None and prior_work_key == ref.work_key:
+        # An update or a replay of a play already in a session, still naming
+        # the same release: it keeps its session. Deciding membership afresh
+        # would compare it against whatever play is newest NOW and could walk
+        # it out of the session its Note was published under, leaving the
+        # album with two Notes for one listening.
+        new_group = prior_group
+    else:
+        new_group = _play_group(
             did=did,
             work_key=ref.work_key,
             rkey=rkey,
             at_uri=at_uri,
-            played=_play_time(record, _event_datetime(event_time)),
+            played=_play_time(record, utcnow()),
         )
-        if ref is not None
-        else None
-    )
     retraction = None
     if note_id is not None and (
         new_group is None

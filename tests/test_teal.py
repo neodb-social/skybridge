@@ -448,13 +448,19 @@ def _played(record: dict, moment: datetime) -> dict:
 def _age_anchor(at_uri: str, hours: float) -> None:
     """Backdate when the bridge last sent a session's Note.
 
-    The refresh throttle reads the anchor row's ``updated_at``; moving it back
-    is how a test reaches "a day later" without waiting.
+    The refresh throttle reads the Note's own ``updated`` stamp, and the
+    anchor row's ``created_at`` before the Note has ever been refreshed;
+    moving both back is how a test reaches "a day later" without waiting.
     """
+    then = utcnow() - timedelta(hours=hours)
     with session_scope() as session:
         row = session.get(Record, at_uri)
         assert row is not None
-        row.updated_at = utcnow() - timedelta(hours=hours)
+        row.created_at = then
+        note = json.loads(row.ap_object_json) if row.ap_object_json else None
+        if note is not None and "updated" in note:
+            note["updated"] = then.isoformat()
+            row.ap_object_json = json.dumps(note)
 
 
 def test_a_play_after_the_window_starts_a_new_note(settings):
@@ -543,6 +549,68 @@ def test_a_delete_after_the_interval_does_not_refresh_the_note(settings):
     after = _row(first.at_uri)
     assert after.ap_object_json == before.ap_object_json
     assert _json(after.ap_activity_json)["type"] == "Create"
+
+
+def test_replaying_an_unchanged_play_keeps_its_session(settings):
+    # Sessions on Sep 7 (two plays) and, after a 23-day silence, Sep 30. A
+    # replay of the Sep 7 follow-up must not be re-measured against the Sep 30
+    # play: it would walk out of its own session and publish a second Note for
+    # one listening.
+    start = datetime(2026, 9, 7, 15, 22, tzinfo=UTC)
+    first = _run(_commit("3lplay000001", _played(PLAY, start)))
+    second = _run(_commit("3lplay000002", _played(PLAY_2, start + timedelta(minutes=5))))
+    later = _run(_commit("3lplay000009", _played(PLAY, start + timedelta(days=23))))
+    assert first is not None and second is not None and later is not None
+    assert _row(second.at_uri).play_group == _row(first.at_uri).play_group
+    assert _row(later.at_uri).play_group != _row(first.at_uri).play_group
+
+    replay = _run(_commit("3lplay000002", _played(PLAY_2, start + timedelta(minutes=5)), "update"))
+    assert replay is not None and replay.activity == {}
+    assert _row(second.at_uri).play_group == _row(first.at_uri).play_group
+    assert _row(second.at_uri).ap_object_json is None
+    with session_scope() as session:
+        published = session.scalars(
+            select(func.count()).select_from(Record).where(Record.ap_object_json.is_not(None))
+        ).one()
+    assert published == 2  # one Note per session, still
+
+
+def test_a_stale_event_time_does_not_cut_a_session(settings):
+    # No playedTime on either side, and the second event is a firehose replay
+    # carrying a three-week-old event time. Both plays reached the bridge
+    # seconds apart and are dated that way: an incoming event time compared
+    # against an archived ingest time would cut a session at every play, and
+    # a scrobbler makes many plays.
+    untimed = {k: v for k, v in PLAY.items() if k != "playedTime"}
+    untimed_2 = {k: v for k, v in PLAY_2.items() if k != "playedTime"}
+    first = _run(_commit("3lplay000001", untimed))
+    assert first is not None and first.activity["type"] == "Create"
+    stale = _commit("3lplay000002", untimed_2)
+    stale["time_us"] = int((utcnow() - timedelta(days=21)).timestamp() * 1_000_000)
+    second = _run(stale)
+    assert second is not None and second.activity == {}
+    assert _row(second.at_uri).play_group == _row(first.at_uri).play_group
+    assert _row(second.at_uri).ap_object_json is None
+
+
+def test_re_persisting_the_anchor_does_not_postpone_a_due_refresh(settings):
+    # _persist rewrites updated_at for a source edit or a re-import that sends
+    # nothing. That must not reset the refresh clock, or an import could hold
+    # the "is listening" mark back for ever.
+    first = _run(_commit("3lplay000001", PLAY))
+    assert first is not None and first.activity["type"] == "Create"
+    _age_anchor(first.at_uri, hours=25)
+
+    # An update of the anchor play itself derives the same Note. It is still a
+    # play, so the refresh that is due goes out — it is not swallowed by the
+    # row being re-persisted moments earlier.
+    touched = _run(_commit("3lplay000001", {**PLAY, "duration": 231}, "update"))
+    assert touched is not None and touched.activity["type"] == "Update"
+    assert touched.activity["object"]["id"].endswith("/posts/3lplay000001")
+
+    # ...and that send, not the re-persisting, is what restarts the interval.
+    played = _run(_commit("3lplay000002", PLAY_2))
+    assert played is not None and played.activity == {}
 
 
 def test_a_real_change_is_not_held_back_by_the_refresh_interval(settings):

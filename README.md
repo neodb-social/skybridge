@@ -274,8 +274,9 @@ into **listening sessions**, and each session is bridged as **ONE `Note`**:
   with an `Update` — but only a play refreshes it, and at most one `Update` per
   `SKYBRIDGE_TEAL_UPDATE_HOURS` (default 24), since an `Update` per scrobbled
   track would flood relays for a mark that did not move. The throttle clock is
-  when the bridge last sent that Note (the anchor row's `updated_at`), so it
-  survives a restart and needs no timer in memory.
+  when the bridge last sent that Note (its `updated` stamp, or the anchor
+  row's `created_at` before the first refresh), so it survives a restart,
+  needs no timer in memory, and no re-import can postpone it.
 - A real change to the Note is never throttled: the Note is re-derived and
   compared with the stored one (ignoring `updated` stamps), and an `Update`
   goes out at once when it actually differs — a release title that only a
@@ -286,9 +287,10 @@ into **listening sessions**, and each session is bridged as **ONE `Note`**:
   **the same session** re-publishes it under its own rkey. Deleting any other
   play just re-derives the Note, which almost always changes nothing.
 
-A play's session is decided once, when the play is ingested, and kept in
+A play's session is decided once, when the play is first ingested, and kept in
 `record.play_group` (`"<work_key>#<founder rkey>"`), so it never moves under a
-Note that peers already hold. Sessions are therefore cut on arrival order,
+Note that peers already hold: a later update or replay of that play keeps its
+session unless the release itself changed. Sessions are therefore cut on arrival order,
 which for both live ingest and a backfill replay is play order (backfill
 replays oldest-first by write time). A play that arrives late and lands inside
 an older silence founds its own session rather than merging the two around it,
@@ -300,7 +302,10 @@ and deleting the plays in the middle of a session never splits it.
 
 `published` is the session-anchoring play's `playedTime` (a play has no
 `createdAt`), falling back to the bridge's own ingest time of that play when it
-is absent. The same `playedTime` decides which session a play joins.
+is absent. The same `playedTime` decides which session a play joins, and the
+same fallback applies there: a play without one counts as played when the
+bridge first saw it, never at the firehose event time, so a replay arriving
+late cannot cut a session at every play.
 
 One consequence for imports: a history import that does not deliver (the
 default) publishes each session's Note silently. A later live play of that
