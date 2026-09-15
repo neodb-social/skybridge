@@ -205,6 +205,18 @@ class Record(Base):
     # more than `teal_window_days` apart; a longer silence starts a new session
     # under a new Note. Assigned once, at ingest; see pipeline._play_group.
     play_group: Mapped[str | None] = mapped_column(String, index=True, default=None)
+    # teal.fm plays only: when the play happened — its `playedTime`, or the
+    # moment the bridge first saw it when the record carries none. Persisted
+    # (rather than re-read per query) so the session window compares the same
+    # value for an incoming play and an archived one, and indexed because
+    # _play_group looks up a play's nearest neighbours in time.
+    played_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True, default=None
+    )
+    # When this row's AP object was last published or refreshed to peers, as
+    # opposed to `updated_at`, which any re-persist of the source moves. The
+    # teal.fm refresh throttle measures from here; NULL means never sent.
+    ap_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     # Highest Jetstream v2 `seq` applied to this row: the high-water mark that
     # keeps a replayed archive event from overwriting newer live state, and
     # makes the live tail's at-least-once redelivery idempotent. NULL on rows

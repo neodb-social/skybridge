@@ -259,11 +259,14 @@ A scrobbler writes one record per track, so bridging each play as its own Note
 would post a 12-track album twelve times. Plays of one release are instead cut
 into **listening sessions**, and each session is bridged as **ONE `Note`**:
 
-- A play joins the newest session of that release when it follows the session's
-  latest play by no more than `SKYBRIDGE_TEAL_WINDOW_DAYS` (default 14). A
-  longer silence means the listener came back to the album later, which is
-  worth its own post: that play founds a new session and a new `Create` goes
-  out, while the earlier session keeps its own Note unchanged.
+- A play joins the session of its nearest neighbour in time among that
+  release's plays, when the two are no more than `SKYBRIDGE_TEAL_WINDOW_DAYS`
+  apart (default 14). A longer silence on both sides means the listener came
+  back to the album later, which is worth its own post: that play founds a new
+  session and a new `Create` goes out, while the other sessions keep their own
+  Notes unchanged. Neighbours are looked up on both sides, so importing a
+  history behind plays already archived joins those imported plays to each
+  other instead of giving each track a Note.
 - The first play of a session publishes the Note (`Create`), anchored on that
   play's rkey. Its content names only the album and the artists of that play
   (never a track or a play count) and carries a `Status` of `progress`
@@ -274,9 +277,9 @@ into **listening sessions**, and each session is bridged as **ONE `Note`**:
   with an `Update` — but only a play refreshes it, and at most one `Update` per
   `SKYBRIDGE_TEAL_UPDATE_HOURS` (default 24), since an `Update` per scrobbled
   track would flood relays for a mark that did not move. The throttle clock is
-  when the bridge last sent that Note (its `updated` stamp, or the anchor
-  row's `created_at` before the first refresh), so it survives a restart,
-  needs no timer in memory, and no re-import can postpone it.
+  `record.ap_sent_at`, stamped when the Note is actually published or
+  refreshed, so it survives a restart, needs no timer in memory, and no
+  re-import or source edit can postpone it.
 - A real change to the Note is never throttled: the Note is re-derived and
   compared with the stored one (ignoring `updated` stamps), and an `Update`
   goes out at once when it actually differs — a release title that only a
@@ -290,7 +293,9 @@ into **listening sessions**, and each session is bridged as **ONE `Note`**:
 A play's session is decided once, when the play is first ingested, and kept in
 `record.play_group` (`"<work_key>#<founder rkey>"`), so it never moves under a
 Note that peers already hold: a later update or replay of that play keeps its
-session unless the release itself changed. Sessions are therefore cut on arrival order,
+session unless the release itself changed. The play time the window measures
+is kept alongside it, in `record.played_at`, so an incoming play and an
+archived one are always compared on the same footing. Sessions are therefore cut on arrival order,
 which for both live ingest and a backfill replay is play order (backfill
 replays oldest-first by write time). A play that arrives late and lands inside
 an older silence founds its own session rather than merging the two around it,
@@ -306,6 +311,11 @@ is absent. The same `playedTime` decides which session a play joins, and the
 same fallback applies there: a play without one counts as played when the
 bridge first saw it, never at the firehose event time, so a replay arriving
 late cannot cut a session at every play.
+
+One consequence for an import that reaches further back than the window: two
+listenings of one album weeks apart are two sessions, so a heavy listener's
+history federates as a handful of Notes per album, not one, and not one per
+track.
 
 One consequence for imports: a history import that does not deliver (the
 default) publishes each session's Note silently. A later live play of that

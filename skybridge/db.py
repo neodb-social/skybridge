@@ -40,6 +40,8 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("bridged_actor", "no_unauthenticated", "BOOLEAN NOT NULL DEFAULT 0"),
     ("bridged_actor", "last_visibility_seq", "INTEGER"),
     ("record", "play_group", "VARCHAR"),
+    ("record", "played_at", "DATETIME"),
+    ("record", "ap_sent_at", "DATETIME"),
 )
 
 
@@ -64,8 +66,21 @@ def _configure_connection(engine: Engine) -> None:
             cursor.close()
 
 
+# Indexes on columns added after the initial release. create_all() builds the
+# indexes of a table it creates and nothing else, so a column _ensure_columns
+# adds to an existing table arrives unindexed however the model declares it —
+# and the teal.fm session lookups would then scan an author's whole play
+# history. Named as SQLAlchemy names them, so a fresh database and an upgraded
+# one end up with the same schema.
+_ADDED_INDEXES: tuple[tuple[str, str, str], ...] = (
+    ("ix_record_play_group", "record", "play_group"),
+    ("ix_record_played_at", "record", "played_at"),
+)
+
+
 def _ensure_columns(engine: Engine) -> None:
-    """Add any post-release columns missing from an existing database."""
+    """Add any post-release columns, and their indexes, missing from an
+    existing database."""
     with engine.begin() as conn:
         for table, column, coltype in _ADDED_COLUMNS:
             existing = {
@@ -73,6 +88,12 @@ def _ensure_columns(engine: Engine) -> None:
             }
             if existing and column not in existing:
                 conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+        for name, table, column in _ADDED_INDEXES:
+            columns = {
+                row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
+            }
+            if column in columns:
+                conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({column})")
 
 
 def _make_engine() -> Engine:

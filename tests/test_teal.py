@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from skybridge.activitypub import objects
 from skybridge.atproto import backfill
-from skybridge.db import session_scope
+from skybridge.db import _ensure_columns, get_engine, session_scope
 from skybridge.models import Record, Work, utcnow
 from skybridge.pipeline import process_event
 from skybridge.translate import neodb, teal, works
@@ -448,19 +448,14 @@ def _played(record: dict, moment: datetime) -> dict:
 def _age_anchor(at_uri: str, hours: float) -> None:
     """Backdate when the bridge last sent a session's Note.
 
-    The refresh throttle reads the Note's own ``updated`` stamp, and the
-    anchor row's ``created_at`` before the Note has ever been refreshed;
-    moving both back is how a test reaches "a day later" without waiting.
+    The refresh throttle reads the anchor row's ``ap_sent_at``; moving it back
+    is how a test reaches "a day later" without waiting.
     """
-    then = utcnow() - timedelta(hours=hours)
     with session_scope() as session:
         row = session.get(Record, at_uri)
         assert row is not None
-        row.created_at = then
-        note = json.loads(row.ap_object_json) if row.ap_object_json else None
-        if note is not None and "updated" in note:
-            note["updated"] = then.isoformat()
-            row.ap_object_json = json.dumps(note)
+        assert row.ap_sent_at is not None  # the Note has been published
+        row.ap_sent_at = utcnow() - timedelta(hours=hours)
 
 
 def test_a_play_after_the_window_starts_a_new_note(settings):
@@ -611,6 +606,76 @@ def test_re_persisting_the_anchor_does_not_postpone_a_due_refresh(settings):
     # ...and that send, not the re-persisting, is what restarts the interval.
     played = _run(_commit("3lplay000002", PLAY_2))
     assert played is not None and played.activity == {}
+
+
+def test_importing_older_plays_after_a_newer_one_groups_them_together(settings):
+    # A live play is already archived when the user imports their history.
+    # Every imported play would otherwise be measured against that newest
+    # play, found its own session, and publish a Note per track.
+    start = datetime(2026, 9, 7, 15, 22, tzinfo=UTC)
+    live = _run(_commit("3lplay000009", _played(PLAY, start + timedelta(days=23))))
+    assert live is not None and live.activity["type"] == "Create"
+
+    first = _run(_commit("3lplay000001", _played(PLAY, start)))
+    second = _run(_commit("3lplay000002", _played(PLAY_2, start + timedelta(minutes=5))))
+    assert first is not None and second is not None
+    assert first.activity["type"] == "Create"  # its own session, 23 days back
+    assert second.activity == {}  # ...which the next imported track joins
+    assert _row(second.at_uri).play_group == _row(first.at_uri).play_group
+    assert _row(first.at_uri).play_group != _row(live.at_uri).play_group
+
+    with session_scope() as session:
+        published = session.scalars(
+            select(func.count()).select_from(Record).where(Record.ap_object_json.is_not(None))
+        ).one()
+    assert published == 2  # two sessions, two Notes — not one per track
+
+
+def test_an_imported_play_joins_a_later_session_within_the_window(settings):
+    # The nearest neighbour may be the play AFTER this one: an import that
+    # reaches back a day from an already-archived session belongs to it.
+    start = datetime(2026, 9, 7, 15, 22, tzinfo=UTC)
+    live = _run(_commit("3lplay000009", _played(PLAY, start)))
+    assert live is not None
+    earlier = _run(_commit("3lplay000001", _played(PLAY_2, start - timedelta(days=1))))
+    assert earlier is not None and earlier.activity == {}
+    assert _row(earlier.at_uri).play_group == _row(live.at_uri).play_group
+
+
+def test_a_promoted_anchor_starts_its_own_refresh_interval(settings):
+    # Deleting an anchor promotes a survivor, which publishes a fresh Create.
+    # That Create is a send: the interval runs from it, however long ago the
+    # promoted play itself was ingested.
+    first = _run(_commit("3lplay000001", PLAY))
+    second = _run(_commit("3lplay000002", PLAY_2))
+    assert first is not None and second is not None
+    with session_scope() as session:  # the survivor was archived days ago
+        row = session.get(Record, second.at_uri)
+        assert row is not None
+        row.created_at = utcnow() - timedelta(days=3)
+
+    promoted = _run(_commit("3lplay000001", {}, "delete"))
+    assert promoted is not None and promoted.activity["type"] == "Delete"
+    assert _json(_row(second.at_uri).ap_activity_json)["type"] == "Create"
+
+    third = _run(_commit("3lplay000003", PLAY_2))
+    assert third is not None and third.activity == {}
+
+
+def test_an_upgraded_database_indexes_the_session_columns(settings):
+    # create_all() indexes only the tables it creates, so a database upgraded
+    # in place gets the new columns without their indexes, and every scrobble
+    # would scan the author's whole play history. Dropping them and re-running
+    # the column migration is that upgrade.
+    wanted = {"ix_record_play_group", "ix_record_played_at"}
+    engine = get_engine()
+    with engine.begin() as conn:
+        for name in wanted:
+            conn.exec_driver_sql(f"DROP INDEX IF EXISTS {name}")
+    _ensure_columns(engine)
+    with engine.begin() as conn:
+        names = {row[1] for row in conn.exec_driver_sql("PRAGMA index_list(record)").fetchall()}
+    assert wanted <= names
 
 
 def test_a_real_change_is_not_held_back_by_the_refresh_interval(settings):
