@@ -1,6 +1,6 @@
 # 🌁 NeoDB Sky Bridge
 
-NeoDB Sky Bridge relays public AT Protocol records (e.g. popfeed,
+NeoDB Sky Bridge relays public AT Protocol records (e.g. [Popfeed](https://github.com/Popfeed-Social),
 [BookHive](https://github.com/nperez0111/bookhive) and
 [teal.fm](https://github.com/teal-fm/teal)) into the Fediverse
 as NeoDB-compatible ActivityPub activities. 
