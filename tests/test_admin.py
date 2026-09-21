@@ -12,7 +12,9 @@ from skybridge import admin, sessions
 from skybridge.atproto import identity, oauth
 from skybridge.atproto.replay import replay_file
 from skybridge.config import Settings, set_settings
+from skybridge.db import session_scope
 from skybridge.main import app
+from skybridge.models import ImportJob
 
 DID = "did:plc:i6k6scfcdaup4e2va33nkprb"  # the fixture author
 OTHER_DID = "did:plc:someoneelse00000000000"
@@ -21,6 +23,7 @@ ADMIN_ROUTES = (
     "/manage/admin/import",
     "/manage/admin/import/dry-run",
     "/manage/admin/import/cancel",
+    "/manage/admin/import/resume",
 )
 
 
@@ -153,6 +156,62 @@ def test_import_refuses_without_an_api_key(client, settings):
     page = client.post("/manage/admin/import", data={"csrf": csrf})
     assert page.status_code == 200
     assert "SKYBRIDGE_JETSTREAM_API_KEY" in page.text
+
+
+def _failed_job(*, after_seq: int, before_seq: int) -> int:
+    """A job that got part way and then failed, as a 307 mid-import left one."""
+    from skybridge.atproto import archive
+
+    job_id = archive.create_job(after_seq=after_seq, before_seq=before_seq)
+    with session_scope() as db:
+        job = db.get(ImportJob, job_id)
+        assert job is not None
+        job.state, job.error = "failed", "HTTPStatusError: 307 Temporary Redirect"
+        job.planned_through_seq, job.last_segment = 15, "seg_00000005uw.jss"
+    return job_id
+
+
+def test_a_failed_import_is_handed_back_with_its_progress(client, settings):
+    """`failed` is terminal to the watcher, but the cause is often outside the
+    job and the row still knows how far it got. Resuming must re-queue that
+    row, so nothing already downloaded is paid for twice."""
+    from skybridge.atproto import archive
+
+    abandoned = _failed_job(after_seq=0, before_seq=5)
+    job_id = _failed_job(after_seq=10, before_seq=20)
+    assert archive._claimable_job() is None
+
+    _set_admins(settings, DID)
+    csrf = _sign_in(client)
+    # The button is the only way in, so it has to come alive with the failure.
+    assert '<button type="submit">Resume failed</button>' in client.get("/manage").text
+
+    page = client.post("/manage/admin/import/resume", data={"csrf": csrf, "job_id": job_id})
+
+    assert f"#{job_id}" in page.text
+    assert archive._claimable_job() == job_id
+    with session_scope() as db:
+        job = db.get(ImportJob, job_id)
+        assert job is not None
+        assert (job.state, job.error) == ("paused", None)
+        assert (job.planned_through_seq, job.last_segment) == (15, "seg_00000005uw.jss")
+
+    # A resubmit (a refreshed POST, a second tab) must not reach past it to an
+    # older abandoned failure: _claimable_job takes the oldest queued job, so
+    # that one would run first and spend metered quota nobody asked for.
+    again = client.post("/manage/admin/import/resume", data={"csrf": csrf, "job_id": job_id})
+    assert "No failed archive import to resume" in again.text
+    assert archive._claimable_job() == job_id
+    with session_scope() as db:
+        older = db.get(ImportJob, abandoned)
+        assert older is not None and older.state == "failed"
+
+
+def test_resume_reports_when_nothing_failed(client, settings):
+    _set_admins(settings, DID)
+    csrf = _sign_in(client)
+    page = client.post("/manage/admin/import/resume", data={"csrf": csrf, "job_id": 0})
+    assert "No failed archive import to resume" in page.text
 
 
 def test_cancel_reports_when_nothing_is_running(client, settings):

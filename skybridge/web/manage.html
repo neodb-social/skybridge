@@ -167,6 +167,12 @@
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <button type="submit"{% if not admin.running %} disabled{% endif %}>Cancel import</button>
   </form>
+  <form method="post" action="/manage/admin/import/resume" style="display:inline">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    {# Naming the job keeps a resubmit harmless: it can only move this one. #}
+    <input type="hidden" name="job_id" value="{{ admin.job.id if admin.job else 0 }}">
+    <button type="submit"{% if not admin.resumable %} disabled{% endif %}>Resume failed</button>
+  </form>
 </div>
 <p class="muted">
   The import replays history from the Jetstream v2 archive up to the live

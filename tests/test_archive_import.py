@@ -703,3 +703,37 @@ def test_done_callback_does_not_unregister_a_newer_run(settings, monkeypatch):
 
     asyncio.run(go())
     archive._TASK = None
+
+
+def test_the_cdn_redirect_is_followed_without_handing_over_the_key(settings, monkeypatch):
+    """getBlock and getSegment answer 307 to a signed CDN URL. Not following
+    it turned every block fetch into a fatal status error; following it must
+    not carry the API key off the origin, since the CDN authenticates the
+    token in the URL and has no business seeing the key."""
+    import httpx
+    from skybridge.atproto import archive
+
+    set_settings(replace(settings, jetstream_api_key="gk_test"))
+    seen: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.host == "jetstream.us-east.bsky.network":
+            return httpx.Response(
+                307,
+                headers={"location": "https://cdn.test/xrpc/getBlock?token=HS256-t&expires=1"},
+            )
+        return httpx.Response(200, content=b"block bytes")
+
+    async def go() -> bytes:
+        client = archive._client()
+        # The redirect handling under test is httpx's own, so the client has
+        # to be the real one _client() builds; only its transport is faked.
+        client._transport = httpx.MockTransport(handle)
+        async with client:
+            return await archive._fetch_block(client, "seg_00000005uw.jss", 236)
+
+    assert asyncio.run(go()) == b"block bytes"
+    assert [r.url.host for r in seen] == ["jetstream.us-east.bsky.network", "cdn.test"]
+    assert "authorization" in seen[0].headers
+    assert "authorization" not in seen[1].headers

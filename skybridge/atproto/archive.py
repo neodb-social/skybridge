@@ -136,6 +136,13 @@ def _client() -> httpx.AsyncClient:
             "User-Agent": settings.user_agent,
         },
         timeout=httpx.Timeout(120.0, connect=15.0),
+        # getBlock answers 307 to a signed, expiring CDN URL, and getSegment
+        # is expected to do the same; only planSnapshot's small JSON is served
+        # by the origin itself. Following that hop does not hand the key to the
+        # CDN: httpx drops Authorization when a redirect leaves the origin, and
+        # the CDN authenticates the `token` in the URL instead. Range survives
+        # the hop, which is what the resuming segment downloads rely on.
+        follow_redirects=True,
     )
 
 
@@ -767,6 +774,32 @@ def current_job() -> ImportJob | None:
     """The most recent job, for the admin view."""
     with session_scope() as session:
         return session.query(ImportJob).order_by(ImportJob.id.desc()).first()
+
+
+def resume_failed(job_id: int) -> int | None:
+    """Return one failed job to the queue; its id, or ``None`` if it is not one.
+
+    ``failed`` is terminal on purpose: the watcher must not spin on a job that
+    is broken in a way retrying cannot fix. But the cause is often outside the
+    job (the host started redirecting block fetches to a CDN, a key expired),
+    and the row still holds the progress that makes resuming cheap — the plan
+    loop restarts from the last completed segment, so only the segment it died
+    inside is downloaded, and paid for, twice. So an operator can hand one back.
+
+    Only the named job moves, which is what makes the action repeatable. A
+    caller that just said "the failed one" would, on a second submit, reach
+    past the job it already resumed to some older abandoned failure — and
+    ``_claimable_job`` takes the *oldest* queued job, so that one would run
+    first and spend metered quota nobody asked for.
+    """
+    with session_scope() as session:
+        job = session.get(ImportJob, job_id)
+        if job is None or job.state != "failed":
+            return None
+        job.state = "paused"
+        job.error = None
+        job.updated_at = utcnow()
+        return job.id
 
 
 def _claimable_job() -> int | None:

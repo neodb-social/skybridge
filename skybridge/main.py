@@ -689,6 +689,7 @@ def _admin_ctx(estimate: archive_replay.PlanEstimate | None = None) -> dict[str,
     # page on the site still answers, which is exactly what the container
     # healthcheck cannot see.
     last_event = jetstream.last_event_at()
+    job = archive_replay.current_job()
     return {
         "cursor_seq": cursor_seq,
         "last_event_at": last_event,
@@ -697,7 +698,10 @@ def _admin_ctx(estimate: archive_replay.PlanEstimate | None = None) -> dict[str,
         "has_api_key": bool(settings.jetstream_api_key),
         "can_import": settings.jetstream_is_v2 and bool(settings.jetstream_api_key),
         "running": archive_replay.is_running(),
-        "job": archive_replay.current_job(),
+        "job": job,
+        # A failed import keeps its progress, so handing it back to the
+        # watcher costs nothing already downloaded. See archive.resume_failed.
+        "resumable": job is not None and job.state == "failed",
         "collections": discover.report(),
         "wanted": set(settings.wanted_collections),
         "estimate": estimate,
@@ -878,6 +882,23 @@ async def admin_import_start(
         job_id = archive_replay.create_job(after_seq=after_seq)
         archive_replay.start(job_id, worker=getattr(app.state, "worker", None))
         msg = f"Archive import #{job_id} started in the background."
+    return _optout_page(request, session=session, message=msg)
+
+
+@app.post("/manage/admin/import/resume", response_class=HTMLResponse)
+async def admin_import_resume(
+    request: Request, csrf: str = Form(""), job_id: int = Form(0)
+) -> Response:
+    """Hand a failed import back to the watcher, which resumes its progress."""
+    session = _admin_session(request, csrf)
+    if session is None:
+        return _optout_error(request, True, _NOT_ADMIN, "forbidden", 403)
+    resumed = archive_replay.resume_failed(job_id)
+    msg = (
+        f"Archive import #{resumed} queued again; it resumes from where it stopped."
+        if resumed is not None
+        else "No failed archive import to resume."
+    )
     return _optout_page(request, session=session, message=msg)
 
 
