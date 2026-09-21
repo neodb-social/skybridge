@@ -185,18 +185,24 @@ def _stale_cursor_floor(exc: InvalidStatus) -> int | None:
     return int(match.group(1)) if match else 0
 
 
-def _report_gap(after_seq: int, before_seq: int) -> None:
+def _report_gap(after_seq: int, before_seq: int) -> bool:
     """Log what a cursor reset skipped, and queue the import that recovers it.
 
     Both ends are seqs the live tail actually held, so the archive can resolve
     the range. Delivery stays off: the gap is history by the time it imports,
     and fanning it out would push a burst of Creates at every peer.
+
+    ``False`` means the caller must keep the gap and try again: the request to
+    record it failed, and the cursor is about to move past the range for good.
+    Nothing but the log would remember it. A gap this deployment can never
+    import (a v1 host, no key, no real range) returns ``True`` — trying again
+    on the next event would only repeat the same refusal forever.
     """
     if not 0 < after_seq < before_seq:
         # Nothing was missed, or the old cursor was a legacy `time_us`
         # (~1.7e15, above every seq) which the seq-keyed archive cannot use.
         log.error("ingest resumed at seq %d after a cursor reset from %d", before_seq, after_seq)
-        return
+        return True
     settings = get_settings()
     if not settings.jetstream_is_v2 or not settings.jetstream_api_key:
         log.error(
@@ -205,7 +211,7 @@ def _report_gap(after_seq: int, before_seq: int) -> None:
             before_seq,
             "v1 endpoint" if not settings.jetstream_is_v2 else "no SKYBRIDGE_JETSTREAM_API_KEY",
         )
-        return
+        return True
     from skybridge.atproto import archive
 
     try:
@@ -219,13 +225,14 @@ def _report_gap(after_seq: int, before_seq: int) -> None:
             after_seq,
             before_seq,
         )
-        return
+        return False
     log.error(
         "ingest gap: seq %d..%d was skipped; queued archive import %d to recover it",
         after_seq,
         before_seq,
         job_id,
     )
+    return True
 
 
 async def run(worker: DeliveryWorker, *, stop_after: int | None = None) -> int:
@@ -247,6 +254,7 @@ async def run(worker: DeliveryWorker, *, stop_after: int | None = None) -> int:
     resume_from: int | None = None
     cursor_resets = 0
     gap_after: int | None = None
+    gap_before: int | None = None
     while True:
         opened: float | None = None
         try:
@@ -266,8 +274,13 @@ async def run(worker: DeliveryWorker, *, stop_after: int | None = None) -> int:
                     if isinstance(body, dict) and (value := _cursor_of(body)) is not None:
                         resumed = gap_after is not None
                         if resumed:
-                            _report_gap(gap_after, value)
-                            gap_after, resume_from = None, None
+                            # Where ingestion came back, pinned on the first
+                            # event so a retry below reports the same range
+                            # rather than a wider one.
+                            gap_before = gap_before or value
+                            if _report_gap(gap_after, gap_before):
+                                gap_after, gap_before = None, None
+                            resume_from = None
                         pending_cursor = value
                         since_flush += 1
                         # The first event after a reset is flushed at once:
@@ -304,6 +317,9 @@ async def run(worker: DeliveryWorker, *, stop_after: int | None = None) -> int:
                     stale = load_cursor()
                     if gap_after is None:
                         gap_after = stale
+                    # Where this attempt will land is not known yet, so the
+                    # far end has to be measured again once events flow.
+                    gap_before = None
                     # Resume at the floor: the lookback window still holds
                     # those events and the socket serves them for free, where
                     # the archive is metered by the byte. A second refusal means

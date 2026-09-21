@@ -326,3 +326,30 @@ def test_a_drop_mid_recovery_does_not_queue_the_gap_twice(settings, monkeypatch)
     _host(monkeypatch, ["refuse", "drop", "refuse", "event"])
 
     assert _queued_jobs() == [(STALE, RESUMED_AT, False)]
+
+
+def test_a_gap_survives_a_failed_enqueue(settings, monkeypatch):
+    """The cursor moves past the skipped range as soon as events flow, so the
+    queued import is the only thing that can still recover it. If recording it
+    fails, the gap has to stay pending and be retried, not be dropped with
+    only a log line left behind."""
+    from skybridge.atproto import archive
+
+    set_settings(replace(settings, jetstream_api_key="k"))
+    jetstream.save_cursor(STALE)
+    real_create_job = archive.create_job
+    failures = {"left": 1}
+
+    def flaky(**kwargs) -> int:
+        if failures["left"]:
+            failures["left"] -= 1
+            raise RuntimeError("database is locked")
+        return real_create_job(**kwargs)
+
+    monkeypatch.setattr(archive, "create_job", flaky)
+
+    # The first event's enqueue fails; the second must still record the gap,
+    # with the range the first one measured.
+    _host(monkeypatch, ["refuse", "event", "event"])
+
+    assert _queued_jobs() == [(STALE, RESUMED_AT, False)]
