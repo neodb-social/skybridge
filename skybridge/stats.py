@@ -10,6 +10,7 @@ from typing import Any
 from sqlalchemy import func, select
 
 from skybridge.activitypub.actors import RELAY_DID
+from skybridge.atproto.jetstream import last_event_at
 from skybridge.config import get_settings
 from skybridge.db import session_scope
 from skybridge.models import BridgedActor, Delivery, Follow, Like, Record, Relay, Work, utcnow
@@ -37,6 +38,7 @@ _usage: dict[str, int] = {
 
 
 def collect_stats() -> dict[str, Any]:
+    last_event = last_event_at()
     with session_scope() as session:
         bridged = session.scalar(
             select(func.count()).select_from(BridgedActor).where(BridgedActor.did != RELAY_DID)
@@ -74,6 +76,11 @@ def collect_stats() -> dict[str, Any]:
             "likes": likes or 0,
             "records_by_collection": by_collection,
             "deliveries_by_status": delivery_by_status,
+            # Ingest liveness. The HTTP healthcheck only proves the web app
+            # answers, and the ingest loop can sit in a reconnect cycle
+            # beside it; this is the reading that shows that. Null in a
+            # process that does not run the loop, and until the first event.
+            "last_event_at": last_event.isoformat() if last_event else None,
         }
 
 

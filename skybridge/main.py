@@ -32,7 +32,7 @@ from skybridge.activitypub.delivery import DeliveryWorker
 from skybridge.activitypub.inbox import handle_inbox
 from skybridge.activitypub.relays import reconcile_relays
 from skybridge.atproto import archive as archive_replay
-from skybridge.atproto import backfill, discover, identity, oauth
+from skybridge.atproto import backfill, discover, identity, jetstream, oauth
 from skybridge.config import get_settings
 from skybridge.db import init_db, optimize_loop, session_scope
 from skybridge.models import BridgedActor, Cursor, Record, Work
@@ -362,6 +362,15 @@ def _display_time(iso: str) -> str:
     return stamp.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def _short_age(stamp: datetime) -> str:
+    """How long ago ``stamp`` was, as a compact ``12s``/``4m``/``3h``/``2d``."""
+    seconds = max(0, int((datetime.now(UTC) - stamp).total_seconds()))
+    for limit, unit, size in ((60, "s", 1), (3600, "m", 60), (86400, "h", 3600)):
+        if seconds < limit:
+            return f"{seconds // size}{unit}"
+    return f"{seconds // 86400}d"
+
+
 def _facets(obj: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """The Note's NeoDB ``relatedWith`` facets, keyed by type (first wins)."""
     out: dict[str, dict[str, Any]] = {}
@@ -676,8 +685,14 @@ def _admin_ctx(estimate: archive_replay.PlanEstimate | None = None) -> dict[str,
     with session_scope() as db:
         cursor = db.get(Cursor, 1)
         cursor_seq = cursor.seq if cursor is not None else None
+    # Ingest liveness: a stalled loop leaves this standing still while every
+    # page on the site still answers, which is exactly what the container
+    # healthcheck cannot see.
+    last_event = jetstream.last_event_at()
     return {
         "cursor_seq": cursor_seq,
+        "last_event_at": last_event,
+        "last_event_ago": _short_age(last_event) if last_event else None,
         "is_v2": settings.jetstream_is_v2,
         "has_api_key": bool(settings.jetstream_api_key),
         "can_import": settings.jetstream_is_v2 and bool(settings.jetstream_api_key),

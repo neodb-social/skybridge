@@ -91,6 +91,12 @@
   <p>
     <span class="pill">admin</span>
     Ingest cursor <code>{{ admin.cursor_seq or "—" }}</code>
+    {% if admin.last_event_at %}
+    — last event {{ admin.last_event_ago }} ago
+    ({{ admin.last_event_at.strftime("%Y-%m-%d %H:%M UTC") }})
+    {% else %}
+    — <strong>no event received yet</strong> in this process
+    {% endif %}
     {% if not admin.is_v2 %}
     — <strong>Jetstream v1 endpoint</strong>: archive import and collection
     discovery need v2.
