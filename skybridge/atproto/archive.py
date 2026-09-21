@@ -43,11 +43,11 @@ from typing import Any
 import httpx
 
 from skybridge import optout
-from skybridge.activitypub.delivery import DeliveryWorker
+from skybridge.activitypub.delivery import DeliveryWorker, fanout
 from skybridge.atproto import jss
 from skybridge.config import get_settings
 from skybridge.db import session_scope
-from skybridge.models import Cursor, ImportJob, utcnow
+from skybridge.models import Cursor, Delivery, ImportJob, utcnow
 from skybridge.pipeline import process_event
 
 log = logging.getLogger("skybridge.archive")
@@ -352,7 +352,20 @@ def _wanted(event: dict[str, Any]) -> bool:
     return event.get("collection") in get_settings().wanted_collections
 
 
-async def _apply(events: list[dict[str, Any]], *, worker: DeliveryWorker | None) -> int:
+def _was_published(event: dict[str, Any]) -> bool:
+    """Did peers ever receive this record? A delivery row is the only proof."""
+    at_uri = "at://{did}/{collection}/{rkey}".format(
+        did=event.get("did", ""),
+        collection=event.get("collection", ""),
+        rkey=event.get("rkey", ""),
+    )
+    with session_scope() as session:
+        return session.query(Delivery.id).filter(Delivery.record_uri == at_uri).first() is not None
+
+
+async def _apply(
+    events: list[dict[str, Any]], *, worker: DeliveryWorker | None, deliver: bool
+) -> int:
     """Feed decoded events through the pipeline, exactly as live ingest does.
 
     ``allow_network`` stays on: identity is resolved once per *new* DID (see
@@ -360,17 +373,41 @@ async def _apply(events: list[dict[str, Any]], *, worker: DeliveryWorker | None)
     would be minted under the synthetic ``<did-tail>.did`` fallback handle.
     That handle is the actor's public URL and is only ever resolved at
     creation time, so it would then stick for good.
+
+    A non-delivering import still sends *retractions* for records peers
+    already hold. Silence is the right default for history — replaying years
+    of Creates would flood every subscriber — but a delete is not more history
+    arriving, it is an author withdrawing something already published. Staying
+    silent would tombstone the record here and leave it standing everywhere
+    else, with no second chance: the replay advances ``last_seq``, so running
+    the same event again with delivery on is dropped as stale. Only a record
+    with a delivery row qualifies, since nothing else was ever sent out.
+
+    That retraction is fanned out here rather than by handing the pipeline a
+    worker, because one delete can produce more than one activity: deleting
+    the anchor of a teal.fm listening session re-publishes the session under a
+    surviving play, and a silent import must not emit that Create. Sending the
+    Delete ourselves keeps the exception to exactly the activity that earns it.
     """
     applied = 0
     for event in events:
         if not _wanted(event):
             continue
-        if optout.is_opted_out(event.get("did", "")):
+        did = event.get("did", "")
+        if optout.is_opted_out(did):
             # Cheap pre-check; process_event re-checks authoritatively.
             continue
-        result = await process_event(event, worker=worker, from_archive=True)
+        retract = (
+            not deliver
+            and worker is not None
+            and event.get("operation") == "delete"
+            and _was_published(event)
+        )
+        result = await process_event(event, worker=worker if deliver else None, from_archive=True)
         if result is not None:
             applied += 1
+            if retract and worker is not None and result.activity.get("type") == "Delete":
+                await fanout(worker, record_uri=result.at_uri, did=did, activity=result.activity)
         # Yield so live ingest is not starved by a long import.
         await asyncio.sleep(0)
     return applied
@@ -443,8 +480,6 @@ async def run_import(job_id: int, *, worker: DeliveryWorker | None = None) -> in
         applied_total = job.events_applied
         resume_after = job.last_segment
 
-    target_worker = worker if deliver else None
-
     try:
         async with _client() as client:
             cursor = after_seq
@@ -491,7 +526,7 @@ async def run_import(job_id: int, *, worker: DeliveryWorker | None = None) -> in
                     if _job_state(job_id) == "cancelled":
                         return applied_total
                     applied_total += await _apply_segment(
-                        client, segment, job_id, worker=target_worker
+                        client, segment, job_id, worker=worker, deliver=deliver
                     )
                     _update_job(
                         job_id,
@@ -583,6 +618,7 @@ async def _apply_segment(
     job_id: int,
     *,
     worker: DeliveryWorker | None,
+    deliver: bool,
 ) -> int:
     """Download and apply one planned segment.
 
@@ -607,7 +643,7 @@ async def _apply_segment(
             # zstd + CBOR decode is CPU-bound: keep it off the event loop so
             # live ingest keeps reading while a 250 MB segment is unpacked.
             events = await asyncio.to_thread(lambda: list(jss.iter_segment(data)))
-            applied += await _apply(events, worker=worker)
+            applied += await _apply(events, worker=worker, deliver=deliver)
             indices = []
     else:
         indices = [
@@ -643,7 +679,7 @@ async def _apply_segment(
         for frame in frames:
             downloaded += len(frame)
             events = await asyncio.to_thread(jss.decode_block, frame)
-            applied += await _apply(events, worker=worker)
+            applied += await _apply(events, worker=worker, deliver=deliver)
 
     with session_scope() as session:
         job = session.get(ImportJob, job_id)

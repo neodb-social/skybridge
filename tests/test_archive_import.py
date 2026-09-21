@@ -12,8 +12,8 @@ from typing import Any, ClassVar, cast
 import pytest
 from skybridge.config import set_settings
 from skybridge.db import session_scope
-from skybridge.models import BridgedActor, ImportJob, OptOut, Record, utcnow
-from skybridge.pipeline import process_event
+from skybridge.models import BridgedActor, Delivery, ImportJob, OptOut, Record, utcnow
+from skybridge.pipeline import Processed, process_event
 
 REVIEW = "social.popfeed.feed.review"
 DID = "did:plc:staletest0000000000000"
@@ -173,6 +173,55 @@ def test_gated_account_stops_bridging_then_resumes(settings):
     assert _run(_account(400, active=True)) is not None
     assert _bridged().inactive_status is None
     assert _run(_commit(500, rkey="r2")) is not None, "resumed after reactivation"
+
+
+def test_a_commit_lifts_a_deactivation_gate_the_events_missed(settings):
+    """The reactivation event can be lost for good: the archive carries no
+    lifecycle rows, so a gap wider than the host's lookback window drops it
+    and the author would never bridge again. A live commit says the repo is
+    writing, which settles the question the missing event would have."""
+    _run(_commit(100))
+    _run(_account(200, active=False, status="deactivated"))
+
+    assert _run(_commit(300, rkey="r2")) is not None, "a live commit proves it is back"
+    assert _bridged().inactive_status is None
+
+
+def test_a_replayed_older_commit_never_lifts_a_gate(settings):
+    """Jetstream redelivers after a reconnect, and backfill_did synthesises
+    commits with no seq at all. Neither says the repo is writing *now*, so
+    only a commit past the gate's own seq may lift it."""
+    _run(_commit(100))
+    _run(_account(200, active=False, status="deactivated"))
+
+    assert _run(_commit(100)) is None, "a redelivered pre-gate commit proves nothing"
+    assert _bridged().inactive_status == "deactivated"
+
+    synthetic = _commit(300, rkey="r3")
+    del synthetic["payload"]["seq"]
+    assert _run(synthetic) is None, "a backfill commit carries no seq"
+    assert _bridged().inactive_status == "deactivated"
+
+
+def test_an_archived_commit_never_lifts_a_gate(settings):
+    """History says nothing about now, and the gap import replays plenty of
+    it. Letting it reopen an account the live stream just gated would undo
+    that gate from the other end."""
+    _run(_commit(100))
+    _run(_account(200, active=False, status="deactivated"))
+
+    assert _run(_commit(300, rkey="r2"), from_archive=True) is None
+    assert _bridged().inactive_status == "deactivated"
+
+
+def test_a_commit_does_not_lift_a_moderation_gate(settings):
+    """A takedown is somebody else's decision, and a commit is not evidence
+    that it was reversed."""
+    _run(_commit(100))
+    _run(_account(200, active=False, status="takendown"))
+
+    assert _run(_commit(300, rkey="r2")) is None
+    assert _bridged().inactive_status == "takendown"
 
 
 def test_takedown_is_reversible_not_a_purge(settings):
@@ -406,7 +455,7 @@ def test_resume_fast_forwards_past_applied_segments(settings, monkeypatch):
     async def fake_plan(_client, *, after_seq, before_seq):
         return plan
 
-    async def fake_apply(_client, segment, _job_id, *, worker):
+    async def fake_apply(_client, segment, _job_id, *, worker, deliver):
         applied.append(segment["name"])
         return 0
 
@@ -452,7 +501,7 @@ def test_resume_restarts_the_page_if_the_plan_changed(settings, monkeypatch):
             "segments": [{"name": "seg_a.jss", "mode": "blocks", "blocks": []}],
         }
 
-    async def fake_apply(_client, segment, _job_id, *, worker):
+    async def fake_apply(_client, segment, _job_id, *, worker, deliver):
         applied.append(segment["name"])
         return 0
 
@@ -511,7 +560,7 @@ def test_segment_mode_actually_fetches_its_index_selected_blocks(settings, monke
 
     applied: list[dict] = []
 
-    async def fake_apply(events, *, worker):
+    async def fake_apply(events, *, worker, deliver):
         applied.extend(events)
         return len(events)
 
@@ -527,6 +576,7 @@ def test_segment_mode_actually_fetches_its_index_selected_blocks(settings, monke
             {"name": "seg_0.jss", "mode": "segment"},
             job_id,
             worker=None,
+            deliver=False,
         )
     )
     assert fetched == [7, 9], "index-selected blocks must be downloaded"
@@ -546,7 +596,7 @@ def test_segment_mode_falls_back_to_whole_file_when_the_index_is_unreadable(sett
         whole_downloads.append(name)
         return b"data"
 
-    async def fake_apply(events, *, worker):
+    async def fake_apply(events, *, worker, deliver):
         return 0
 
     monkeypatch.setattr(archive, "_blocks_from_index", no_index)
@@ -561,6 +611,7 @@ def test_segment_mode_falls_back_to_whole_file_when_the_index_is_unreadable(sett
             {"name": "seg_0.jss", "mode": "segment"},
             job_id,
             worker=None,
+            deliver=False,
         )
     )
     assert whole_downloads == ["seg_0.jss"], "must not silently import nothing"
@@ -737,3 +788,63 @@ def test_the_cdn_redirect_is_followed_without_handing_over_the_key(settings, mon
     assert [r.url.host for r in seen] == ["jetstream.us-east.bsky.network", "cdn.test"]
     assert "authorization" in seen[0].headers
     assert "authorization" not in seen[1].headers
+
+
+def test_a_non_delivering_import_still_retracts_what_peers_hold(settings, monkeypatch):
+    """Silence is right for history, but a delete is not history arriving: it
+    is an author withdrawing something peers already have. Staying silent
+    would tombstone it here and leave it standing everywhere else, with no
+    second chance — the replay advances last_seq, so the same event with
+    delivery on is dropped as stale."""
+    from skybridge.activitypub.delivery import DeliveryWorker
+    from skybridge.atproto import archive
+
+    with session_scope() as db:
+        db.add(
+            Delivery(
+                record_uri=_uri("r1"),
+                target_inbox="https://peer.test/inbox",
+                activity_type="Create",
+                status="sent",
+            )
+        )
+
+    seen: list[tuple[str, bool]] = []
+    fanned: list[tuple[str, str]] = []
+
+    async def fake_process(event, *, worker=None, from_archive=False, **kw):
+        seen.append((f"{event['operation']} {event['rkey']}", worker is not None))
+        kind = "Delete" if event["operation"] == "delete" else "Create"
+        at_uri = f"at://{event['did']}/{event['collection']}/{event['rkey']}"
+        return Processed(at_uri, event["operation"], event["collection"], {"type": kind})
+
+    async def fake_fanout(_worker, *, record_uri, did, activity):
+        fanned.append((record_uri, activity["type"]))
+        return 1
+
+    monkeypatch.setattr(archive, "process_event", fake_process)
+    monkeypatch.setattr(archive, "fanout", fake_fanout)
+
+    def _event(rkey: str, operation: str) -> dict:
+        return {
+            "kind": "commit",
+            "did": DID,
+            "collection": REVIEW,
+            "rkey": rkey,
+            "operation": operation,
+        }
+
+    asyncio.run(
+        archive._apply(
+            [_event("r1", "delete"), _event("r9", "delete"), _event("r1", "create")],
+            worker=DeliveryWorker(),
+            deliver=False,
+        )
+    )
+
+    # The pipeline itself is never handed a worker, so nothing it derives from
+    # a delete can escape — a teal.fm session re-anchored by one would fan out
+    # a Create of its own.
+    assert seen == [("delete r1", False), ("delete r9", False), ("create r1", False)]
+    # Only the record peers actually hold is retracted, and only the Delete.
+    assert fanned == [(_uri("r1"), "Delete")]

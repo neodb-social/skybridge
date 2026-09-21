@@ -46,6 +46,8 @@ class BridgedActor(Base):
     # retracted, so the account resumes cleanly if it comes back. A true
     # deletion purges instead — see pipeline._process_account.
     inactive_status: Mapped[str | None] = mapped_column(String, default=None)
+    # The account event's seq, so only a *later* commit can lift the gate.
+    inactive_seq: Mapped[int | None] = mapped_column(Integer, default=None)
     inactive_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     # High-water mark for profile commits. Profile edits are identity metadata
     # and deliberately never land in the Record archive, so they have no row to

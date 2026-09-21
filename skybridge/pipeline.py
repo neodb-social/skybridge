@@ -72,6 +72,15 @@ _ACCOUNT_KIND = "account"
 # find their federated history intact rather than destroyed.
 _ACCOUNT_DELETED = "deleted"
 
+# Gates a live commit may lift by itself. A repo that is writing again is not
+# deactivated, whatever the last account event said — and that event can be
+# missed for good: the archive carries no lifecycle rows (see
+# ``jss._build_event``), so a gap wider than the host's lookback window loses
+# the reactivation, and nothing would ever bridge from that author again.
+# Moderation statuses are deliberately absent: those are somebody else's
+# decision, and a commit is not evidence that it was reversed.
+_COMMIT_CLEARS_GATE = frozenset({"deactivated", "inactive"})
+
 
 @dataclass
 class Processed:
@@ -242,8 +251,11 @@ async def process_event(
     # An account currently deactivated/suspended/taken down is gated: its
     # records stay as they are, but nothing new is bridged until it is active
     # again (see _process_account).
-    if _is_gated(did):
-        return None
+    if (gate := _gate_status(did)) is not None:
+        if not _outlives_gate(did, event, from_archive=from_archive, gate=gate):
+            return None
+        _set_gate(did, None)
+        log.info("account %s is writing again; clearing the %s gate", did, gate)
 
     # Ingest-volume metric: ticks for every wanted commit event from non-opted-out
     # authors, regardless of what the pipeline later does with it (archive-only,
@@ -1319,11 +1331,42 @@ def _mark_visibility_seq(did: str, seq: int | None) -> None:
             actor.last_visibility_seq = max(actor.last_visibility_seq or 0, seq)
 
 
-def _is_gated(did: str) -> bool:
-    """Is this DID currently inactive (not deleted) on atproto?"""
+def _gate_status(did: str) -> str | None:
+    """The inactive (not deleted) status gating this DID, if any."""
     with session_scope() as session:
         actor = session.get(BridgedActor, did)
-        return actor is not None and actor.inactive_status is not None
+        return actor.inactive_status if actor is not None else None
+
+
+def _outlives_gate(did: str, event: dict[str, Any], *, from_archive: bool, gate: str) -> bool:
+    """Does this commit prove the gate on ``did`` is out of date?
+
+    A repo that is writing is not deactivated, whatever the last account event
+    said — and that event can be missed for good, since the archive carries no
+    lifecycle rows (see ``jss._build_event``) and a gap wider than the host's
+    lookback window loses it. Without this the author would never bridge again.
+
+    The proof has to be a *live* commit from *after* the gate went up, which
+    is three tests, each guarding a way the evidence can be counterfeit:
+
+    * a moderation status is somebody else's decision, and a commit is no
+      evidence it was reversed;
+    * an archived commit is history, and the gap import replays plenty of it;
+    * a commit at or below the gate's own seq is either a Jetstream replay
+      after a reconnect or a synthetic backfill commit (which carries no seq
+      at all) — neither says anything about the repo now.
+    """
+    if gate not in _COMMIT_CLEARS_GATE or from_archive:
+        return False
+    seq = event.get("seq")
+    if seq is None:
+        return False
+    with session_scope() as session:
+        actor = session.get(BridgedActor, did)
+        gate_seq = actor.inactive_seq if actor is not None else None
+    # No recorded seq: a gate from before this was tracked. Unprovable, so it
+    # stands until an account event lifts it.
+    return gate_seq is not None and int(seq) > gate_seq
 
 
 async def _process_account(
@@ -1360,11 +1403,11 @@ async def _process_account(
         return Processed(f"at://{did}", "delete", _ACCOUNT_KIND, {}, purged)
 
     if active is False:
-        _set_gate(did, status or "inactive")
+        _set_gate(did, status or "inactive", seq=event.get("seq"))
         log.info("account %s gated (%s)", did, status or "inactive")
         return Processed(f"at://{did}", "update", _ACCOUNT_KIND, {})
 
-    if active is True and _is_gated(did):
+    if active is True and _gate_status(did) is not None:
         _set_gate(did, None)
         log.info("account %s active again; resuming", did)
         return Processed(f"at://{did}", "update", _ACCOUNT_KIND, {})
@@ -1377,12 +1420,15 @@ def _is_bridged(did: str) -> bool:
         return session.get(BridgedActor, did) is not None
 
 
-def _set_gate(did: str, status: str | None) -> None:
+def _set_gate(did: str, status: str | None, *, seq: int | None = None) -> None:
     with session_scope() as session:
         actor = session.get(BridgedActor, did)
         if actor is not None:
             actor.inactive_status = status
             actor.inactive_at = utcnow() if status else None
+            # Kept only while gated, and it is what _outlives_gate measures a
+            # later commit against.
+            actor.inactive_seq = seq if status else None
 
 
 async def _process_identity(

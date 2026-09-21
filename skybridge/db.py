@@ -35,6 +35,7 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("cursor", "seq", "INTEGER"),
     ("bridged_actor", "inactive_status", "VARCHAR"),
     ("bridged_actor", "inactive_at", "DATETIME"),
+    ("bridged_actor", "inactive_seq", "INTEGER"),
     ("bridged_actor", "last_profile_seq", "INTEGER"),
     ("import_job", "last_segment", "VARCHAR"),
     # Booleans carry an explicit NOT NULL DEFAULT so existing rows read as
