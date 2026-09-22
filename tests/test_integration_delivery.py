@@ -28,6 +28,7 @@ from skybridge.atproto.replay import replay_file
 from skybridge.crypto import (
     generate_keypair,
     parse_signature_header,
+    sign_request,
     verify_ld_signature,
     verify_request,
 )
@@ -83,6 +84,20 @@ class MockInstance:
             return {"ok": True}
 
         return app
+
+
+def _signed_post(mock: MockInstance, url: str, activity: dict) -> httpx.Response:
+    """POST ``activity`` to ``url`` signed as the mock's actor, the way a real
+    peer does — the inbox authenticates Accept and Like."""
+    body = json.dumps(activity).encode()
+    headers = sign_request(
+        private_pem=mock.private_pem,
+        key_id=f"{mock.actor_id}#main-key",
+        method="POST",
+        url=url,
+        body=body,
+    )
+    return httpx.post(url, content=body, headers=headers, timeout=10)
 
 
 def _serve(app, port: int) -> uvicorn.Server:
@@ -158,7 +173,10 @@ def test_relay_subscription_then_signed_delivery_and_like_forward(live, fixture_
         "actor": mock.actor_id,
         "object": follow,
     }
-    resp = httpx.post(f"{relay_base}/inbox", json=accept, timeout=10)
+    # Unsigned, the Accept is refused: nothing the inbox acts on is taken on
+    # trust any more.
+    assert httpx.post(f"{relay_base}/inbox", json=accept, timeout=10).status_code == 401
+    resp = _signed_post(mock, f"{relay_base}/inbox", accept)
     assert resp.status_code in (200, 202)
     with session_scope() as session:
         row = session.scalar(select(Relay).where(Relay.inbox == f"{mock.base}/inbox"))
@@ -222,7 +240,7 @@ def test_relay_subscription_then_signed_delivery_and_like_forward(live, fixture_
         "actor": mock.actor_id,
         "object": liked_object_id,
     }
-    resp = httpx.post(f"{relay_base}/inbox", json=like, timeout=10)
+    resp = _signed_post(mock, f"{relay_base}/inbox", like)
     assert resp.status_code in (200, 202)
 
     assert _wait_for(lambda: any(a.get("type") == "Announce" for a in mock.received))

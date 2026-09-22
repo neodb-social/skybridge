@@ -15,7 +15,7 @@ from skybridge.models import BridgedActor
 from skybridge.pipeline import Processed
 
 DID = "did:plc:backfilltestuser00000000"
-PDS = "https://pds.test"
+PDS = "https://pds.example"
 
 REVIEWS = "social.popfeed.feed.review"
 ITEMS = "social.popfeed.feed.listItem"

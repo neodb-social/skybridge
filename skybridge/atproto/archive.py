@@ -403,7 +403,22 @@ async def _apply(
             and event.get("operation") == "delete"
             and _was_published(event)
         )
-        result = await process_event(event, worker=worker if deliver else None, from_archive=True)
+        try:
+            result = await process_event(
+                event, worker=worker if deliver else None, from_archive=True
+            )
+        except Exception:
+            # Same rule as the live loop: one malformed record is skipped, not
+            # the whole import. Left to propagate it would mark the job failed
+            # and every resume would fail again on the same block.
+            log.exception(
+                "skipping archived event the pipeline could not process: seq=%s %s/%s/%s",
+                event.get("seq"),
+                did,
+                event.get("collection"),
+                event.get("rkey"),
+            )
+            continue
         if result is not None:
             applied += 1
             if retract and worker is not None and result.activity.get("type") == "Delete":

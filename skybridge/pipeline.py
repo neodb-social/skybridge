@@ -6,6 +6,7 @@ regardless of whether it came from the live firehose or a replayed fixture.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -302,7 +303,20 @@ async def process_event(
             worker=worker,
         )
 
-    ident = identity.ensure_actor(did, allow_network=allow_network)
+    if operation == "delete" and not _is_bridged(did) and not _record_exists(at_uri):
+        # A delete of a record we never archived, from an author we never
+        # bridged: there is nothing to retract and nobody to retract it for.
+        # Minting an actor here (with a network round trip and a public actor
+        # page) would contradict bridging people because of what they post.
+        return None
+
+    if allow_network:
+        # Resolving a new DID is up to four sequential HTTP calls (PLC plus
+        # three PDS reads, 8s timeout each). Off-thread, so a slow or dead
+        # PDS stalls this event and not the whole server.
+        ident = await asyncio.to_thread(identity.ensure_actor, did, allow_network=True)
+    else:
+        ident = identity.ensure_actor(did, allow_network=False)
     handle = ident.handle
 
     if collection in ARCHIVE_ONLY_COLLECTIONS:
@@ -312,7 +326,14 @@ async def process_event(
         return await _process_delete(at_uri, did, collection, rkey, handle, worker, seq)
 
     record = event.get("record") or {}
+    if not isinstance(record, dict):
+        record = {}
     ref = works.mint(record)
+
+    if collection == _LIST_ITEM_COLLECTION and allow_network:
+        # The Note names the parent list. Resolve it here, off-thread, so the
+        # translator's own lookup is a DB hit and never blocks the loop.
+        await asyncio.to_thread(neodb.ensure_list_archived, record.get("listUri"))
 
     if collection in teal.PLAY_COLLECTIONS:
         # A scrobble: one Note per listening session, not per play. See
@@ -1205,7 +1226,11 @@ async def _process_profile(
     if _profile_seen(did, seq):
         return None
 
-    row = identity.refresh_actor(did, record, allow_network=allow_network)
+    if allow_network:
+        # PLC plus two PDS reads; off the event loop like ensure_actor.
+        row = await asyncio.to_thread(identity.refresh_actor, did, record, allow_network=True)
+    else:
+        row = identity.refresh_actor(did, record, allow_network=False)
     if row is None:
         return None
 
@@ -1418,6 +1443,11 @@ async def _process_account(
 def _is_bridged(did: str) -> bool:
     with session_scope() as session:
         return session.get(BridgedActor, did) is not None
+
+
+def _record_exists(at_uri: str) -> bool:
+    with session_scope() as session:
+        return session.get(Record, at_uri) is not None
 
 
 def _set_gate(did: str, status: str | None, *, seq: int | None = None) -> None:

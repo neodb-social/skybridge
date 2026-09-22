@@ -18,6 +18,7 @@ from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from skybridge.atproto import auth
 from skybridge.config import get_settings
 from skybridge.crypto import generate_keypair
 from skybridge.db import session_scope
@@ -68,6 +69,23 @@ class Identity:
     handle_resolved: bool = False
 
 
+class _VettedRedirects(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only onto another public https URL.
+
+    Every URL this module fetches beyond PLC comes from a DID document that
+    its own controller writes, so a redirect is the one place a vetted
+    endpoint could still steer a request at an internal host.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not auth.is_public_https_url(newurl):
+            raise ValueError(f"refusing redirect to non-public URL {newurl!r}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_VettedRedirects)
+
+
 def _http_json(url: str, timeout: float = 8.0) -> dict | None:
     """The server's JSON, or ``None`` when we never got any.
 
@@ -82,7 +100,7 @@ def _http_json(url: str, timeout: float = 8.0) -> dict | None:
     """
     try:
         req = urllib.request.Request(url, headers={"User-Agent": get_settings().user_agent})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:
             return json.load(resp)
     except urllib.error.HTTPError as exc:
         try:
@@ -173,10 +191,20 @@ def _avatar_url(value: dict, *, did: str, pds: str) -> str | None:
 
 
 def _pds_from_doc(doc: dict) -> str | None:
-    """Extract the atproto PDS endpoint from a PLC document."""
-    for svc in doc.get("service", []):
-        if svc.get("id") == "#atproto_pds":
-            return svc.get("serviceEndpoint")
+    """Extract the atproto PDS endpoint from a PLC document.
+
+    The endpoint is whatever the DID's controller wrote there, and everything
+    this module reads from a PDS is fetched from this URL — so one pointing at
+    a loopback, private or special-use host is refused, not followed (SSRF).
+    """
+    services = doc.get("service")
+    for svc in services if isinstance(services, list) else []:
+        if isinstance(svc, dict) and svc.get("id") == "#atproto_pds":
+            endpoint = svc.get("serviceEndpoint")
+            if isinstance(endpoint, str) and auth.is_public_https_url(endpoint):
+                return endpoint.rstrip("/")
+            log.warning("ignoring non-public PDS endpoint %r in DID document", endpoint)
+            return None
     return None
 
 

@@ -130,7 +130,8 @@ def list_item_status(record: dict) -> str | None:
     works.season_view), where it always means "watching": one episode never
     completes (or wishlists) a season, whatever the list's own verb says.
     """
-    status = shelf_status((record.get("listType") or "").lower())
+    list_type = record.get("listType")
+    status = shelf_status(list_type.lower() if isinstance(list_type, str) else "")
     if status and record.get("creativeWorkType") == works.EPISODE_TYPE:
         return "progress"
     return status
@@ -161,29 +162,47 @@ def _published(record: dict, event_time: str | None) -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _byte_index(facet: dict) -> dict:
+    idx = facet.get("index")
+    return idx if isinstance(idx, dict) else {}
+
+
+def _text(value: Any) -> str:
+    """A record field as text: the string itself, or empty for anything else."""
+    return value if isinstance(value, str) else ""
+
+
 def render_facets(text: str, facets: list[dict] | None) -> str:
     """Render atproto richtext ``facets`` (byte-indexed links) into HTML.
 
     Mirrors app.bsky richtext: indices are byte offsets into the UTF-8 text.
     """
     raw = text.encode("utf-8")
+    # Records are not validated against their lexicon before they reach us,
+    # so a facet list that is not a list, or a facet that is not an object,
+    # is treated as "no facets" rather than allowed to raise mid-ingest.
+    facets = [f for f in facets if isinstance(f, dict)] if isinstance(facets, list) else []
     if not facets:
         return f"<p>{html.escape(text)}</p>"
-    spans = sorted(facets, key=lambda f: f.get("index", {}).get("byteStart", 0))
+    spans = sorted(facets, key=lambda f: _byte_index(f).get("byteStart", 0))
     out: list[str] = []
     cursor = 0
     for facet in spans:
-        idx = facet.get("index", {})
+        idx = _byte_index(facet)
         start, end = idx.get("byteStart"), idx.get("byteEnd")
-        if start is None or end is None or start < cursor:
+        if not isinstance(start, int) or not isinstance(end, int) or start < cursor:
             continue
         out.append(html.escape(raw[cursor:start].decode("utf-8", "ignore")))
         slice_text = raw[start:end].decode("utf-8", "ignore")
+        features = facet.get("features")
         link = next(
             (
                 f["uri"]
-                for f in facet.get("features", [])
-                if f.get("$type", "").endswith("#link") and f.get("uri")
+                for f in (features if isinstance(features, list) else [])
+                if isinstance(f, dict)
+                and isinstance(f.get("$type"), str)
+                and f["$type"].endswith("#link")
+                and isinstance(f.get("uri"), str)
             ),
             None,
         )
@@ -200,6 +219,13 @@ def render_facets(text: str, facets: list[dict] | None) -> str:
         cursor = end
     out.append(html.escape(raw[cursor:].decode("utf-8", "ignore")))
     return "<p>" + "".join(out) + "</p>"
+
+
+def _hashtags(record: dict) -> list[str]:
+    tags = record.get("tags")
+    if not isinstance(tags, list):
+        return []
+    return [tag for tag in tags if isinstance(tag, str) and tag]
 
 
 def _work_tag(ref: works.WorkRef) -> dict:
@@ -375,8 +401,8 @@ def _populate_review(
     # Prefer the minted work's (normalized) title: popfeed sometimes labels a
     # show-typed record with the watched episode's title (see
     # works.normalize_title); the Note should name the work being marked.
-    title = (ref.title if ref is not None else None) or record.get("title") or "a work"
-    text = record.get("text") or ""
+    title = (ref.title if ref is not None else None) or _text(record.get("title")) or "a work"
+    text = _text(record.get("text"))
     rating = record.get("rating")
     if not isinstance(rating, int | float) or isinstance(rating, bool):
         rating = None
@@ -394,7 +420,7 @@ def _populate_review(
         # Mastodon renders ``summary`` as the content warning text.
         note["sensitive"] = True
         note["summary"] = f"Spoilers: {title}"
-    for tag in record.get("tags") or []:
+    for tag in _hashtags(record):
         note["tag"].append({"type": "Hashtag", "name": f"#{tag}"})
     # The poster is deliberately NOT attached as media: peers should show it
     # from the catalog-item tag (_work_tag) instead of a bare image post.
@@ -439,7 +465,7 @@ def _populate_book(note: dict, record: dict, ref: works.WorkRef | None) -> None:
     ``Comment`` at once — the same facets popfeed reassembles from a
     review/listItem pair (see :func:`_populate_review`).
     """
-    title = (ref.title if ref is not None else None) or record.get("title") or "a book"
+    title = (ref.title if ref is not None else None) or _text(record.get("title")) or "a book"
     review = record.get("review") if isinstance(record.get("review"), str) else ""
     stars = record.get("stars")
     if not isinstance(stars, int) or isinstance(stars, bool):
@@ -528,7 +554,7 @@ def _populate_list(
         "published": note["published"],
         "updated": note.get("updated") or note["published"],
     }
-    for tag in record.get("tags") or []:
+    for tag in _hashtags(record):
         note["tag"].append({"type": "Hashtag", "name": f"#{tag}"})
     note["relatedWith"].append(shelf)
 
@@ -595,6 +621,23 @@ def _fetch_and_archive_list(list_uri: str) -> dict | None:
     return value
 
 
+def ensure_list_archived(list_uri: Any) -> None:
+    """Archive a listItem's parent list now if it is not archived yet.
+
+    The pipeline calls this off the event loop before translating, so that
+    :func:`_list_label` — which runs inside the synchronous translation and
+    would otherwise fetch inline — finds the row (or the negative-cache entry)
+    and never touches the network on the loop. Blocking; call via
+    ``asyncio.to_thread``.
+    """
+    if not isinstance(list_uri, str) or not list_uri:
+        return
+    with session_scope() as session:
+        if session.get(Record, list_uri) is not None:
+            return
+    _fetch_and_archive_list(list_uri)
+
+
 def _list_label(list_uri: Any) -> str | None:
     """Best-effort display label for the parent ``feed.list`` of a listItem.
 
@@ -631,7 +674,7 @@ def _populate_list_item(note: dict, record: dict, ref: works.WorkRef | None) -> 
     # whole-work Status until that mapping is designed.
     # The linked/displayed title is the minted work's, so an episode add
     # bridged as season activity names the season, not the episode.
-    title = (ref.title if ref is not None else None) or record.get("title") or "a work"
+    title = (ref.title if ref is not None else None) or _text(record.get("title")) or "a work"
     label = _list_label(record.get("listUri"))
     if label:
         note["content"] = (

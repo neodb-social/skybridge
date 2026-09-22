@@ -40,6 +40,7 @@ import re
 from datetime import UTC, datetime
 from random import uniform
 from time import monotonic
+from typing import Any
 from urllib.parse import urlencode
 
 import websockets
@@ -158,6 +159,16 @@ def save_cursor(value: int) -> None:
             row.seq = value
         else:
             row.time_us = value
+
+
+def _describe(body: Any) -> str:
+    """A one-line handle on an event for the log: enough to find the record
+    (did, collection, rkey, seq), never the record itself."""
+    if not isinstance(body, dict):
+        return repr(body)[:120]
+    return " ".join(
+        f"{key}={body.get(key)}" for key in ("seq", "did", "collection", "rkey") if key in body
+    )
 
 
 def _cursor_of(event: dict) -> int | None:
@@ -290,7 +301,21 @@ async def run(worker: DeliveryWorker, *, stop_after: int | None = None) -> int:
                         if since_flush >= _CURSOR_FLUSH_EVERY or resumed:
                             save_cursor(pending_cursor)
                             pending_cursor, since_flush = None, 0
-                    result = await process_event(event, worker=worker)
+                    try:
+                        result = await process_event(event, worker=worker)
+                    except Exception:
+                        # One record must never take the stream down. Anyone
+                        # can write a lexicon-invalid record into a wanted
+                        # collection, and Jetstream does not validate shapes;
+                        # letting the error escape would drop the socket and,
+                        # since the cursor names this very event, replay it
+                        # on reconnect — for good. Log it, keep the cursor
+                        # moving, and read on.
+                        log.exception(
+                            "skipping event that the pipeline could not process: %s",
+                            _describe(body),
+                        )
+                        result = None
                     if result is not None:
                         processed += 1
                         log.info("bridged %s (%s)", result.at_uri, result.operation)

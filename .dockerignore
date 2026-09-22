@@ -4,10 +4,12 @@
 .env
 data
 *.db
+# the relay signing key lives under SKYBRIDGE_DATA, never in the image
+*.pem
 __pycache__
 *.egg-info
 .pytest_cache
 .ruff_cache
 .pre-commit-config.yaml
 Dockerfile
-compose.yaml
+compose.yml

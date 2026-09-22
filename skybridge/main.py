@@ -26,6 +26,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from skybridge import admin, neodb_servers, optout, pipeline, sessions, telemetry
+from skybridge.activitypub import inbox as ap_inbox
 from skybridge.activitypub import nodeinfo, objects, webfinger
 from skybridge.activitypub.actors import RELAY_DID, get_relay_keys, person_actor, relay_actor
 from skybridge.activitypub.delivery import DeliveryWorker
@@ -197,16 +198,41 @@ async def get_relay_actor() -> Response:
     return ap_response(relay_actor())
 
 
-@app.post("/actor/inbox")
-@app.post("/inbox")
-async def relay_inbox(request: Request) -> Response:
-    activity = await request.json()
+async def _inbox(request: Request, target_actor_id: str) -> Response:
+    """Shared inbox handling: parse the body, authenticate what we act on,
+    then dispatch to :func:`handle_inbox`."""
+    body = await request.body()
+    try:
+        activity = json.loads(body)
+    except ValueError:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+    if not isinstance(activity, dict):
+        return JSONResponse({"error": "activity must be an object"}, status_code=400)
+    if ap_inbox.needs_authentication(activity):
+        path = request.url.path
+        if request.url.query:
+            path += "?" + request.url.query
+        ok = await ap_inbox.authenticate(
+            activity,
+            method=request.method,
+            path=path,
+            headers=dict(request.headers),
+            body=body,
+        )
+        if not ok:
+            return JSONResponse({"error": "signature required"}, status_code=401)
     status = await handle_inbox(
         activity,
-        target_actor_id=get_settings().relay_actor_id,
+        target_actor_id=target_actor_id,
         worker=getattr(app.state, "worker", None),
     )
     return Response(status_code=status)
+
+
+@app.post("/actor/inbox")
+@app.post("/inbox")
+async def relay_inbox(request: Request) -> Response:
+    return await _inbox(request, get_settings().relay_actor_id)
 
 
 @app.get("/users/{ident}")
@@ -260,18 +286,12 @@ async def get_user(ident: str, request: Request) -> Response:
 
 @app.post("/users/{ident}/inbox")
 async def user_inbox(ident: str, request: Request) -> Response:
-    activity = await request.json()
     # A POST can't be redirected safely, so a delivery addressed to a retired
     # handle is accepted here and attributed to the canonical actor.
     with session_scope() as session:
         actor = _actor_for_ident(session, ident)
         target = actor.handle if actor is not None else ident
-    status = await handle_inbox(
-        activity,
-        target_actor_id=get_settings().actor_id(target),
-        worker=getattr(app.state, "worker", None),
-    )
-    return Response(status_code=status)
+    return await _inbox(request, get_settings().actor_id(target))
 
 
 @app.get("/users/{ident}/followers")

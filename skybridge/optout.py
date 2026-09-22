@@ -23,6 +23,15 @@ from skybridge.translate import neodb
 log = logging.getLogger("skybridge.optout")
 
 
+def _stored_note_id(ap_object_json: str | None) -> str | None:
+    """The id of a stored Note, as peers received it (see pipeline._stored_note_id)."""
+    try:
+        note = json.loads(ap_object_json or "")
+    except (TypeError, ValueError):
+        return None
+    return note.get("id") if isinstance(note, dict) else None
+
+
 def is_opted_out(did: str) -> bool:
     with session_scope() as session:
         return session.get(OptOut, did) is not None
@@ -125,6 +134,7 @@ async def purge_did(did: str, *, worker: DeliveryWorker | None = None, mark_opt_
         )
         for row in rows:
             was_published = row.ap_object_json is not None
+            stored_id = _stored_note_id(row.ap_object_json)
             row.op = "delete"
             row.deleted_at = utcnow()
             row.updated_at = utcnow()
@@ -140,7 +150,11 @@ async def purge_did(did: str, *, worker: DeliveryWorker | None = None, mark_opt_
                 record=None,
                 operation="delete",
                 event_time=None,
-                prior_object_id=settings.post_id(handle, row.rkey),
+                # Name the id peers actually received. The author may have
+                # been renamed since the Note was published, and a Tombstone
+                # built from the current handle would retract a URL nobody
+                # holds — leaving the opted-out content live on every peer.
+                prior_object_id=stored_id or settings.post_id(handle, row.rkey),
                 unlisted=unlisted,
             )
             row.ap_activity_json = json.dumps(activity)

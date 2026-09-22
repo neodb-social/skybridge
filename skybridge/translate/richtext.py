@@ -171,6 +171,9 @@ def _breaks(text: str) -> str:
 
 def review_html(text: str) -> str:
     """Render a review body into a safe HTML fragment."""
+    if not isinstance(text, str):
+        # The lexicon says string; a record that says otherwise has no body.
+        return ""
     body = "".join(
         chunk if is_markup else _breaks(chunk) for is_markup, chunk in _runs(text.strip())
     )

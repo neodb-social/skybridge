@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -150,7 +151,10 @@ EPISODE_TYPE = "tv_episode"
 SEASON_TYPE = "tv_season"
 
 
-def _stringified(identifiers: dict) -> dict[str, str]:
+def _stringified(identifiers: Any) -> dict[str, str]:
+    """Identifiers as strings; anything that is not an object has none."""
+    if not isinstance(identifiers, dict):
+        return {}
     return {str(k): str(v) for k, v in identifiers.items() if v not in (None, "")}
 
 
@@ -211,7 +215,8 @@ def normalize_title(work_type: str, title: str | None, identifiers: dict) -> str
     through unchanged.
     """
     if not isinstance(title, str) or not title:
-        return title
+        # A lexicon-invalid title (an object, a number) is no title at all.
+        return None
     episode = _EPISODE_TITLE.match(title)
     if work_type == "tv_show":
         return episode.group("show") if episode else title
@@ -239,7 +244,9 @@ def season_view(record: dict) -> dict | None:
     episode title is left as-is here; work_ref normalizes it to a season
     title (see normalize_title) once the type is tv_season.
     """
-    identifiers = record.get("identifiers") or {}
+    identifiers = record.get("identifiers")
+    if not isinstance(identifiers, dict):
+        return None
     series = identifiers.get("tmdbTvSeriesId")
     season = identifiers.get("seasonNumber")
     if not series or season in (None, ""):
@@ -296,8 +303,12 @@ def work_ref(record: dict) -> WorkRef | None:
         work_id=work_id,
         url=settings.catalog_id(work_type, work_id),
         title=normalize_title(work_type, record.get("title"), identifiers),
-        poster_url=record.get("posterUrl"),
+        poster_url=_url_or_none(record.get("posterUrl")),
     )
+
+
+def _url_or_none(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 def _reref(ref: WorkRef, work_key: str) -> WorkRef:

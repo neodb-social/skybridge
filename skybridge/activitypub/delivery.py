@@ -109,7 +109,9 @@ class DeliveryWorker:
             body=body,
         )
         _record_attempt(task, status="sent" if ok else "failed", code=code)
-        if ok or task.attempt + 1 >= len(settings.retry_backoff):
+        # One retry per backoff entry: attempt N (0-based) failing schedules
+        # retry N after retry_backoff[N], so the last entry is used too.
+        if ok or task.attempt >= len(settings.retry_backoff):
             return
         delay = settings.retry_backoff[task.attempt]
         task.attempt += 1

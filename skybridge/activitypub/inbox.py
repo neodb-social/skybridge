@@ -15,16 +15,26 @@
   :class:`Like` for dedup and forwarded, signed by the service actor, to every
   accepted relay.
 
-Inbound HTTP signature verification is not implemented yet — a future
-hardening item; activities are trusted at face value.
+Activities we *act on* (``Follow``, ``Undo``, ``Accept``, ``Reject``,
+``Like``) must arrive with a valid draft-cavage HTTP signature whose key is
+owned by the activity's ``actor`` — see :func:`authenticate`, which the HTTP
+layer runs before :func:`handle_inbox`. Everything else (``Create``,
+``Announce``, a relay forwarding someone else's post under its own key, …) is
+acknowledged unread, so it needs no proof of origin.
+
+Every remote URL taken from an inbound document — the actor to fetch, the
+inbox to answer at — must be a public https URL (see :func:`_fetchable`), so
+an unauthenticated POST cannot point this server at an internal host.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from typing import Any
+from urllib.parse import urldefrag, urljoin
 
 import httpx
 from sqlalchemy import delete, select
@@ -32,33 +42,167 @@ from sqlalchemy import delete, select
 from skybridge.activitypub import objects, relays
 from skybridge.activitypub.actors import RELAY_DID, get_relay_keys
 from skybridge.activitypub.delivery import DeliveryWorker, Task, forward_to_relays, post_signed
-from skybridge.atproto import identity
+from skybridge.atproto import auth, identity
 from skybridge.config import get_settings
+from skybridge.crypto import parse_signature_header, verify_request
 from skybridge.db import session_scope
 from skybridge.models import BridgedActor, Follow, Like, Record
 
 log = logging.getLogger("skybridge.inbox")
 
 
+# Redirects followed when fetching a remote document, each one re-vetted.
+_MAX_REDIRECTS = 3
+
+
+def _fetchable(url: Any) -> bool:
+    """May this server send a request to ``url``?
+
+    Public https only. A deployment that is itself plain http is a local
+    development one (see ``oauth.client_id``), whose peers sit on loopback,
+    so there http is allowed too.
+    """
+    if not isinstance(url, str) or not url:
+        return False
+    if auth.is_public_https_url(url):
+        return True
+    return get_settings().scheme == "http" and url.startswith("http://")
+
+
 async def fetch_actor(actor_id: str) -> dict[str, Any] | None:
+    """The remote actor (or key) document at ``actor_id``, or ``None``.
+
+    Redirects are followed by hand so each hop is vetted like the first URL:
+    a public actor URL that 302s to an internal one is refused.
+    """
+    if not _fetchable(actor_id):
+        log.warning("refusing to fetch non-public actor URL %r", actor_id)
+        return None
     headers = {
         "Accept": "application/activity+json",
         "User-Agent": get_settings().user_agent,
     }
+    url = actor_id
     try:
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-            resp = await client.get(actor_id, headers=headers)
-            if resp.status_code == 200:
-                return resp.json()
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
+            for _ in range(_MAX_REDIRECTS + 1):
+                resp = await client.get(url, headers=headers)
+                if resp.is_redirect:
+                    url = urljoin(url, resp.headers.get("location", ""))
+                    if not _fetchable(url):
+                        log.warning("refusing redirect to non-public URL %r", url)
+                        return None
+                    continue
+                if resp.status_code == 200:
+                    doc = resp.json()
+                    return doc if isinstance(doc, dict) else None
+                break
     except (httpx.HTTPError, json.JSONDecodeError):
         log.warning("could not fetch remote actor %s", actor_id)
     return None
 
 
 def _inboxes(actor_doc: dict[str, Any]) -> tuple[str, str | None]:
+    """``(inbox, sharedInbox)`` of a remote actor, each only if it is a URL
+    this server may post to; an unusable inbox is ``""``/``None``."""
     inbox = actor_doc.get("inbox", "")
-    shared = (actor_doc.get("endpoints") or {}).get("sharedInbox")
-    return inbox, shared
+    endpoints = actor_doc.get("endpoints")
+    shared = endpoints.get("sharedInbox") if isinstance(endpoints, dict) else None
+    return (inbox if _fetchable(inbox) else "", shared if _fetchable(shared) else None)
+
+
+# --------------------------------------------------------------------------- #
+# Authentication: HTTP signatures on the activities we act on
+# --------------------------------------------------------------------------- #
+# Everything else is acknowledged and dropped by handle_inbox, so it needs no
+# proof of origin — and demanding one would 401 the relays we subscribe to,
+# which forward other servers' posts under their own key.
+_AUTHENTICATED_TYPES = frozenset({"Follow", "Undo", "Accept", "Reject", "Like"})
+
+# keyId -> (owner actor id, public PEM, expires_at). A Like-happy peer would
+# otherwise cost one actor fetch per activity. Short-lived so a rotated key is
+# picked up; a signature that fails against a cached key refetches once anyway.
+_KEY_TTL = 3600.0
+_KEYS_MAX = 4096
+_keys: dict[str, tuple[str, str, float]] = {}
+
+
+def needs_authentication(activity: dict[str, Any]) -> bool:
+    return activity.get("type") in _AUTHENTICATED_TYPES
+
+
+def _key_from_doc(doc: dict[str, Any], key_id: str) -> tuple[str, str] | None:
+    """``(owner, public PEM)`` for ``key_id`` from an actor or key document."""
+    key: Any = doc.get("publicKey")
+    if isinstance(key, list):
+        key = next((k for k in key if isinstance(k, dict) and k.get("id") == key_id), None)
+    if not isinstance(key, dict):
+        # A bare key document (the keyId dereferences to the key itself).
+        key = doc if "publicKeyPem" in doc else None
+    if not isinstance(key, dict):
+        return None
+    pem = key.get("publicKeyPem")
+    owner = key.get("owner") or doc.get("id")
+    if not isinstance(pem, str) or not isinstance(owner, str):
+        return None
+    return owner, pem
+
+
+async def _public_key(key_id: str, *, refresh: bool = False) -> tuple[str, str] | None:
+    now = time.time()
+    cached = _keys.get(key_id)
+    if cached is not None and not refresh and cached[2] > now:
+        return cached[0], cached[1]
+    doc = await fetch_actor(urldefrag(key_id).url)
+    key = _key_from_doc(doc, key_id) if doc is not None else None
+    if key is None:
+        return None
+    if len(_keys) >= _KEYS_MAX:
+        _keys.clear()
+    _keys[key_id] = (key[0], key[1], now + _KEY_TTL)
+    return key
+
+
+def reset_key_cache() -> None:
+    """Forget fetched keys (tests)."""
+    _keys.clear()
+
+
+async def authenticate(
+    activity: dict[str, Any],
+    *,
+    method: str,
+    path: str,
+    headers: dict[str, str],
+    body: bytes,
+) -> bool:
+    """Is this request signed by a key owned by ``activity["actor"]``?
+
+    The same check a Mastodon inbox makes: the ``Signature`` header's
+    ``keyId`` is dereferenced, the key's ``owner`` must be the activity's
+    actor, and the signature must verify over the request (including the
+    body ``Digest``). A failure against a cached key refetches it once, so a
+    peer that rotated its key is not locked out for the cache lifetime.
+    """
+    actor = activity.get("actor")
+    if not isinstance(actor, str):
+        return False
+    lower = {k.lower(): v for k, v in headers.items()}
+    params = parse_signature_header(lower.get("signature", ""))
+    key_id = params.get("keyId")
+    if not key_id or not _fetchable(key_id):
+        return False
+    for refresh in (False, True):
+        key = await _public_key(key_id, refresh=refresh)
+        if key is None:
+            return False
+        owner, pem = key
+        if owner != actor:
+            log.info("signature key %s is owned by %s, not activity actor %s", key_id, owner, actor)
+            return False
+        if verify_request(public_pem=pem, method=method, path=path, headers=headers, body=body):
+            return True
+    return False
 
 
 def _target_username(target_actor_id: str | None) -> str | None:
@@ -153,6 +297,8 @@ async def _handle_follow(
     if remote is None:
         return 202  # accept-and-forget; we can't deliver a response without an inbox
     inbox, shared = _inboxes(remote)
+    if not inbox:
+        return 202  # no usable inbox to answer at, and none we would post to
 
     username = _target_username(target_actor_id)
     if username and username != get_settings().relay_username:
@@ -193,6 +339,10 @@ async def _follow_person(
         author = session.get(BridgedActor, did) if did and did != RELAY_DID else None
         if author is None:
             return 404
+        if author.opted_out:
+            # Same answer as GET /users/<handle>: the actor is Gone, and a
+            # follower stored now would receive nothing but a stale Accept.
+            return 410
         existing = session.scalar(
             select(Follow).where(
                 Follow.local_did == author.did, Follow.follower_actor_id == actor_id

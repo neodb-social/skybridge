@@ -495,6 +495,15 @@ Every push to `main` runs the checks and publishes multi-arch
 - Bridged actors: `GET /users/{handle}` (+ `/inbox` `/outbox` `/followers`) —
   inbound `Like`/`Undo(Like)` on a local post is stored and forwarded to
   configured relays
+- Inbox authentication: every activity the bridge acts on (`Follow`, `Undo`,
+  `Accept`, `Reject`, `Like`) must carry a valid draft-cavage HTTP signature
+  whose key is owned by the activity's `actor`, or it is refused with `401`.
+  Everything else (`Create`, `Announce`, ...) is acknowledged unread, so a
+  relay forwarding other servers' posts under its own key is unaffected. A
+  reverse proxy in front of the bridge must pass the `Host` header and the
+  request path through unchanged, since both are covered by the signature.
+  Remote actor and inbox URLs taken from inbound documents must be public
+  `https` URLs (as must a PDS endpoint read from a DID document).
 - Objects: `GET /users/{handle}/posts/{rkey}` (Note / Tombstone),
   `GET /catalog/{type}/{id}` (catalog work)
 - UI / stats: `GET /` (dashboard), `GET /archive`, `GET /archive/{at_uri}`

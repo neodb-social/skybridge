@@ -62,6 +62,23 @@ def is_valid_identifier(identifier: str) -> bool:
     )
 
 
+def is_public_https_url(url: str) -> bool:
+    """Syntactic check: ``https`` and a public-looking host, no DNS lookup.
+
+    For URLs taken from documents we did not write — a PDS endpoint in a DID
+    document, an actor or inbox URL in an inbound activity — before fetching
+    or posting to them. Rejects IP literals and special-use names outright;
+    the name is resolved by the fetch itself, so a DNS pre-check here would
+    only race it (see :func:`_is_public_https` for the OAuth path, which pays
+    for that check because it runs once per sign-in).
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    return parsed.scheme == "https" and bool(parsed.hostname) and _is_public_name(parsed.hostname)
+
+
 def _is_public_https(url: str) -> bool:
     """True if ``url`` is https and its host resolves only to public IPs.
 
