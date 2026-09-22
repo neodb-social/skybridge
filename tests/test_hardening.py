@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -15,7 +16,7 @@ from skybridge.activitypub import delivery, inbox
 from skybridge.activitypub.delivery import DeliveryWorker, Task
 from skybridge.atproto import archive, identity, jetstream
 from skybridge.atproto.replay import replay_file
-from skybridge.crypto import generate_keypair, sign_request
+from skybridge.crypto import generate_keypair, http_date, sign_request
 from skybridge.db import session_scope
 from skybridge.main import app
 from skybridge.models import BridgedActor, Delivery, Follow, Record
@@ -412,7 +413,9 @@ def _undo_follow(handle: str) -> dict:
     }
 
 
-def _signed(private_pem: str, key_id: str, path: str, activity: dict) -> tuple[bytes, dict]:
+def _signed(
+    private_pem: str, key_id: str, path: str, activity: dict, *, date: str | None = None
+) -> tuple[bytes, dict]:
     body = json.dumps(activity).encode()
     headers = sign_request(
         private_pem=private_pem,
@@ -420,6 +423,7 @@ def _signed(private_pem: str, key_id: str, path: str, activity: dict) -> tuple[b
         method="POST",
         url=f"http://testserver{path}",
         body=body,
+        date=date,
     )
     return body, headers
 
@@ -438,6 +442,29 @@ def test_a_signed_undo_follow_is_honoured(followed, remote):
     resp = client.post(path, content=body, headers=headers)
     assert resp.status_code == 202
     assert _follow_row(did) is None
+
+
+def test_a_retried_delivery_signed_hours_ago_is_still_honoured(followed, remote):
+    """Mastodon retries with the original signature for up to 12 hours."""
+    client, handle, did = followed
+    path = f"/users/{handle}/inbox"
+    stale = http_date(datetime.now(UTC) - timedelta(hours=2))
+    body, headers = _signed(
+        remote["private_pem"], REMOTE_KEY_ID, path, _undo_follow(handle), date=stale
+    )
+    assert client.post(path, content=body, headers=headers).status_code == 202
+    assert _follow_row(did) is None
+
+
+def test_a_signature_from_yesterday_is_refused(followed, remote):
+    client, handle, did = followed
+    path = f"/users/{handle}/inbox"
+    stale = http_date(datetime.now(UTC) - timedelta(hours=13))
+    body, headers = _signed(
+        remote["private_pem"], REMOTE_KEY_ID, path, _undo_follow(handle), date=stale
+    )
+    assert client.post(path, content=body, headers=headers).status_code == 401
+    assert _follow_row(did) is not None
 
 
 def test_a_signature_by_a_key_the_actor_does_not_own_is_refused(followed, remote):

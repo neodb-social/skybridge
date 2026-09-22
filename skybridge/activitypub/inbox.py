@@ -124,6 +124,12 @@ _AUTHENTICATED_TYPES = frozenset({"Follow", "Undo", "Accept", "Reject", "Like"})
 # picked up; a signature that fails against a cached key refetches once anyway.
 _KEY_TTL = 3600.0
 _KEYS_MAX = 4096
+
+# How old a signature's Date may be. Mastodon's inbox allows 12 hours, and its
+# delivery worker retries a failed POST for days with the ORIGINAL signature
+# only inside that window, re-signing after it; a tighter bound here would
+# 401 legitimate retries that Mastodon itself would still accept.
+_MAX_SKEW_SECONDS = 12 * 3600
 _keys: dict[str, tuple[str, str, float]] = {}
 
 
@@ -200,7 +206,14 @@ async def authenticate(
         if owner != actor:
             log.info("signature key %s is owned by %s, not activity actor %s", key_id, owner, actor)
             return False
-        if verify_request(public_pem=pem, method=method, path=path, headers=headers, body=body):
+        if verify_request(
+            public_pem=pem,
+            method=method,
+            path=path,
+            headers=headers,
+            body=body,
+            max_skew_seconds=_MAX_SKEW_SECONDS,
+        ):
             return True
     return False
 
