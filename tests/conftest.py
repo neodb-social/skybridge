@@ -39,7 +39,7 @@ def _db(settings: Settings):
     # otherwise outlive the database they were counted from.
     reset_usage()
     # Same for the per-account relay throttle counter.
-    delivery._relayed_creates.clear()
+    delivery.reset_relay_throttle()
     yield
     set_settings(None)
 

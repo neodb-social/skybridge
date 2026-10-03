@@ -84,6 +84,19 @@ def test_window_slides(clock):
     assert _send("did:plc:a", "Create") == {RELAY: 0, PEER: 1}
 
 
+def test_inactive_accounts_are_evicted(clock):
+    _limit(2)
+    _send("did:plc:a", "Create")
+    clock[0] += 1800
+    _send("did:plc:b", "Create")
+    clock[0] += 1800  # a is an hour idle, b only half an hour
+    _send("did:plc:c", "Create")
+    assert set(delivery._relayed_creates) == {"did:plc:b", "did:plc:c"}
+    # b's Create still counts after the sweep
+    _send("did:plc:b", "Create")
+    assert _send("did:plc:b", "Create") == {RELAY: 0, PEER: 1}
+
+
 def test_zero_means_no_limit(clock):
     _limit(0)
     assert _send("did:plc:a", "Create", 30) == {RELAY: 30, PEER: 30}

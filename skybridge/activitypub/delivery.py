@@ -203,19 +203,42 @@ def relay_inboxes() -> list[str]:
 # ingest CLI) keeps its own; an approximate limit is all it needs to be.
 _RELAY_WINDOW = 3600.0
 _relayed_creates: dict[str, deque[float]] = {}
+_last_sweep: float | None = None
 _clock = time.monotonic
+
+
+def reset_relay_throttle() -> None:
+    global _last_sweep
+    _relayed_creates.clear()
+    _last_sweep = None
+
+
+def _sweep_relayed_creates(now: float) -> None:
+    """Drop DIDs with no relayed Create in the last hour, at most once an hour.
+
+    Otherwise an author's entry is only pruned when that author posts again,
+    and the dict grows with every author ever seen in a long-running process.
+    """
+    global _last_sweep
+    if _last_sweep is not None and now - _last_sweep < _RELAY_WINDOW:
+        return
+    _last_sweep = now
+    for did in [d for d, times in _relayed_creates.items() if now - times[-1] >= _RELAY_WINDOW]:
+        del _relayed_creates[did]
 
 
 def _relay_create_allowed(did: str) -> bool:
     """Take a slot for one more relayed ``Create`` by ``did``, if one is free.
 
     ``SKYBRIDGE_RELAY_CREATES_PER_HOUR`` caps the slots per sliding hour (0 =
-    no cap). Each DID holds at most that many timestamps.
+    no cap). Each DID holds at most that many timestamps, and only DIDs that
+    relayed a Create within the last hour or so are kept.
     """
     limit = get_settings().relay_creates_per_hour
     if limit <= 0:
         return True
     now = _clock()
+    _sweep_relayed_creates(now)
     times = _relayed_creates.setdefault(did, deque())
     while times and now - times[0] >= _RELAY_WINDOW:
         times.popleft()
