@@ -17,7 +17,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -196,6 +198,33 @@ def relay_inboxes() -> list[str]:
         return [inbox for inbox in accepted if inbox in configured]
 
 
+# Relay throttle: per author DID, the times of the Creates relayed in the last
+# hour. In memory only, so it resets on restart and each process (serve, the
+# ingest CLI) keeps its own; an approximate limit is all it needs to be.
+_RELAY_WINDOW = 3600.0
+_relayed_creates: dict[str, deque[float]] = {}
+_clock = time.monotonic
+
+
+def _relay_create_allowed(did: str) -> bool:
+    """Take a slot for one more relayed ``Create`` by ``did``, if one is free.
+
+    ``SKYBRIDGE_RELAY_CREATES_PER_HOUR`` caps the slots per sliding hour (0 =
+    no cap). Each DID holds at most that many timestamps.
+    """
+    limit = get_settings().relay_creates_per_hour
+    if limit <= 0:
+        return True
+    now = _clock()
+    times = _relayed_creates.setdefault(did, deque())
+    while times and now - times[0] >= _RELAY_WINDOW:
+        times.popleft()
+    if len(times) >= limit:
+        return False
+    times.append(now)
+    return True
+
+
 def follower_targets(local_did: str) -> list[str]:
     with session_scope() as session:
         rows = session.execute(
@@ -270,7 +299,14 @@ async def fanout(
     # rejection, so a signing failure skips the relay path rather than burn
     # the whole retry schedule on it. Signing is CPU-bound (URDNA2015
     # normalization), hence the thread.
+    #
+    # A Create over the author's hourly relay allowance is not relayed: the
+    # Note stays fetchable by URL and still goes to the author's followers.
+    # Only Creates count; Updates and Deletes always go through.
     inboxes = relay_inboxes()
+    if inboxes and activity.get("type") == "Create" and not _relay_create_allowed(did):
+        log.info("relay throttle: not relaying Create %s by %s", record_uri, did)
+        inboxes = []
     if inboxes:
         try:
             signature = await asyncio.to_thread(

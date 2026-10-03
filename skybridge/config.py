@@ -147,6 +147,11 @@ class Settings:
     # External Fediverse relay inboxes we subscribe to as a client (Mastodon-
     # style); empty = pure normal-server mode. See SKYBRIDGE_RELAYS.
     relays: tuple[str, ...] = ()
+    # At most this many Creates per account per hour go to the relays; the
+    # overflow is still stored (fetchable by URL) and delivered to the
+    # author's own followers. Counted in memory per process, so approximate.
+    # 0 = no limit.
+    relay_creates_per_hour: int = 10
     # Delivery worker retry schedule (seconds).
     retry_backoff: tuple[int, ...] = (2, 4, 8, 16)
     # neodb-relay (https://github.com/neodb-social/neodb-relay) returns HTTP
@@ -269,6 +274,7 @@ def _from_env() -> Settings:
         relay_key_pem=os.environ.get("SKYBRIDGE_RELAY_KEY") or None,
         relay_key_file=os.path.join(data_dir, "relay_key.pem"),
         relays=_parse_list(os.environ.get("SKYBRIDGE_RELAYS", "")),
+        relay_creates_per_hour=_env_int("SKYBRIDGE_RELAY_CREATES_PER_HOUR", 10, minimum=0),
         jetstream_api_key=os.environ.get("SKYBRIDGE_JETSTREAM_API_KEY") or None,
         admins=_parse_list(os.environ.get("SKYBRIDGE_ADMINS", "")),
         sentry_dsn=os.environ.get("SKYBRIDGE_SENTRY_DSN") or None,

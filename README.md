@@ -453,6 +453,7 @@ the CLI with `python -m skybridge import`.
 | `SKYBRIDGE_ADMINS` | unset | Comma/space-separated DIDs and/or handles that get the admin panel on `/manage`. Prefer DIDs: handles are transferable |
 | `SKYBRIDGE_RELAY_KEY` | **required** | Service actor private key (PEM); alternatively place a PEM at `$SKYBRIDGE_DATA/relay_key.pem` |
 | `SKYBRIDGE_RELAYS` | unset | Comma/space-separated relay inbox URLs to publish through (Mastodon-style); empty = pure normal-server mode |
+| `SKYBRIDGE_RELAY_CREATES_PER_HOUR` | `10` | Max `Create`s per account per sliding hour sent to relays; the overflow is still stored (fetchable by URL) and delivered to the account's own followers. `Update`/`Delete` are not limited. Counted in memory per process (`serve` and `ingest` each keep their own), so approximate. `0` = no limit |
 
 The service actor signs outbound activities with an RSA key that **you must
 provide** — either as `SKYBRIDGE_RELAY_KEY` in `.env` (compose supports

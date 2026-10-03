@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from skybridge.activitypub import delivery
 from skybridge.config import Settings, set_settings
 from skybridge.crypto import generate_keypair
 from skybridge.db import init_db
@@ -37,6 +38,8 @@ def _db(settings: Settings):
     # The NodeInfo counts are cached in a module global, so they would
     # otherwise outlive the database they were counted from.
     reset_usage()
+    # Same for the per-account relay throttle counter.
+    delivery._relayed_creates.clear()
     yield
     set_settings(None)
 
