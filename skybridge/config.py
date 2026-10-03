@@ -53,6 +53,12 @@ WANTED_COLLECTIONS: tuple[str, ...] = (
     # (comments, like popfeed reactions) and buzz.bookhive.hiveBook /
     # buzz.bookhive.catalogBook (the app's catalog, not user activity).
     "buzz.bookhive.book",
+    # Postgame (https://postgame.at), a video game backlog tracker: like a
+    # BookHive book, one game record per (user, game) carries status + rating
+    # + note and is edited in place, so it bridges to a single Note via the
+    # non-paired path. See translate.postgame. Not bridged: at.postgame.list /
+    # list.item (collection membership), at.postgame.love, follow, settings.
+    "at.postgame.game",
     # teal.fm (https://github.com/teal-fm/teal), a music scrobbler: one play
     # record per track listened to. Bridged as ONE Note per listening session
     # of (author, release), with a Status of progress ("is listening") — see
@@ -93,7 +99,12 @@ WANTED_KINDS: tuple[str, ...] = ("commit", "identity", "account")
 # `collections`). NOT used for ingestion: buzz.bookhive.* would pull in
 # high-volume catalogBook records carrying multi-KB author biographies that the
 # bridge has no use for. See WANTED_COLLECTIONS for what is actually ingested.
-DISCOVERY_COLLECTIONS: tuple[str, ...] = ("social.popfeed.*", "buzz.bookhive.*", "fm.teal.*")
+DISCOVERY_COLLECTIONS: tuple[str, ...] = (
+    "social.popfeed.*",
+    "buzz.bookhive.*",
+    "fm.teal.*",
+    "at.postgame.*",
+)
 
 
 @dataclass(frozen=True)
@@ -130,8 +141,8 @@ class Settings:
     relay_key_pem: str | None = None
     relay_key_file: str = "data/relay_key.pem"
     relay_summary: str = (
-        "Skybridge mirrors activities from Atmosphere (e.g. popfeed, bookhive, teal.fm) to "
-        "the Fediverse in NeoDB-compatible format."
+        "Skybridge mirrors activities from Atmosphere (e.g. popfeed, bookhive, postgame, teal.fm) "
+        "to the Fediverse in NeoDB-compatible format."
     )
     # External Fediverse relay inboxes we subscribe to as a client (Mastodon-
     # style); empty = pure normal-server mode. See SKYBRIDGE_RELAYS.

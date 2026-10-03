@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from skybridge.config import get_settings
 from skybridge.db import session_scope
 from skybridge.models import Work, WorkIdentifier
-from skybridge.translate import bookhive, teal
+from skybridge.translate import bookhive, postgame, teal
 
 # popfeed creativeWorkType -> NeoDB catalog category.
 WORK_TYPE_TO_CATEGORY: dict[str, str] = {
@@ -262,7 +262,8 @@ def _effective_record(record: dict) -> dict:
     """The record whose work actually gets minted.
 
     A BookHive book is normalized to the generic ``book`` work shape (see
-    :mod:`skybridge.translate.bookhive`); a teal.fm play to a ``music`` work
+    :mod:`skybridge.translate.bookhive`); a Postgame game to a ``video_game``
+    work (see :mod:`skybridge.translate.postgame`); a teal.fm play to a ``music`` work
     for its release (see :mod:`skybridge.translate.teal`). Episode list-adds
     become season activity (see :func:`season_view`); an episode that can't be
     resolved to a season keeps its own tv_episode work, which the pipeline
@@ -270,6 +271,8 @@ def _effective_record(record: dict) -> dict:
     """
     if bookhive.is_book(record):
         return bookhive.as_work_record(record)
+    if postgame.is_game(record):
+        return postgame.as_work_record(record)
     if teal.is_play(record):
         return teal.as_work_record(record)
     if record.get("creativeWorkType") == EPISODE_TYPE and str(record.get("$type", "")).endswith(
