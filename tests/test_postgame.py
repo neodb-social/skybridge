@@ -190,6 +190,18 @@ def test_note_on_an_unplayed_game_is_still_a_comment(settings):
     assert note["content"].endswith("<p>This is the PAL version</p>")
 
 
+def test_note_is_plain_text_never_markup(settings):
+    # Postgame's note is a plain textarea: what looks like a tag or an entity
+    # is literal text, while line breaks still become paragraphs.
+    record = {**PLAYED, "notes": "I <3 this & the <b>DLC</b>.\nFish &amp; chips\n\nBye"}
+    note, _ = _translate(record, rkey="pg-plain")
+    assert note is not None
+    body = "<p>I &lt;3 this &amp; the &lt;b&gt;DLC&lt;/b&gt;.<br>Fish &amp;amp; chips</p><p>Bye</p>"
+    assert note["content"].endswith(body)
+    comments = [r for r in note["relatedWith"] if r["type"] == "Comment"]
+    assert comments and comments[0]["content"] == body
+
+
 def test_game_and_popfeed_game_share_one_catalog_work(settings):
     # Postgame can import a Popfeed game into its own record; both carry the
     # IGDB id, so they must resolve to ONE catalog work.

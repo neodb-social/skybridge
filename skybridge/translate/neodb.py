@@ -536,8 +536,10 @@ def _populate_game(note: dict, record: dict, ref: works.WorkRef | None) -> None:
         lead = f"<p>{_GAME_STATUS_LEAD[status]} {_title_html(title, ref)}</p>"
     else:
         lead = f"<p>Added {_title_html(title, ref)}</p>"
-    # Postgame notes are plain text without facets (see _review_body).
-    text_html = _review_body(text) if text else ""
+    # Postgame notes come from a plain textarea, never editor HTML: escape the
+    # whole text first, so "<3" or "a<b>c" stays literal, then let the
+    # sanitizer turn its line breaks into paragraphs.
+    text_html = richtext.review_html(html.escape(text, quote=False)) if text else ""
     note["content"] = lead + text_html
 
     # As with reviews, the cover rides on the catalog-item tag, not as media.
