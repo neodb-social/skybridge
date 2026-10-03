@@ -1,7 +1,8 @@
 # 🌁 NeoDB Sky Bridge
 
 NeoDB Sky Bridge relays public AT Protocol records (e.g. [Popfeed](https://github.com/Popfeed-Social),
-[BookHive](https://github.com/nperez0111/bookhive) and
+[BookHive](https://github.com/nperez0111/bookhive),
+[Postgame](https://postgame.at) and
 [teal.fm](https://github.com/teal-fm/teal)) into the Fediverse
 as NeoDB-compatible ActivityPub activities. 
 
@@ -203,7 +204,7 @@ Visibility preferences above): unlike a profile edit it is a rare, low-volume
 record, and like one it only ever updates an actor we already bridge.
 
 `uv run python -m skybridge discover` keeps this list honest: it subscribes to
-`social.popfeed.*` / `buzz.bookhive.*` / `fm.teal.*` (Jetstream v2 accepts
+`social.popfeed.*` / `buzz.bookhive.*` / `fm.teal.*` / `at.postgame.*` (Jetstream v2 accepts
 namespace wildcards) and reports every collection seen, flagging the ones we
 don't bridge. Ingestion itself still asks for the explicit list — a wildcard
 subscription would also pull in `buzz.bookhive.catalogBook`, whose records
@@ -235,6 +236,49 @@ Known but not bridged:
   entries, not user activity)
 - the `cover` blob (a PDS blob, not a URL): no poster is derived yet, so the
   Note relies on the catalog-item tag for imagery
+
+### Postgame
+
+[Postgame](https://postgame.at) is a video game backlog tracker on atproto,
+with its own lexicons. Like a BookHive book, one `at.postgame.game` record per
+(author, game) carries the status, the rating and a free-text note, and
+Postgame edits it in place as the status changes. So it bridges to ONE AP
+`Note` through the non-paired path, and an edit becomes an `Update` of that
+same Note. The work type is `video_game` (AP `Game`).
+
+| Postgame record | becomes |
+|---|---|
+| `at.postgame.game` | a single `Note` carrying, as available: a `Status` mark, a `Rating` (`rating`, stored as stars x 2, so already 1-10), and, when there is a note, an untitled `Comment` `withRegardTo` the work. An unrated game leads with a playing verb ("Wants to play", "Playing", "Played", "Stopped playing") |
+
+| Postgame status | NeoDB status |
+|---|---|
+| `wishlisted`, `backlogged` | wishlist |
+| `playing` | progress |
+| `played` (`completed`, `mastered`, `retired`, or no `playedStatus`) | complete |
+| `played` + `abandoned` | dropped |
+| `backlogged` + `backloggedStatus: shelved` (started, then paused) | dropped, as popfeed's "shelved" lists |
+
+Legacy values that older records still carry (`started`, `wishlist`,
+`shelved`, `finished`, `abandoned`) map the same way. The note becomes a
+`Comment` whatever the status: on a played game it is usually a review, on a
+backlogged one a library note.
+
+Game identity is the IGDB id. The slug from the record's `igdbUrl` rides along
+as an identifier, so the catalog item exposes the IGDB URL that NeoDB resolves.
+The identifier names match popfeed's game identifiers (`igdbId`, `slug`), so a
+Postgame game and a popfeed game share one catalog entry.
+
+Postgame reads popfeed's game records, and a user can "import" one, which
+writes a new `at.postgame.game` and leaves the popfeed record as it was. Each
+record keeps its own Note: a Postgame game never joins a popfeed
+review/listItem pair, so a game kept on both apps appears as two posts. A
+replay is also a separate record, so it also gets its own Note.
+
+Known but not bridged:
+- `at.postgame.list` / `at.postgame.list.item` (collection membership; NeoDB
+  Collections are not bridged yet)
+- `at.postgame.love` (a "loved" flag with no status of its own)
+- `at.postgame.follow` / `at.postgame.settings` (social graph and preferences)
 
 ### teal.fm
 

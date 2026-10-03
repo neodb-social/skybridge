@@ -31,7 +31,7 @@ from skybridge.activitypub.delivery import DeliveryWorker
 from skybridge.atproto import identity
 from skybridge.config import get_settings
 from skybridge.pipeline import ARCHIVE_ONLY_COLLECTIONS, Processed, process_event
-from skybridge.translate import bookhive, teal
+from skybridge.translate import bookhive, postgame, teal
 
 log = logging.getLogger("skybridge.backfill")
 
@@ -45,6 +45,7 @@ _FETCH_PRIORITY = (
     "social.popfeed.feed.review",
     "social.popfeed.feed.listItem",
     bookhive.BOOK_COLLECTION,
+    postgame.GAME_COLLECTION,
     teal.PLAY_COLLECTION,
     teal.ALPHA_PLAY_COLLECTION,
 )

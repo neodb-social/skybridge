@@ -33,7 +33,7 @@ from skybridge.atproto import identity
 from skybridge.config import get_settings
 from skybridge.db import session_scope
 from skybridge.models import Record
-from skybridge.translate import bookhive, richtext, teal, works
+from skybridge.translate import bookhive, postgame, richtext, teal, works
 
 log = logging.getLogger("skybridge.translate")
 
@@ -338,6 +338,8 @@ def build_note(
     # feed.review in 2025 — is no longer bridged; see config.WANTED_COLLECTIONS.)
     if collection == bookhive.BOOK_COLLECTION:
         _populate_book(note, record, ref)
+    elif collection == postgame.GAME_COLLECTION:
+        _populate_game(note, record, ref)
     elif collection in teal.PLAY_COLLECTIONS:
         _populate_play(note, record, ref)
     elif collection.endswith("feed.list"):
@@ -501,6 +503,59 @@ def _populate_book(note: dict, record: dict, ref: works.WorkRef | None) -> None:
             # An untitled Comment on the mark (never a titled Review, which
             # NeoDB renders Article-like); carries only the review text.
             note["relatedWith"].append(_related(note, "Comment", ref.url, {"content": review_html}))
+        if status:
+            note["relatedWith"].append(_related(note, "Status", ref.url, {"status": status}))
+
+
+# NeoDB shelf status -> the playing verb that leads an unrated game Note.
+# "Stopped playing" covers both an abandoned and a shelved (paused) game.
+_GAME_STATUS_LEAD = {
+    "wishlist": "Wants to play",
+    "progress": "Playing",
+    "complete": "Played",
+    "dropped": "Stopped playing",
+}
+
+
+def _populate_game(note: dict, record: dict, ref: works.WorkRef | None) -> None:
+    """Populate the Note for an ``at.postgame.game`` record.
+
+    Like a BookHive book, one game record carries the shelf status, rating
+    (1-10) and a note together, so its one Note may carry ``Status`` +
+    ``Rating`` + ``Comment`` at once. The note becomes the Comment whatever
+    the status: on a played game it is a review, on others a library note.
+    """
+    title = (ref.title if ref is not None else None) or postgame.title(record) or "a game"
+    text = postgame.notes(record)
+    stars = postgame.rating(record)
+    status = postgame.shelf_status(record)
+
+    if stars is not None:
+        lead = f"<p>Rated {_title_html(title, ref)} {stars:g}/{_RATING_BEST}</p>"
+    elif status:
+        lead = f"<p>{_GAME_STATUS_LEAD[status]} {_title_html(title, ref)}</p>"
+    else:
+        lead = f"<p>Added {_title_html(title, ref)}</p>"
+    # Postgame notes are plain text without facets (see _review_body).
+    text_html = _review_body(text) if text else ""
+    note["content"] = lead + text_html
+
+    # As with reviews, the cover rides on the catalog-item tag, not as media.
+    if ref is not None:
+        note["tag"].append(_work_tag(ref))
+        note["tag"].append({"type": "Hashtag", "name": f"#{works.category_for(ref.work_type)}"})
+        if stars is not None:
+            note["relatedWith"].append(
+                _related(
+                    note,
+                    "Rating",
+                    ref.url,
+                    {"value": stars, "best": _RATING_BEST, "worst": _RATING_WORST},
+                )
+            )
+        if text:
+            # An untitled Comment on the mark, never a titled Review.
+            note["relatedWith"].append(_related(note, "Comment", ref.url, {"content": text_html}))
         if status:
             note["relatedWith"].append(_related(note, "Status", ref.url, {"status": status}))
 
