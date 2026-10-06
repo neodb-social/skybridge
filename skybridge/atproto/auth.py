@@ -43,6 +43,17 @@ def _is_public_name(host: str) -> bool:
     return len(labels) >= 2 and labels[-1] not in _SPECIAL_SUFFIXES
 
 
+def is_handle(value: str) -> bool:
+    """Syntactic check: does ``value`` have the shape of an atproto handle?
+
+    Shape only — no public-name requirement — for names that arrive already
+    verified (a Jetstream identity event) or that are verified next (see
+    ``identity._handle_points_at``). It is what keeps ``/``, quotes and angle
+    brackets out of a handle, which is also a URL path segment and HTML text.
+    """
+    return len(value) <= 253 and _HANDLE_RE.match(value) is not None
+
+
 def is_valid_identifier(identifier: str) -> bool:
     """Cheap syntax check so we never resolve attacker-shaped garbage."""
     if identifier.startswith("did:web:"):

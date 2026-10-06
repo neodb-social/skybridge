@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+import pytest
 from skybridge.atproto import identity
+from skybridge.atproto.identity import _handle_points_at as _real_handle_points_at
 from skybridge.models import BridgedActor
 
 DID = "did:plc:test"
@@ -95,6 +97,91 @@ def test_rename_actor_ignores_the_invalid_handle_placeholder(settings):
 
     assert identity.rename_actor(DID, identity.INVALID_HANDLE) is None
     assert _actor(DID).handle == HANDLE
+
+
+def test_rename_actor_refuses_a_malformed_handle(settings):
+    """A handle is a URL path segment and HTML text here, so its shape is
+    checked even though Jetstream already verified it."""
+    identity.ensure_actor(DID, allow_network=False)
+    identity.rename_actor(DID, HANDLE)
+
+    for bad in ('x"><script>.test', "a/b.test", "noDots", "", "x" * 254 + ".test"):
+        assert identity.rename_actor(DID, bad) is None
+    assert _actor(DID).handle == HANDLE
+
+
+# A PLC document naming only a handle, so resolve_remote has no PDS to read
+# profile records from and the test can focus on the handle alone.
+PLC_HANDLE_ONLY = {"alsoKnownAs": PLC_DOC["alsoKnownAs"]}
+
+
+def test_plc_handle_must_resolve_back_to_the_did(monkeypatch):
+    """``alsoKnownAs`` is written by the DID's controller: a DID that names
+    someone else's handle must not be given it."""
+    monkeypatch.setattr(identity, "_http_json", _fake_http_json({"plc.directory": PLC_HANDLE_ONLY}))
+    monkeypatch.setattr(identity, "_handle_points_at", lambda handle, did: False)
+
+    ident = identity.resolve_remote(DID)
+
+    assert ident.handle == identity._fallback_handle(DID)
+    assert ident.handle_resolved is False
+
+
+def test_plc_handle_is_verified_against_this_did(monkeypatch):
+    seen: list[tuple[str, str]] = []
+
+    def points_at(handle: str, did: str) -> bool:
+        seen.append((handle, did))
+        return True
+
+    monkeypatch.setattr(identity, "_http_json", _fake_http_json({"plc.directory": PLC_HANDLE_ONLY}))
+    monkeypatch.setattr(identity, "_handle_points_at", points_at)
+
+    ident = identity.resolve_remote(DID)
+
+    assert ident.handle == HANDLE and ident.handle_resolved is True
+    assert seen == [(HANDLE, DID)]
+
+
+def test_malformed_plc_handle_falls_back_without_resolving(monkeypatch):
+    doc = {"alsoKnownAs": ['at://evil"><img src=x onerror=alert(1)>.example']}
+    monkeypatch.setattr(identity, "_http_json", _fake_http_json({"plc.directory": doc}))
+    monkeypatch.setattr(
+        identity, "_handle_points_at", lambda handle, did: pytest.fail("must not resolve")
+    )
+
+    ident = identity.resolve_remote(DID)
+
+    assert ident.handle == identity._fallback_handle(DID)
+
+
+def test_a_handle_that_was_hijacked_in_plc_does_not_displace_the_real_holder(settings, monkeypatch):
+    """The real holder of HANDLE is bridged; a second DID then claims HANDLE
+    in its own PLC document. The claim is unverified, so the first actor
+    keeps its name and the newcomer lands on its synthetic handle."""
+    identity.ensure_actor(DID, allow_network=False)
+    identity.rename_actor(DID, HANDLE)
+    newcomer = "did:plc:hijacker"
+    monkeypatch.setattr(identity, "_http_json", _fake_http_json({"plc.directory": PLC_HANDLE_ONLY}))
+    monkeypatch.setattr(identity, "_handle_points_at", lambda handle, did: did == DID)
+
+    identity.ensure_actor(newcomer, allow_network=True)
+
+    assert _actor(HANDLE).did == DID
+    assert _actor(newcomer).handle == identity._fallback_handle(newcomer)
+
+
+def test_handle_verification_refuses_non_public_names(monkeypatch):
+    """Resolution fetches https://<handle>/.well-known/..., so an internal
+    name is never even looked up."""
+    import atproto
+
+    monkeypatch.setattr(
+        atproto, "IdResolver", lambda *a, **k: pytest.fail("must not resolve"), raising=True
+    )
+    # The real function: conftest stubs identity._handle_points_at for every test.
+    assert _real_handle_points_at("metadata.google.internal", DID) is False
+    assert _real_handle_points_at("foo.localhost", DID) is False
 
 
 def test_handle_taken_by_another_did_displaces_the_stale_actor(settings):

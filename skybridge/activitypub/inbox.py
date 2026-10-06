@@ -69,11 +69,33 @@ def _fetchable(url: Any) -> bool:
     return get_settings().scheme == "http" and url.startswith("http://")
 
 
+# Largest remote document we are willing to hold in memory. Actor and key
+# documents are a few KB; anything near this is not one.
+MAX_DOCUMENT_BYTES = 5 * 1024 * 1024
+
+
+async def _read_capped(resp: httpx.Response, limit: int) -> bytes | None:
+    """The response body, or ``None`` once it exceeds ``limit`` bytes."""
+    declared = resp.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > limit:
+        return None
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in resp.aiter_bytes():
+        size += len(chunk)
+        if size > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 async def fetch_actor(actor_id: str) -> dict[str, Any] | None:
     """The remote actor (or key) document at ``actor_id``, or ``None``.
 
     Redirects are followed by hand so each hop is vetted like the first URL:
-    a public actor URL that 302s to an internal one is refused.
+    a public actor URL that 302s to an internal one is refused. The body is
+    read in chunks and abandoned past :data:`MAX_DOCUMENT_BYTES`, so a hostile
+    peer cannot make an unauthenticated POST cost this server its memory.
     """
     if not _fetchable(actor_id):
         log.warning("refusing to fetch non-public actor URL %r", actor_id)
@@ -86,18 +108,26 @@ async def fetch_actor(actor_id: str) -> dict[str, Any] | None:
     try:
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
             for _ in range(_MAX_REDIRECTS + 1):
-                resp = await client.get(url, headers=headers)
-                if resp.is_redirect:
-                    url = urljoin(url, resp.headers.get("location", ""))
-                    if not _fetchable(url):
-                        log.warning("refusing redirect to non-public URL %r", url)
-                        return None
-                    continue
-                if resp.status_code == 200:
-                    doc = resp.json()
-                    return doc if isinstance(doc, dict) else None
-                break
-    except (httpx.HTTPError, json.JSONDecodeError):
+                request = client.build_request("GET", url, headers=headers)
+                resp = await client.send(request, stream=True)
+                try:
+                    if resp.is_redirect:
+                        url = urljoin(url, resp.headers.get("location", ""))
+                        if not _fetchable(url):
+                            log.warning("refusing redirect to non-public URL %r", url)
+                            return None
+                        continue
+                    if resp.status_code != 200:
+                        break
+                    body = await _read_capped(resp, MAX_DOCUMENT_BYTES)
+                finally:
+                    await resp.aclose()
+                if body is None:
+                    log.warning("remote document %s exceeds %d bytes", url, MAX_DOCUMENT_BYTES)
+                    return None
+                doc = json.loads(body)
+                return doc if isinstance(doc, dict) else None
+    except (httpx.HTTPError, ValueError):
         log.warning("could not fetch remote actor %s", actor_id)
     return None
 
@@ -147,6 +177,9 @@ def _key_from_doc(doc: dict[str, Any], key_id: str) -> tuple[str, str] | None:
         key = doc if "publicKeyPem" in doc else None
     if not isinstance(key, dict):
         return None
+    if key.get("id") != key_id:
+        # The document holds a key, but not the one the signature named.
+        return None
     pem = key.get("publicKeyPem")
     owner = key.get("owner") or doc.get("id")
     if not isinstance(pem, str) or not isinstance(owner, str):
@@ -154,13 +187,47 @@ def _key_from_doc(doc: dict[str, Any], key_id: str) -> tuple[str, str] | None:
     return owner, pem
 
 
+async def _confirmed_key(key_id: str) -> tuple[str, str] | None:
+    """``(owner, public PEM)`` for ``key_id``, vouched for by the owner.
+
+    The document at ``key_id`` names an ``owner``, but that is only a claim:
+    anyone can host a key document that says it belongs to someone else. The
+    key counts only when the owner's own actor document stands behind it,
+    the same way Mastodon's ``FetchRemoteKeyService`` confirms a key:
+
+    * the key was fetched from the owner's own URL (``keyId`` defrags to the
+      owner, so the owner's server served it), or
+    * the owner's actor document, fetched from the owner's URL, lists a key
+      with this exact ``id`` — and then it is THAT document's PEM that is
+      used, never the one from the unconfirmed document.
+    """
+    base = urldefrag(key_id).url
+    doc = await fetch_actor(base)
+    key = _key_from_doc(doc, key_id) if doc is not None else None
+    if key is None:
+        return None
+    owner, _pem = key
+    if owner == base:
+        return key
+    if not _fetchable(owner):
+        return None
+    owner_doc = await fetch_actor(owner)
+    if owner_doc is None or owner_doc.get("id") != owner:
+        log.info("key %s: owner %s did not serve an actor document for itself", key_id, owner)
+        return None
+    confirmed = _key_from_doc(owner_doc, key_id)
+    if confirmed is None or confirmed[0] != owner:
+        log.info("key %s is not listed by its claimed owner %s", key_id, owner)
+        return None
+    return confirmed
+
+
 async def _public_key(key_id: str, *, refresh: bool = False) -> tuple[str, str] | None:
     now = time.time()
     cached = _keys.get(key_id)
     if cached is not None and not refresh and cached[2] > now:
         return cached[0], cached[1]
-    doc = await fetch_actor(urldefrag(key_id).url)
-    key = _key_from_doc(doc, key_id) if doc is not None else None
+    key = await _confirmed_key(key_id)
     if key is None:
         return None
     if len(_keys) >= _KEYS_MAX:
@@ -446,7 +513,7 @@ async def _handle_undo_like(
     with session_scope() as session:
         row = session.scalar(select(Like).where(Like.activity_id == like_id))
         if row is None or row.actor_id != actor_id:
-            return 202  # unknown Like, or actor mismatch (no signature verification): no-op
+            return 202  # unknown Like, or an Undo by someone other than its author: no-op
         session.delete(row)
     if worker is not None:
         await forward_to_relays(worker, record_uri=activity.get("id") or like_id, activity=activity)

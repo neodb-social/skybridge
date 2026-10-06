@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from skybridge.activitypub import delivery
+from skybridge.atproto import identity
 from skybridge.config import Settings, set_settings
 from skybridge.crypto import generate_keypair
 from skybridge.db import init_db
@@ -42,6 +43,16 @@ def _db(settings: Settings):
     delivery.reset_relay_throttle()
     yield
     set_settings(None)
+
+
+@pytest.fixture(autouse=True)
+def _handles_verify(monkeypatch):
+    """Treat every PLC-claimed handle as resolving back to its DID.
+
+    The real check does DNS and HTTPS; tests that exercise the failure case
+    override this themselves.
+    """
+    monkeypatch.setattr(identity, "_handle_points_at", lambda handle, did: True)
 
 
 @pytest.fixture

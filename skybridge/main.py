@@ -198,10 +198,34 @@ async def get_relay_actor() -> Response:
     return ap_response(relay_actor())
 
 
+# Largest inbox POST we read. A real activity is a few KB, and a Create
+# carrying a long article is tens of KB; anything far beyond that is not
+# something this server acts on, and reading it in full would let an
+# unauthenticated peer spend our memory.
+MAX_INBOX_BYTES = 5 * 1024 * 1024
+
+
+async def _read_body(request: Request, limit: int) -> bytes | None:
+    """The request body, or ``None`` once it exceeds ``limit`` bytes."""
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        return None
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 async def _inbox(request: Request, target_actor_id: str) -> Response:
     """Shared inbox handling: parse the body, authenticate what we act on,
     then dispatch to :func:`handle_inbox`."""
-    body = await request.body()
+    body = await _read_body(request, MAX_INBOX_BYTES)
+    if body is None:
+        return JSONResponse({"error": "payload too large"}, status_code=413)
     try:
         activity = json.loads(body)
     except ValueError:

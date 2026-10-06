@@ -401,6 +401,16 @@ def test_review_becomes_rating_and_comment(settings):
     assert activity["type"] == "Create"
 
 
+def test_poster_url_with_an_unsafe_scheme_is_dropped(settings):
+    """The poster lands in <img src>, og:image and the catalog tag sent to
+    peers, so only http(s) may get through."""
+    for bad in ("javascript:alert(1)", "data:text/html,<script>", "//cdn.example/x.jpg", ""):
+        ref = works.work_ref({**REVIEW, "posterUrl": bad})
+        assert ref is not None and ref.poster_url is None
+    ref = works.work_ref({**REVIEW, "posterUrl": "HTTPS://cdn.example/x.jpg"})
+    assert ref is not None and ref.poster_url == "HTTPS://cdn.example/x.jpg"
+
+
 def test_letterboxd_imported_review_keeps_its_markup(settings):
     # popfeed's Letterboxd importer writes that site's HTML into `text` and
     # leaves `facets` empty; escaping it would show the tag names to readers.

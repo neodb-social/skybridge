@@ -8,6 +8,7 @@ neither is present.
 
 from __future__ import annotations
 
+import html
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -98,7 +99,8 @@ def person_actor(actor: BridgedActor) -> dict[str, Any]:
         "name": actor.display_name or actor.handle,
         "summary": (
             f"Bridged from Atmosphere. Original account: "
-            f'<a href="https://bsky.app/profile/{actor.did}" rel="me">{actor.handle}</a>'
+            f'<a href="https://bsky.app/profile/{html.escape(actor.did)}" rel="me">'
+            f"{html.escape(actor.handle)}</a>"
         ),
         "alsoKnownAs": [
             f"at://{actor.did}",
@@ -115,7 +117,8 @@ def person_actor(actor: BridgedActor) -> dict[str, Any]:
                 "type": "PropertyValue",
                 "name": "AT Protocol",
                 "value": (
-                    f'<a href="https://bsky.app/profile/{actor.did}" rel="me">{actor.did}</a>'
+                    f'<a href="https://bsky.app/profile/{html.escape(actor.did)}" rel="me">'
+                    f"{html.escape(actor.did)}</a>"
                 ),
             }
         ],

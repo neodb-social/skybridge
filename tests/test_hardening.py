@@ -511,6 +511,162 @@ def test_key_document_shapes(remote):
     many = {"id": REMOTE, "publicKey": [{"id": "x#k"}, {"id": REMOTE_KEY_ID, "publicKeyPem": "P"}]}
     assert inbox._key_from_doc(many, REMOTE_KEY_ID) == (REMOTE, "P")
     assert inbox._key_from_doc({"id": REMOTE}, REMOTE_KEY_ID) is None
+    # A document holding some other key is not a document holding THIS key.
+    other = {
+        "id": REMOTE,
+        "publicKey": {"id": f"{REMOTE}#other", "owner": REMOTE, "publicKeyPem": "P"},
+    }
+    assert inbox._key_from_doc(other, REMOTE_KEY_ID) is None
+
+
+ATTACKER = "https://attacker.example/users/mallory"
+ATTACKER_KEY_ID = f"{ATTACKER}#main-key"
+
+
+def test_a_key_whose_owner_claim_the_owner_does_not_back_is_refused(followed, remote, monkeypatch):
+    """The key document names an owner, but that is only a claim. Hosting a
+    key that says ``owner: victim`` must not let its holder act as the victim."""
+    client, handle, did = followed
+    attacker_pem, attacker_public = generate_keypair()
+    forged = {
+        "id": ATTACKER,
+        "type": "Person",
+        "publicKey": {"id": ATTACKER_KEY_ID, "owner": REMOTE, "publicKeyPem": attacker_public},
+    }
+    docs = {ATTACKER: forged, REMOTE: remote["doc"]}
+
+    async def fake_fetch_actor(actor_id: str):
+        return docs.get(actor_id)
+
+    monkeypatch.setattr(inbox, "fetch_actor", fake_fetch_actor)
+    path = f"/users/{handle}/inbox"
+    body, headers = _signed(attacker_pem, ATTACKER_KEY_ID, path, _undo_follow(handle))
+    resp = client.post(path, content=body, headers=headers)
+    assert resp.status_code == 401
+    assert _follow_row(did) is not None
+
+
+def test_a_key_hosted_apart_from_its_actor_is_accepted_when_the_actor_lists_it(
+    followed, remote, monkeypatch
+):
+    """Some servers serve keys at their own URL; the actor document vouching
+    for that key id is what makes it the actor's."""
+    client, handle, did = followed
+    key_id = "https://remote.example/keys/1"
+    pem = remote["doc"]["publicKey"]["publicKeyPem"]
+    key_doc = {"id": key_id, "owner": REMOTE, "publicKeyPem": pem}
+    actor_doc = {**remote["doc"], "publicKey": {"id": key_id, "owner": REMOTE, "publicKeyPem": pem}}
+    docs = {key_id: key_doc, REMOTE: actor_doc}
+
+    async def fake_fetch_actor(actor_id: str):
+        return docs.get(actor_id)
+
+    monkeypatch.setattr(inbox, "fetch_actor", fake_fetch_actor)
+    inbox.reset_key_cache()
+    path = f"/users/{handle}/inbox"
+    body, headers = _signed(remote["private_pem"], key_id, path, _undo_follow(handle))
+    assert client.post(path, content=body, headers=headers).status_code == 202
+    assert _follow_row(did) is None
+
+
+def test_a_separately_hosted_key_the_actor_does_not_list_is_refused(followed, remote, monkeypatch):
+    client, handle, did = followed
+    key_id = "https://remote.example/media/upload.json"
+    attacker_pem, attacker_public = generate_keypair()
+    docs = {
+        key_id: {"id": key_id, "owner": REMOTE, "publicKeyPem": attacker_public},
+        REMOTE: remote["doc"],
+    }
+
+    async def fake_fetch_actor(actor_id: str):
+        return docs.get(actor_id)
+
+    monkeypatch.setattr(inbox, "fetch_actor", fake_fetch_actor)
+    path = f"/users/{handle}/inbox"
+    body, headers = _signed(attacker_pem, key_id, path, _undo_follow(handle))
+    assert client.post(path, content=body, headers=headers).status_code == 401
+    assert _follow_row(did) is not None
+
+
+def _signed_covering(private_pem: str, key_id: str, path: str, activity: dict, covered: str):
+    """Sign only the named headers, the way a signer that skips Digest or Date would."""
+    import base64
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+    from skybridge.crypto import digest_header, load_private_key
+
+    body = json.dumps(activity).encode()
+    values = {
+        "(request-target)": f"post {path}",
+        "host": "testserver",
+        "date": http_date(),
+        "digest": digest_header(body),
+        "content-type": "application/activity+json",
+    }
+    names = covered.split()
+    signing_string = "\n".join(f"{n}: {values[n]}" for n in names)
+    sig = load_private_key(private_pem).sign(
+        signing_string.encode(), padding.PKCS1v15(), hashes.SHA256()
+    )
+    headers = {n.title(): v for n, v in values.items() if n != "(request-target)"}
+    headers["Signature"] = (
+        f'keyId="{key_id}",algorithm="rsa-sha256",headers="{covered}",'
+        f'signature="{base64.b64encode(sig).decode()}"'
+    )
+    return body, headers
+
+
+@pytest.mark.parametrize(
+    "covered",
+    [
+        "(request-target) host date",  # no digest: any body could ride this signature
+        "(request-target) host digest",  # no date: no replay window
+        "host date digest",  # no request-target: valid for any inbox
+    ],
+)
+def test_a_post_signature_must_cover_target_date_and_digest(followed, remote, covered):
+    client, handle, did = followed
+    path = f"/users/{handle}/inbox"
+    body, headers = _signed_covering(
+        remote["private_pem"], REMOTE_KEY_ID, path, _undo_follow(handle), covered
+    )
+    assert client.post(path, content=body, headers=headers).status_code == 401
+    assert _follow_row(did) is not None
+
+
+def test_a_signature_covering_everything_is_still_accepted(followed, remote):
+    client, handle, did = followed
+    path = f"/users/{handle}/inbox"
+    body, headers = _signed_covering(
+        remote["private_pem"],
+        REMOTE_KEY_ID,
+        path,
+        _undo_follow(handle),
+        "(request-target) host date digest content-type",
+    )
+    assert client.post(path, content=body, headers=headers).status_code == 202
+    assert _follow_row(did) is None
+
+
+def test_an_oversized_inbox_body_is_refused(followed):
+    from skybridge.main import MAX_INBOX_BYTES
+
+    client, _handle, _did = followed
+    resp = client.post("/inbox", content=b"x" * (MAX_INBOX_BYTES + 1))
+    assert resp.status_code == 413
+
+
+def test_an_oversized_remote_document_is_abandoned():
+    import httpx
+
+    limit = 1024
+    small = httpx.Response(200, content=b"a" * limit)
+    assert asyncio.run(inbox._read_capped(small, limit)) == b"a" * limit
+    big = httpx.Response(200, content=b"a" * (limit + 1))
+    assert asyncio.run(inbox._read_capped(big, limit)) is None
+    declared = httpx.Response(200, headers={"content-length": str(limit + 1)}, content=b"")
+    assert asyncio.run(inbox._read_capped(declared, limit)) is None
 
 
 def test_follow_at_an_opted_out_actors_own_inbox_is_gone(settings, fixture_path, monkeypatch):

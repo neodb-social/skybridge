@@ -311,7 +311,15 @@ def work_ref(record: dict) -> WorkRef | None:
 
 
 def _url_or_none(value: Any) -> str | None:
-    return value if isinstance(value, str) and value else None
+    """A record-supplied URL, kept only when it is an http(s) one.
+
+    Poster URLs land in ``<img src>``, ``og:image`` and the catalog-item tag
+    sent to peers, so a ``javascript:`` or ``data:`` value must never get
+    through.
+    """
+    if isinstance(value, str) and value.lower().startswith(("http://", "https://")):
+        return value
+    return None
 
 
 def _reref(ref: WorkRef, work_key: str) -> WorkRef:

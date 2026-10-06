@@ -264,20 +264,36 @@ def verify_request(
     """Verify an incoming signed request against ``public_pem``.
 
     ``headers`` keys are matched case-insensitively. Returns ``True`` only if
-    the signature covers and matches the reconstructed signing string (and, when
-    present, the ``Digest`` matches ``body`` and ``Date`` is within skew).
+    the signature covers ``(request-target)``, ``host`` and ``date`` (plus
+    ``digest`` on a POST), matches the reconstructed signing string, the
+    ``Digest`` matches ``body`` and ``Date`` is within skew.
     """
     lower = {k.lower(): v for k, v in headers.items()}
     sig_raw = lower.get("signature")
     if not sig_raw:
         return False
     params = parse_signature_header(sig_raw)
-    signed_headers = params.get("headers", "(request-target) host date").split()
+    signed_headers = [
+        h.lower() for h in params.get("headers", "(request-target) host date").split()
+    ]
     signature_b64 = params.get("signature", "")
     if not signature_b64:
         return False
 
-    # Verify digest matches the body if it is part of the covered headers.
+    # The signer chooses which headers the signature covers, so the covered
+    # set has to be checked, not just the signature: one that skips Date has
+    # no replay window, and one that skips Digest on a POST is a signature
+    # over the path alone, which any body could ride on. Same requirements as
+    # Mastodon's ``verify_signature_strength!``.
+    if "(request-target)" not in signed_headers or "host" not in signed_headers:
+        return False
+    if "date" not in signed_headers:
+        return False
+    if method.upper() == "POST" and "digest" not in signed_headers:
+        return False
+
+    # A covered Digest must be present and match the body (when the caller
+    # has the body; ``None`` means it is only checking the header signature).
     if (
         "digest" in signed_headers
         and body is not None
@@ -285,16 +301,18 @@ def verify_request(
     ):
         return False
 
-    # Reject stale dates to limit replay.
-    if "date" in signed_headers and (date_val := lower.get("date")):
-        try:
-            sent = parsedate_to_datetime(date_val)
-            if sent.tzinfo is None:
-                sent = sent.replace(tzinfo=UTC)
-            if abs((datetime.now(UTC) - sent).total_seconds()) > max_skew_seconds:
-                return False
-        except (TypeError, ValueError):
+    # Reject a stale or missing Date to limit replay.
+    date_val = lower.get("date")
+    if not date_val:
+        return False
+    try:
+        sent = parsedate_to_datetime(date_val)
+        if sent.tzinfo is None:
+            sent = sent.replace(tzinfo=UTC)
+        if abs((datetime.now(UTC) - sent).total_seconds()) > max_skew_seconds:
             return False
+    except (TypeError, ValueError):
+        return False
 
     covered: list[tuple[str, str]] = []
     for name in signed_headers:

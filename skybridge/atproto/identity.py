@@ -208,6 +208,51 @@ def _pds_from_doc(doc: dict) -> str | None:
     return None
 
 
+_HANDLE_TIMEOUT = 5.0
+
+
+def _handle_points_at(handle: str, did: str) -> bool:
+    """Does ``handle`` resolve (DNS TXT or ``/.well-known/atproto-did``) to ``did``?
+
+    The bidirectional check the atproto handle spec requires. Resolution
+    fetches ``https://<handle>/...``, so a name that is not public is refused
+    before any lookup. Never raises: a failure is just "not verified".
+    """
+    if not auth._is_public_name(handle):
+        return False
+    try:
+        from atproto import IdResolver
+
+        resolved = IdResolver(timeout=_HANDLE_TIMEOUT).handle.resolve(handle)
+    except Exception as exc:
+        log.info("handle %s did not resolve: %s", handle, type(exc).__name__)
+        return False
+    return resolved == did
+
+
+def _verified_handle(doc: dict, did: str) -> str | None:
+    """The handle a DID document claims, if it is well-formed and the handle
+    points back at ``did``; otherwise ``None``.
+
+    A PLC document holds whatever its controller wrote, so ``alsoKnownAs`` is
+    a claim, not a fact: unverified, a DID could name any handle it liked —
+    another account's, or one carrying ``/`` or ``<`` — and ``_claim_handle``
+    would then hand it that account's actor URL, WebFinger record and key id.
+    """
+    for aka in doc.get("alsoKnownAs", []):
+        if not (isinstance(aka, str) and aka.startswith("at://")):
+            continue
+        handle = aka[len("at://") :]
+        if not auth.is_handle(handle):
+            log.warning("ignoring malformed handle %r claimed by %s", handle, did)
+            return None
+        if not _handle_points_at(handle, did):
+            log.warning("handle %s claimed by %s does not resolve back to it", handle, did)
+            return None
+        return handle
+    return None
+
+
 def resolve_pds(did: str) -> str | None:
     """Fetch the PLC doc for ``did`` and return its atproto PDS endpoint.
 
@@ -236,12 +281,7 @@ def resolve_remote(did: str) -> Identity:
     on almost every account.
     """
     doc = _http_json(f"{PLC_DIRECTORY}/{did}")
-    handle: str | None = None
-    if doc:
-        for aka in doc.get("alsoKnownAs", []):
-            if isinstance(aka, str) and aka.startswith("at://"):
-                handle = aka[len("at://") :]
-                break
+    handle = _verified_handle(doc, did) if doc else None
     pds = _pds_from_doc(doc) if doc else None
     display_name: str | None = None
     avatar: str | None = None
@@ -361,8 +401,13 @@ def rename_actor(did: str, handle: str) -> BridgedActor | None:
 
 
 def _is_real_handle(handle: str) -> bool:
-    """A handle we can rename an actor to, as opposed to a placeholder."""
-    return bool(handle) and handle != INVALID_HANDLE
+    """A handle we can rename an actor to: well-formed, and not a placeholder.
+
+    Jetstream reports a handle only after the relay verified it, so no
+    network check is repeated here; the shape is still checked because the
+    handle becomes a URL path segment and HTML text on this side.
+    """
+    return bool(handle) and handle != INVALID_HANDLE and auth.is_handle(handle)
 
 
 def _apply_rename(session: Session, row: BridgedActor, handle: str) -> None:

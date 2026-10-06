@@ -28,8 +28,9 @@ import logging
 import re
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlencode
 
-from skybridge.atproto import identity
+from skybridge.atproto import auth, identity
 from skybridge.config import get_settings
 from skybridge.db import session_scope
 from skybridge.models import Record
@@ -623,6 +624,19 @@ _LIST_COLLECTION = "social.popfeed.feed.list"
 # attempted once — otherwise every listItem pointing at it would separately
 # pay a network timeout.
 _LIST_FETCH_FAILED: set[str] = set()
+# Bounded: a listItem's ``listUri`` is author-written, so unique bogus ones
+# would otherwise grow this set without limit. Forgetting the oldest only
+# costs a repeat of a one-off fetch.
+_LIST_FETCH_FAILED_MAX = 10_000
+
+# atproto record key syntax (https://atproto.com/specs/record-key).
+_RKEY_RE = re.compile(r"^[A-Za-z0-9._:~-]{1,512}$")
+
+
+def _remember_failed_list(list_uri: str) -> None:
+    if len(_LIST_FETCH_FAILED) >= _LIST_FETCH_FAILED_MAX:
+        _LIST_FETCH_FAILED.clear()
+    _LIST_FETCH_FAILED.add(list_uri)
 
 
 def _list_value_label(value: dict) -> str | None:
@@ -651,17 +665,24 @@ def _fetch_and_archive_list(list_uri: str) -> dict | None:
     if list_uri in _LIST_FETCH_FAILED:
         return None
     did, collection, rkey = parts
+    # Both come from the author's own record and go into URLs we then fetch,
+    # so they are checked against their syntax and percent-encoded rather than
+    # trusted to be the plain tokens they usually are.
+    if not auth.is_valid_identifier(did) or not did.startswith("did:") or not _RKEY_RE.match(rkey):
+        _remember_failed_list(list_uri)
+        return None
     pds = identity.resolve_pds(did)
     resp = (
         identity._http_json(
-            f"{pds}/xrpc/com.atproto.repo.getRecord?repo={did}&collection={collection}&rkey={rkey}"
+            f"{pds}/xrpc/com.atproto.repo.getRecord?"
+            + urlencode({"repo": did, "collection": collection, "rkey": rkey})
         )
         if pds
         else None
     )
     value = resp.get("value") if isinstance(resp, dict) else None
     if not isinstance(resp, dict) or not isinstance(value, dict):
-        _LIST_FETCH_FAILED.add(list_uri)
+        _remember_failed_list(list_uri)
         return None
     with session_scope() as session:
         session.merge(
