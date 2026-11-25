@@ -713,6 +713,8 @@ async def _apply_segment(
 # optout.opt_out before it re-publishes records behind their own Delete.
 # --------------------------------------------------------------------------- #
 _TASK: asyncio.Task | None = None
+# The job _TASK runs, so a cancel marks that job and no other.
+_TASK_JOB: int | None = None
 
 
 def create_job(*, after_seq: int = 0, before_seq: int | None = None, deliver: bool = False) -> int:
@@ -736,11 +738,21 @@ def create_job(*, after_seq: int = 0, before_seq: int | None = None, deliver: bo
         return job.id
 
 
+def discard_job(job_id: int) -> None:
+    """Cancel a job that never started, so the watcher does not claim it."""
+    with session_scope() as session:
+        job = session.get(ImportJob, job_id)
+        if job is not None and job.state == "pending":
+            job.state = "cancelled"
+            job.updated_at = utcnow()
+
+
 def start(job_id: int, *, worker: DeliveryWorker | None = None) -> bool:
     """Run ``job_id`` in the background. ``False`` if one is already running."""
-    global _TASK
+    global _TASK, _TASK_JOB
     if _TASK is not None and not _TASK.done():
         return False
+    _TASK_JOB = job_id
 
     async def _run() -> None:
         try:
@@ -772,9 +784,16 @@ def is_running() -> bool:
     return _TASK is not None and not _TASK.done()
 
 
-def _mark_running_cancelled() -> None:
+def _mark_cancelled(job_id: int | None) -> None:
+    """Mark ``job_id`` cancelled if it is still running.
+
+    By job id, not by state: this runs on a worker thread, and by the time
+    it does, the import being cancelled may have finished and the watcher
+    started another, which must keep running.
+    """
     with session_scope() as session:
-        for job in session.query(ImportJob).filter(ImportJob.state == "running"):
+        job = session.get(ImportJob, job_id) if job_id is not None else None
+        if job is not None and job.state == "running":
             job.state = "cancelled"
             job.updated_at = utcnow()
 
@@ -786,15 +805,14 @@ async def cancel(*, resume: bool = False) -> bool:
     :func:`watch_jobs` picks it up again from its persisted progress. Used
     when an opt-out must interrupt an import rather than abandon it.
     """
-    global _TASK
-    task = _TASK
+    task, job_id = _TASK, _TASK_JOB
     if task is None or task.done():
         return False
     if not resume:
         # run_import polls for this to stop between blocks; it also stops the
         # task being restarted by watch_jobs. Off the loop: the admin panel's
         # cancel button awaits this inside a request.
-        await asyncio.to_thread(_mark_running_cancelled)
+        await asyncio.to_thread(_mark_cancelled, job_id)
     task.cancel()
     with suppress(asyncio.CancelledError):
         await task

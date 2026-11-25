@@ -20,7 +20,7 @@ from skybridge.activitypub import actors
 from skybridge.activitypub.delivery import DeliveryWorker, fanout, fanout_actor_update
 from skybridge.atproto import events, identity
 from skybridge.config import get_settings
-from skybridge.db import session_scope
+from skybridge.db import indexed_by, session_scope
 from skybridge.models import BridgedActor, Record, utcnow
 from skybridge.translate import neodb, teal, works
 
@@ -912,12 +912,26 @@ def _active_plays(did: str, play_group: str):
 
 def _play_holder(did: str, play_group: str, *, exclude_uri: str | None = None) -> Record | None:
     """The play currently holding the session's published Note (other than
-    *exclude_uri*, when given)."""
-    query = _active_plays(did, play_group).where(Record.ap_object_json.is_not(None))
+    *exclude_uri*, when given).
+
+    Pinned to ix_record_play_holder, which holds one row per session. Left to
+    the planner, a database without statistics (any new one, until the next
+    server start analyzes it) gets ix_record_play_session instead, and each
+    new play walks past every earlier play of its session to find the Note.
+    """
+    with session_scope() as session:
+        return session.scalars(_holder_query(did, play_group, exclude_uri)).first()
+
+
+def _holder_query(did: str, play_group: str, exclude_uri: str | None = None):
+    query = (
+        _active_plays(did, play_group)
+        .where(Record.ap_object_json.is_not(None))
+        .with_hint(Record, indexed_by("ix_record_play_holder"), "sqlite")
+    )
     if exclude_uri is not None:
         query = query.where(Record.at_uri != exclude_uri)
-    with session_scope() as session:
-        return session.scalars(query.limit(1)).first()
+    return query.limit(1)
 
 
 def _play_anchor(did: str, play_group: str) -> tuple[Record | None, str]:

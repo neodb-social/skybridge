@@ -7,6 +7,7 @@
   <input type="search" name="q" value="{{ q or '' }}" placeholder="search title / handle / collection">
   <button type="submit">Search</button>
 </form>
-<p class="muted">{{ total }} most recent record(s){% if q %} matching “{{ q }}”{% endif %} (up to 100).</p>
+<p class="muted">{{ total }} most recent record(s){% if q %} matching “{{ q }}”{% endif %} (up to 100).
+{% if q %}A search reads only the newest {{ "{:,}".format(search_rows) }} records bridged; an older record is still at its own link.{% endif %}</p>
 {{ record_table(rows, show_author=True, show_raw=True) }}
 {% endblock %}

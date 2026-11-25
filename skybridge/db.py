@@ -217,8 +217,15 @@ def _new_engine() -> Engine:
     )
 
 
-def init_db(reset: bool = False) -> Engine:
+def init_db(reset: bool = False, *, refresh_stats: bool = False) -> Engine:
     """(Re)initialise the engine + schema. Idempotent.
+
+    ``refresh_stats`` also re-analyzes tables whose planner statistics have
+    gone stale (see :func:`_refresh_stats`). Only the server passes it, at
+    startup, before its own ingestion starts. A CLI command can run beside a
+    live server, and an ANALYZE there would hold the write lock under it.
+    A table that just got a new index is analyzed either way, since that
+    build has already held the lock far longer.
 
     Ends with a write probe so a read-only database (e.g. a bind-mounted
     data folder the container user cannot write) fails loudly at startup
@@ -232,9 +239,8 @@ def init_db(reset: bool = False) -> Engine:
         Base.metadata.drop_all(_engine)
     Base.metadata.create_all(_engine)
     # A new index gets its statistics at once: until it has some, SQLite can
-    # prefer an older, wider index plus a sort. This is also the only place
-    # the statistics are refreshed (see _refresh_stats).
-    _refresh_stats(_engine, _ensure_columns(_engine))
+    # prefer an older, wider index plus a sort.
+    _refresh_stats(_engine, _ensure_columns(_engine), stale=refresh_stats)
     try:
         with _engine.begin() as conn:
             # Rewriting user_version (even unchanged) is a real header-page
@@ -316,10 +322,11 @@ def _stale_tables(conn: Connection) -> set[str]:
     return stale
 
 
-def _refresh_stats(engine: Engine, tables: set[str]) -> None:
-    """Analyze ``tables`` and any whose statistics have gone stale.
+def _refresh_stats(engine: Engine, tables: set[str], *, stale: bool) -> None:
+    """Analyze ``tables``, and with ``stale`` any whose statistics have
+    gone stale.
 
-    At startup only, from :func:`init_db`, before ingestion starts. ANALYZE
+    At server startup only, from :func:`init_db`, before ingestion starts. ANALYZE
     holds the write lock while it walks each index, and ingestion still
     writes from the event loop, so a pass beside it would stall every
     request for as long as the lock is held.
@@ -331,7 +338,7 @@ def _refresh_stats(engine: Engine, tables: set[str]) -> None:
     used, and it ran on a fresh pooled connection.
     """
     with engine.begin() as conn:
-        for table in sorted(tables | _stale_tables(conn)):
+        for table in sorted(tables | (_stale_tables(conn) if stale else set())):
             log.warning("analyzing %s for the query planner", table)
             started = monotonic()
             _analyze(conn, table)
