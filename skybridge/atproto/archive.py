@@ -771,6 +771,13 @@ def is_running() -> bool:
     return _TASK is not None and not _TASK.done()
 
 
+def _mark_running_cancelled() -> None:
+    with session_scope() as session:
+        for job in session.query(ImportJob).filter(ImportJob.state == "running"):
+            job.state = "cancelled"
+            job.updated_at = utcnow()
+
+
 async def cancel(*, resume: bool = False) -> bool:
     """Cancel the running import and wait for it to stop.
 
@@ -784,11 +791,9 @@ async def cancel(*, resume: bool = False) -> bool:
         return False
     if not resume:
         # run_import polls for this to stop between blocks; it also stops the
-        # task being restarted by watch_jobs.
-        with session_scope() as session:
-            for job in session.query(ImportJob).filter(ImportJob.state == "running"):
-                job.state = "cancelled"
-                job.updated_at = utcnow()
+        # task being restarted by watch_jobs. Off the loop: the admin panel's
+        # cancel button awaits this inside a request.
+        await asyncio.to_thread(_mark_running_cancelled)
     task.cancel()
     with suppress(asyncio.CancelledError):
         await task

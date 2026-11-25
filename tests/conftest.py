@@ -9,7 +9,8 @@ from skybridge.activitypub import delivery
 from skybridge.config import Settings, set_settings
 from skybridge.crypto import generate_keypair
 from skybridge.db import init_db
-from skybridge.stats import reset_usage
+from skybridge.main import reset_caches
+from skybridge.stats import reset_stats, reset_usage
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
 
@@ -38,6 +39,9 @@ def _db(settings: Settings):
     # The NodeInfo counts are cached in a module global, so they would
     # otherwise outlive the database they were counted from.
     reset_usage()
+    reset_stats()
+    # And the catalog pages' per-work rating averages.
+    reset_caches()
     # Same for the per-account relay throttle counter.
     delivery.reset_relay_throttle()
     yield

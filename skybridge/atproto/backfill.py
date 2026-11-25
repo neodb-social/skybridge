@@ -297,6 +297,21 @@ def start_import(did: str, *, worker: DeliveryWorker | None = None) -> bool:
     """
     if did in _IMPORTS or optout.is_opted_out(did):
         return False
+    return launch_import(did, worker=worker)
+
+
+def launch_import(did: str, *, worker: DeliveryWorker | None = None) -> bool:
+    """:func:`start_import` without the opt-out check.
+
+    For a caller on the event loop that has already made that check in a
+    worker thread: it is a database read, and the task itself has to be
+    created on the loop. Returns ``False`` when an import for this DID is
+    already running. Every event the import replays is checked against the
+    opt-out list again in the pipeline, so an opt-out that lands in between
+    still stops it.
+    """
+    if did in _IMPORTS:
+        return False
     settings = get_settings()
     since = datetime.now(UTC) - timedelta(days=settings.backfill_days)
 
@@ -311,7 +326,7 @@ def start_import(did: str, *, worker: DeliveryWorker | None = None) -> bool:
 
     task = asyncio.create_task(_run(), name=f"import-{did}")
     _IMPORTS[did] = task
-    # start_import refuses while the DID is still in _IMPORTS, so this pop
+    # launch_import refuses while the DID is still in _IMPORTS, so this pop
     # can only ever remove this very task.
     task.add_done_callback(lambda _t: _IMPORTS.pop(did, None))
     return True

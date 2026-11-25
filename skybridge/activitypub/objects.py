@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from skybridge.atproto import identity
 from skybridge.config import get_settings
@@ -16,18 +16,40 @@ from skybridge.translate import works
 from skybridge.translate.neodb import AP_CONTEXT
 from skybridge.translate.works import category_for
 
+# Every distinct collection in the archive, one index seek per collection
+# rather than a pass over the index: each step asks ix_record_collection for
+# the next value after the last one found.
+_COLLECTIONS = text(
+    "WITH RECURSIVE c(name) AS ("
+    " SELECT min(collection) FROM record"
+    " UNION ALL"
+    " SELECT (SELECT min(collection) FROM record WHERE collection > name)"
+    " FROM c WHERE name IS NOT NULL"
+    ") SELECT name FROM c WHERE name IS NOT NULL"
+)
+
 
 def _record_for(ident: str, rkey: str) -> Record | None:
     """Find the archived record for a bridged author's post by handle/did + rkey.
 
     ``ident`` may be a handle the author has since renamed away from: object
     ids are minted from the handle of the day and stay federated forever.
+
+    The post URL carries no collection, and no index covers ``(did, rkey)``,
+    so filtering on those two columns reads every row the author has: for an
+    author with hundreds of thousands of teal.fm plays, that is seconds per
+    request. A record's key is ``at://<did>/<collection>/<rkey>``, though, and
+    the archive holds only a handful of collections, so this tries each one
+    by primary key instead.
     """
     with session_scope() as session:
         did = identity.did_for_ident(session, ident)
         if did is None:
             return None
-        return session.scalar(select(Record).where(Record.did == did, Record.rkey == rkey))
+        uris = [f"at://{did}/{name}/{rkey}" for name in session.scalars(_COLLECTIONS)]
+        if not uris:
+            return None
+        return session.scalar(select(Record).where(Record.at_uri.in_(uris)).limit(1))
 
 
 @dataclass(frozen=True)
