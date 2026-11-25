@@ -232,7 +232,8 @@ async def estimate(*, after_seq: int = 0, before_seq: int | None = None) -> Plan
     """
     async with _client() as client:
         if before_seq is None:
-            before_seq = _live_cursor()
+            # Off the loop: the admin panel's dry run awaits this in a request.
+            before_seq = await asyncio.to_thread(_live_cursor)
         segments = 0
         whole = 0
         ranges = 0

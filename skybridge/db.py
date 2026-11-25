@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -60,8 +59,6 @@ _BUSY_TIMEOUT_MS = 15_000
 # _make_engine).
 _POOL_SIZE = 10
 _POOL_OVERFLOW = 70
-# Seconds a pooled connection is reused before it is reopened.
-_POOL_RECYCLE = 3600
 
 # Columns added after the initial release. Base.metadata.create_all() creates
 # missing *tables* but never alters existing ones, so an upgraded deployment
@@ -137,21 +134,17 @@ _ADDED_INDEXES: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
 )
 
 
-def _ensure_columns(engine: Engine) -> None:
+def _ensure_columns(engine: Engine) -> set[str]:
     """Add any post-release columns, and their indexes, missing from an
-    existing database.
+    existing database. Returns the tables that got a new index.
 
     A new index on a large table is built here, at startup, on purpose. The
     build holds the write lock for as long as it reads the table (minutes on
     a multi-gigabyte archive). Before ingestion starts, nothing waits on that
     lock. Built later, beside live ingestion, every writer would time out on
     ``busy_timeout`` and the Jetstream loop would skip those events.
-
-    A new index gets its statistics at once, too. Until it has some, SQLite
-    guesses its size by shape and can prefer an older, wider index plus a
-    sort, which for a popular work reads every one of its rows.
     """
-    built = False
+    built: set[str] = set()
     with engine.begin() as conn:
         for table, column, coltype in _ADDED_COLUMNS:
             existing = {
@@ -185,9 +178,8 @@ def _ensure_columns(engine: Engine) -> None:
                     f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({spec}){where}"
                 )
                 log.warning("built index %s in %.1fs", name, monotonic() - started)
-                built = True
-        if built:
-            _analyze(conn)
+                built.add(table)
+    return built
 
 
 def _make_engine() -> Engine:
@@ -221,11 +213,6 @@ def _new_engine() -> Engine:
         # cheap, so allow enough for all of them.
         pool_size=_POOL_SIZE,
         max_overflow=_POOL_OVERFLOW,
-        # A connection reads the planner statistics once, when it opens, and
-        # never sees a later ANALYZE run on another one. Reopening each
-        # connection after an hour lets the daily pass (see optimize) reach
-        # every connection the pool holds.
-        pool_recycle=_POOL_RECYCLE,
         future=True,
     )
 
@@ -244,7 +231,10 @@ def init_db(reset: bool = False) -> Engine:
     if reset:
         Base.metadata.drop_all(_engine)
     Base.metadata.create_all(_engine)
-    _ensure_columns(_engine)
+    # A new index gets its statistics at once: until it has some, SQLite can
+    # prefer an older, wider index plus a sort. This is also the only place
+    # the statistics are refreshed (see _refresh_stats).
+    _refresh_stats(_engine, _ensure_columns(_engine))
     try:
         with _engine.begin() as conn:
             # Rewriting user_version (even unchanged) is a real header-page
@@ -263,54 +253,89 @@ def get_engine() -> Engine:
     return _engine
 
 
-# How much of each index ANALYZE samples. SQLite's own recommendation for a
-# live database: enough rows to tell a selective index from a useless one,
-# few enough that the pass never blocks writers for long.
+# How many rows of each index ANALYZE samples for its distinct-value counts.
+# It still walks every index in full to count the rows: on a cold cache that
+# took 1.6 s for one index of a 1M-row record table, holding the write lock.
 _ANALYSIS_LIMIT = 400
-OPTIMIZE_INTERVAL = 24 * 60 * 60
+
+# A table is analyzed again at startup once its row count is this many times
+# larger or smaller than sqlite_stat1 last recorded.
+_STALE_FACTOR = 2
+
+# Smaller tables are not worth a pass: the planner's guesses cost nothing there.
+_ANALYZE_MIN_ROWS = 10_000
 
 
 def optimize() -> None:
-    """Refresh the query planner's statistics.
+    """Refresh the query planner's statistics for every table, now.
 
-    Without them SQLite guesses between indexes by shape alone, and it guesses
-    wrong where two index the same columns: the teal.fm holder lookup takes
-    the full ix_record_play_session over the partial ix_record_play_holder and
-    walks a whole listening session, per scrobble. One pass over a populated
-    table settles it.
-
-    A plain ``ANALYZE`` under ``analysis_limit``, not ``PRAGMA optimize``. The
-    pragma only looks at tables that queries on the *same connection* have
-    used, and this runs on a pooled connection that has used none, so it
-    left ``sqlite_stat1`` stating 356k rows for a ``record`` table that had
-    grown to 3.77M. With the limit, each index is sampled rather than read,
-    so a pass holds the write lock briefly, not for a table scan.
-
-    Other open connections keep the statistics they loaded when they opened;
-    the pool reopens them within ``_POOL_RECYCLE`` seconds.
+    Blocking, and it holds the write lock while it walks every index: for
+    the CLI and tests. The app refreshes them at startup instead, from
+    :func:`init_db`, and only where they have gone stale.
     """
     with get_engine().begin() as conn:
         _analyze(conn)
 
 
-def _analyze(conn: Connection) -> None:
+def _analyze(conn: Connection, table: str | None = None) -> None:
     conn.exec_driver_sql(f"PRAGMA analysis_limit={_ANALYSIS_LIMIT}")
-    conn.exec_driver_sql("ANALYZE")
+    conn.exec_driver_sql(f'ANALYZE "{table}"' if table else "ANALYZE")
 
 
-async def optimize_loop(interval: float = OPTIMIZE_INTERVAL) -> None:
-    """Keep those statistics current; started by the app lifespan.
+def _stale_tables(conn: Connection) -> set[str]:
+    """Tables whose row count has moved :data:`_STALE_FACTOR` times away
+    from what ``sqlite_stat1`` records, or that it has never recorded.
 
-    A pass at startup, then daily: the tables that matter grow by ingestion,
-    so a database that was empty when the process started is not the one it is
-    querying a week later.
+    ``max(rowid)`` stands in for the row count, since it is one index seek;
+    only a table where it disagrees with the statistics is counted for real,
+    because a table that deletes rows has a max(rowid) above its count.
     """
-    while True:
-        try:
-            await asyncio.to_thread(optimize)
-        except Exception:
-            log.exception("database optimize failed")
-        await asyncio.sleep(interval)
+    recorded: dict[str, int] = {}
+    has_stats = conn.exec_driver_sql(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'"
+    ).first()
+    if has_stats:
+        for table, stat in conn.exec_driver_sql("SELECT tbl, stat FROM sqlite_stat1"):
+            # A partial index records only its own rows; the table's size is
+            # the largest count any of its indexes reports.
+            rows = int(str(stat).split()[0])
+            recorded[table] = max(recorded.get(table, 0), rows)
+
+    def off(rows: int, seen: int | None) -> bool:
+        return seen is None or rows > seen * _STALE_FACTOR or rows * _STALE_FACTOR < seen
+
+    stale = set()
+    for table in Base.metadata.tables:
+        seen = recorded.get(table)
+        rows = conn.exec_driver_sql(f'SELECT max(rowid) FROM "{table}"').scalar() or 0
+        if rows < _ANALYZE_MIN_ROWS or not off(rows, seen):
+            continue
+        rows = conn.exec_driver_sql(f'SELECT count(*) FROM "{table}"').scalar() or 0
+        if rows >= _ANALYZE_MIN_ROWS and off(rows, seen):
+            stale.add(table)
+    return stale
+
+
+def _refresh_stats(engine: Engine, tables: set[str]) -> None:
+    """Analyze ``tables`` and any whose statistics have gone stale.
+
+    At startup only, from :func:`init_db`, before ingestion starts. ANALYZE
+    holds the write lock while it walks each index, and ingestion still
+    writes from the event loop, so a pass beside it would stall every
+    request for as long as the lock is held.
+
+    Without statistics, or with ones from a table a tenth the size, SQLite
+    misjudges which index is narrower. sqlite_stat1 said 356k rows for a
+    record table that had grown to 3.77M: ``PRAGMA optimize``, which ran here
+    before, only considers tables that queries on the same connection have
+    used, and it ran on a fresh pooled connection.
+    """
+    with engine.begin() as conn:
+        for table in sorted(tables | _stale_tables(conn)):
+            log.warning("analyzing %s for the query planner", table)
+            started = monotonic()
+            _analyze(conn, table)
+            log.warning("analyzed %s in %.1fs", table, monotonic() - started)
 
 
 @contextmanager
