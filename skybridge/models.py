@@ -211,6 +211,23 @@ class Record(Base):
             "rkey",
             sqlite_where=text("ap_object_json IS NOT NULL AND deleted_at IS NULL"),
         ),
+        # The public listings: an author's newest published Notes (profile
+        # page, outbox) and a work's (catalog page). Partial like the one
+        # above, so a listing walks only published rows, already in order,
+        # and stops at the page size instead of sorting every row of an
+        # author with hundreds of thousands of plays.
+        Index(
+            "ix_record_author_posts",
+            "did",
+            "created_at",
+            sqlite_where=text("ap_object_json IS NOT NULL AND deleted_at IS NULL"),
+        ),
+        Index(
+            "ix_record_work_posts",
+            "work_key",
+            "created_at",
+            sqlite_where=text("ap_object_json IS NOT NULL AND deleted_at IS NULL"),
+        ),
     )
 
     at_uri: Mapped[str] = mapped_column(String, primary_key=True)

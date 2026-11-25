@@ -23,7 +23,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     if log_level not in {"critical", "error", "warning", "info", "debug", "trace"}:
         log_level = "info"
 
-    # Access logs are noise outside debug/trace (healthcheck polls /stats constantly)
+    # Access logs are noise outside debug/trace (the healthcheck polls constantly)
     access_log = log_level in {"debug", "trace"}
 
     uvicorn.run(

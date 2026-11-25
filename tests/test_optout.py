@@ -268,7 +268,7 @@ def test_status_not_shown_without_login(client):
 def test_import_action_starts_backfill(client, monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(
-        backfill, "start_import", lambda did, worker=None: calls.append(did) or True
+        backfill, "launch_import", lambda did, worker=None: calls.append(did) or True
     )
     csrf = _sign_in(client)
     r = client.post("/manage/import", data={"csrf": csrf})
@@ -278,7 +278,7 @@ def test_import_action_starts_backfill(client, monkeypatch):
 
 
 def test_import_action_already_running(client, monkeypatch):
-    monkeypatch.setattr(backfill, "start_import", lambda did, worker=None: False)
+    monkeypatch.setattr(backfill, "launch_import", lambda did, worker=None: False)
     csrf = _sign_in(client)
     r = client.post("/manage/import", data={"csrf": csrf})
     assert r.status_code == 200
@@ -288,7 +288,7 @@ def test_import_action_already_running(client, monkeypatch):
 def test_import_action_refused_when_opted_out(client, monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(
-        backfill, "start_import", lambda did, worker=None: calls.append(did) or True
+        backfill, "launch_import", lambda did, worker=None: calls.append(did) or True
     )
     csrf = _sign_in(client)
     asyncio.run(optout.opt_out(DID))
@@ -301,7 +301,7 @@ def test_import_action_refused_when_opted_out(client, monkeypatch):
 def test_import_action_requires_session_and_csrf(client, monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(
-        backfill, "start_import", lambda did, worker=None: calls.append(did) or True
+        backfill, "launch_import", lambda did, worker=None: calls.append(did) or True
     )
     r = client.post("/manage/import", data={"csrf": "x"})  # never signed in
     assert r.status_code == 401

@@ -18,12 +18,14 @@ services:
       # env_file's SKYBRIDGE_DATA only picks the host-side folder
       SKYBRIDGE_DATA: /data
     healthcheck:
+      # A constant route: the check proves the event loop answers, and must
+      # never itself cost a database query.
       test:
         [
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/stats', timeout=5)",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/robots.txt', timeout=5)",
         ]
       interval: 30s
       timeout: 10s

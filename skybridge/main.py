@@ -3,6 +3,13 @@
 The lifespan starts the in-process delivery worker (and, when
 ``SKYBRIDGE_INGEST=1``, the live Jetstream consumer). All hostnames come from
 :mod:`skybridge.config`, so the same app serves any configured ``SKYBRIDGE_DOMAIN``.
+
+Database access is blocking, and one event loop runs every request, the
+Jetstream consumer and delivery. So a route that reads the database is a plain
+``def``, which FastAPI runs on its thread pool; a route that must stay
+``async`` (it awaits other work, or creates a task) hands its database calls
+to :func:`run_in_threadpool`. An ``async def`` route that queries inline holds
+up everything else for as long as the query runs.
 """
 
 from __future__ import annotations
@@ -13,17 +20,20 @@ import logging
 import os
 import re
 import secrets
+import threading
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 from fastapi import FastAPI, Form, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, literal_column, or_, select
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from skybridge import admin, neodb_servers, optout, pipeline, sessions, telemetry
 from skybridge.activitypub import inbox as ap_inbox
@@ -37,7 +47,7 @@ from skybridge.atproto import backfill, discover, identity, jetstream, oauth
 from skybridge.config import get_settings
 from skybridge.db import init_db, optimize_loop, session_scope
 from skybridge.models import BridgedActor, Cursor, Record, Work
-from skybridge.stats import collect_stats, usage_refresh_loop
+from skybridge.stats import cached_stats, stats_refresh_loop, usage_refresh_loop
 from skybridge.translate import works
 
 log = logging.getLogger("skybridge")
@@ -86,6 +96,11 @@ async def lifespan(app: FastAPI):
     usage_task = asyncio.create_task(usage_refresh_loop(), name="usage-refresh")
     app.state.usage_task = usage_task
 
+    # The dashboard and /stats figures, likewise: recounted every few minutes
+    # off-thread, so serving them never runs a query.
+    stats_task = asyncio.create_task(stats_refresh_loop(), name="stats-refresh")
+    app.state.stats_task = stats_task
+
     # Keeps the query planner's statistics current as the archive grows; see
     # db.optimize for what goes wrong without them.
     optimize_task = asyncio.create_task(optimize_loop(), name="db-optimize")
@@ -104,6 +119,9 @@ async def lifespan(app: FastAPI):
         usage_task.cancel()
         with suppress(asyncio.CancelledError):
             await usage_task
+        stats_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await stats_task
         optimize_task.cancel()
         with suppress(asyncio.CancelledError):
             await optimize_task
@@ -168,7 +186,7 @@ def _stored_object_id(ap_object_json: str | None) -> str | None:
 # Discovery
 # --------------------------------------------------------------------------- #
 @app.get("/.well-known/webfinger")
-async def well_known_webfinger(resource: str = "") -> Response:
+def well_known_webfinger(resource: str = "") -> Response:
     jrd = webfinger.resolve(resource)
     if jrd is None:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -235,41 +253,50 @@ async def relay_inbox(request: Request) -> Response:
     return await _inbox(request, get_settings().relay_actor_id)
 
 
+def _published(*where: Any) -> tuple[Any, ...]:
+    """WHERE terms for the records that hold a live, published Note.
+
+    The two terms are the predicate of the partial indexes that serve the
+    public listings (ix_record_author_posts, ix_record_work_posts,
+    ix_record_play_holder). SQLite uses such an index only when the query
+    repeats its predicate, so every listing goes through here.
+    """
+    return (Record.ap_object_json.isnot(None), Record.deleted_at.is_(None), *where)
+
+
+def _post_count(session: Session, did: str) -> int:
+    """How many live Notes ``did`` has: a count over the partial index."""
+    count = select(func.count()).select_from(Record).where(*_published(Record.did == did))
+    return session.scalar(count) or 0
+
+
 @app.get("/users/{ident}")
-async def get_user(ident: str, request: Request) -> Response:
+def get_user(ident: str, request: Request) -> Response:
+    wants_ap = _wants_ap(request)
     with session_scope() as session:
         actor = _actor_for_ident(session, ident)
+        if actor is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
         # An opted-out actor is Gone: don't serve its profile.
-        if actor is not None and actor.opted_out:
+        if actor.opted_out:
             return JSONResponse({"error": "gone"}, status_code=410)
         # Reached under a retired handle: send callers to the canonical URL
         # rather than serving one actor under two ids.
-        if actor is not None and ident != actor.handle:
+        if ident != actor.handle:
             return RedirectResponse(get_settings().actor_id(actor.handle), status_code=301)
-        doc = person_actor(actor) if actor else None
-        profile: dict[str, Any] | None = None
-        if actor is not None:
-            post_count = session.scalar(
-                select(func.count())
-                .select_from(Record)
-                .where(
-                    Record.did == actor.did,
-                    Record.deleted_at.is_(None),
-                    Record.ap_object_json.isnot(None),
-                )
-            )
-            profile = {
-                "name": actor.display_name or actor.handle,
-                "handle": actor.handle,
-                "did": actor.did,
-                "avatar": actor.avatar,
-                "post_count": post_count or 0,
-                "no_unauthenticated": bool(actor.no_unauthenticated),
-            }
-    if doc is None or profile is None:
-        return JSONResponse({"error": "not found"}, status_code=404)
-    if _wants_ap(request):
-        return ap_response(doc)
+        doc = person_actor(actor)
+        if wants_ap:
+            # Peers fetch this on every delivery they verify; the post count
+            # is only for the HTML page.
+            return ap_response(doc)
+        profile: dict[str, Any] = {
+            "name": actor.display_name or actor.handle,
+            "handle": actor.handle,
+            "did": actor.did,
+            "avatar": actor.avatar,
+            "post_count": _post_count(session, actor.did),
+            "no_unauthenticated": bool(actor.no_unauthenticated),
+        }
     # An author hiding from signed-out readers gets the identity-only page:
     # don't list their posts on it (see _hides_from_anonymous).
     posts = (
@@ -284,22 +311,24 @@ async def get_user(ident: str, request: Request) -> Response:
     )
 
 
+def _canonical_actor_id(ident: str) -> str:
+    """The actor id for ``ident``, under the live handle when it is a retired one."""
+    with session_scope() as session:
+        actor = _actor_for_ident(session, ident)
+        target = actor.handle if actor is not None else ident
+    return get_settings().actor_id(target)
+
+
 @app.post("/users/{ident}/inbox")
 async def user_inbox(ident: str, request: Request) -> Response:
     # A POST can't be redirected safely, so a delivery addressed to a retired
     # handle is accepted here and attributed to the canonical actor.
-    with session_scope() as session:
-        actor = _actor_for_ident(session, ident)
-        target = actor.handle if actor is not None else ident
-    return await _inbox(request, get_settings().actor_id(target))
+    return await _inbox(request, await run_in_threadpool(_canonical_actor_id, ident))
 
 
 @app.get("/users/{ident}/followers")
-async def user_followers(ident: str) -> Response:
-    settings = get_settings()
-    with session_scope() as session:
-        actor = _actor_for_ident(session, ident)
-        actor_id = settings.actor_id(actor.handle if actor is not None else ident)
+def user_followers(ident: str) -> Response:
+    actor_id = _canonical_actor_id(ident)
     return ap_response(
         {
             "@context": "https://www.w3.org/ns/activitystreams",
@@ -311,23 +340,27 @@ async def user_followers(ident: str) -> Response:
     )
 
 
+# How many Note ids the outbox lists: the newest ones, like the profile page.
+# totalItems still counts them all.
+OUTBOX_ITEMS = 100
+
+
 @app.get("/users/{ident}/outbox")
-async def user_outbox(ident: str) -> Response:
+def user_outbox(ident: str) -> Response:
     settings = get_settings()
     with session_scope() as session:
         actor = _actor_for_ident(session, ident)
         actor_id = settings.actor_id(actor.handle if actor is not None else ident)
         items: list[str] = []
+        total = 0
         if actor is not None:
+            # Bounded: an author can hold hundreds of thousands of Notes, and
+            # each id is read out of its stored Note.
             rows = session.execute(
                 select(Record.rkey, Record.ap_object_json)
-                .where(
-                    Record.did == actor.did,
-                    Record.deleted_at.is_(None),
-                    # Exclude archive-only records that were never published.
-                    Record.ap_object_json.isnot(None),
-                )
+                .where(*_published(Record.did == actor.did))
                 .order_by(Record.created_at.desc())
+                .limit(OUTBOX_ITEMS)
             ).all()
             # Prefer each Note's own id: posts minted before a rename keep the
             # handle they were published under.
@@ -335,12 +368,13 @@ async def user_outbox(ident: str) -> Response:
                 _stored_object_id(ap_object_json) or settings.post_id(actor.handle, rkey)
                 for rkey, ap_object_json in rows
             ]
+            total = _post_count(session, actor.did)
     return ap_response(
         {
             "@context": "https://www.w3.org/ns/activitystreams",
             "id": f"{actor_id}/outbox",
             "type": "OrderedCollection",
-            "totalItems": len(items),
+            "totalItems": total,
             "orderedItems": items,
         }
     )
@@ -471,8 +505,45 @@ def _review_schema(obj: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any] |
     return {"@context": "https://schema.org", **doc}
 
 
+# How long a work's rating average is reused. Every Note delivered to a
+# Mastodon server makes it fetch the catalog page the Note links to, for a
+# preview card, so one Note brings a burst of requests for the same work.
+RATING_TTL = 600.0
+_RATING_CACHE_MAX = 4096
+_rating_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
+_rating_lock = threading.Lock()
+
+
+def reset_caches() -> None:
+    """Forget the per-work rating averages (tests, and a swapped database)."""
+    with _rating_lock:
+        _rating_cache.clear()
+
+
 def _aggregate_rating(work_key: str) -> dict[str, Any] | None:
     """The mean of every rating bridged for a work, or ``None`` if it has none.
+
+    Reused for :data:`RATING_TTL` seconds. Computing it parses every
+    published Note of the work, and a popular album has a Note for every
+    listening session of every listener.
+    """
+    now = monotonic()
+    with _rating_lock:
+        hit = _rating_cache.get(work_key)
+    if hit is not None and now - hit[0] < RATING_TTL:
+        return hit[1]
+    aggregate = _count_rating(work_key)
+    with _rating_lock:
+        if len(_rating_cache) >= _RATING_CACHE_MAX:
+            # Crude, and enough: the cache only absorbs bursts, so starting
+            # over costs one recount per work.
+            _rating_cache.clear()
+        _rating_cache[work_key] = (now, aggregate)
+    return aggregate
+
+
+def _count_rating(work_key: str) -> dict[str, Any] | None:
+    """:func:`_aggregate_rating`, uncached.
 
     Deliberately unfiltered and uncapped, unlike the listing beside it: an
     average is a statistic over all the ratings, and it attributes no score to
@@ -482,11 +553,7 @@ def _aggregate_rating(work_key: str) -> dict[str, Any] | None:
     """
     with session_scope() as session:
         notes = session.scalars(
-            select(Record.ap_object_json).where(
-                Record.work_key == work_key,
-                Record.deleted_at.is_(None),
-                Record.ap_object_json.isnot(None),
-            )
+            select(Record.ap_object_json).where(*_published(Record.work_key == work_key))
         )
         facets = [_facets(json.loads(note)).get("Rating") for note in notes if note]
     scored = [(facet, _rating_value(facet)) for facet in facets if facet is not None]
@@ -607,7 +674,7 @@ def _hides_from_anonymous(ident: str) -> bool:
 
 
 @app.get("/users/{ident}/posts/{rkey}")
-async def get_post(ident: str, rkey: str, request: Request) -> Response:
+def get_post(ident: str, rkey: str, request: Request) -> Response:
     view = objects.get_post_view(ident, rkey)
     wants_ap = _wants_ap(request)
     if view is None:
@@ -626,12 +693,12 @@ async def get_post(ident: str, rkey: str, request: Request) -> Response:
 
 
 @app.get("/objects/{ident}/{rkey}")
-async def get_object(ident: str, rkey: str, request: Request) -> Response:
-    return await get_post(ident, rkey, request)
+def get_object(ident: str, rkey: str, request: Request) -> Response:
+    return get_post(ident, rkey, request)
 
 
 @app.get("/catalog/{work_type}/{work_id}")
-async def get_catalog(work_type: str, work_id: str, request: Request) -> Response:
+def get_catalog(work_type: str, work_id: str, request: Request) -> Response:
     doc = objects.get_work_object(work_type, work_id)
     if doc is None:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -761,7 +828,7 @@ def _current_session(request: Request) -> sessions.Session | None:
 
 
 @app.get("/manage", response_class=HTMLResponse)
-async def optout_form(request: Request) -> Response:
+def optout_form(request: Request) -> Response:
     # Status is only shown to the signed-in account holder: an open lookup
     # would let anyone enumerate what we hold about a user.
     return _optout_page(request, session=_current_session(request))
@@ -817,11 +884,11 @@ async def optout_action_opt_out(request: Request, csrf: str = Form("")) -> Respo
         return _optout_error(request, True, _SESSION_EXPIRED, "session_expired", 401)
     purged = await optout.opt_out(session.did, worker=getattr(app.state, "worker", None))
     msg = f"{session.handle} opted out; {purged} bridged record(s) deleted."
-    return _optout_page(request, session=session, message=msg)
+    return await run_in_threadpool(_optout_page, request, session=session, message=msg)
 
 
 @app.post("/manage/opt-in", response_class=HTMLResponse)
-async def optout_action_opt_in(request: Request, csrf: str = Form("")) -> Response:
+def optout_action_opt_in(request: Request, csrf: str = Form("")) -> Response:
     session = _action_session(request, csrf)
     if session is None:
         return _optout_error(request, True, _SESSION_EXPIRED, "session_expired", 401)
@@ -840,15 +907,17 @@ async def optout_action_import(request: Request, csrf: str = Form("")) -> Respon
     session = _action_session(request, csrf)
     if session is None:
         return _optout_error(request, True, _SESSION_EXPIRED, "session_expired", 401)
-    if optout.is_opted_out(session.did):
+    # Async because the import is a task on this loop; the opt-out check
+    # beside it is a query, so it goes to a thread first.
+    if await run_in_threadpool(optout.is_opted_out, session.did):
         # Server-side guard behind the disabled button: never re-publish an
         # opted-out account's records.
         msg = f"{session.handle} is opted out; import is disabled."
-    elif backfill.start_import(session.did, worker=getattr(app.state, "worker", None)):
+    elif backfill.launch_import(session.did, worker=getattr(app.state, "worker", None)):
         msg = f"Importing recent activity for {session.handle} in the background."
     else:
         msg = f"An import for {session.handle} is already in progress."
-    return _optout_page(request, session=session, message=msg)
+    return await run_in_threadpool(_optout_page, request, session=session, message=msg)
 
 
 def _admin_session(request: Request, csrf: str) -> sessions.Session | None:
@@ -877,12 +946,14 @@ async def admin_import_dry_run(
     try:
         estimate = await archive_replay.estimate(after_seq=after_seq)
     except archive_replay.ArchiveError as exc:
-        return _optout_page(request, session=session, message=str(exc))
+        return await run_in_threadpool(_optout_page, request, session=session, message=str(exc))
     msg = (
         f"Planned {estimate.segments} segment(s) covering seq "
         f"{estimate.after_seq} to {estimate.before_seq}."
     )
-    return _optout_page(request, session=session, message=msg, estimate=estimate)
+    return await run_in_threadpool(
+        _optout_page, request, session=session, message=msg, estimate=estimate
+    )
 
 
 @app.post("/manage/admin/import", response_class=HTMLResponse)
@@ -899,16 +970,16 @@ async def admin_import_start(
     elif archive_replay.is_running():
         msg = "An archive import is already running."
     else:
-        job_id = archive_replay.create_job(after_seq=after_seq)
+        # Async because the import is a task on this loop; the job row is
+        # written from a thread first.
+        job_id = await run_in_threadpool(archive_replay.create_job, after_seq=after_seq)
         archive_replay.start(job_id, worker=getattr(app.state, "worker", None))
         msg = f"Archive import #{job_id} started in the background."
-    return _optout_page(request, session=session, message=msg)
+    return await run_in_threadpool(_optout_page, request, session=session, message=msg)
 
 
 @app.post("/manage/admin/import/resume", response_class=HTMLResponse)
-async def admin_import_resume(
-    request: Request, csrf: str = Form(""), job_id: int = Form(0)
-) -> Response:
+def admin_import_resume(request: Request, csrf: str = Form(""), job_id: int = Form(0)) -> Response:
     """Hand a failed import back to the watcher, which resumes its progress."""
     session = _admin_session(request, csrf)
     if session is None:
@@ -929,7 +1000,7 @@ async def admin_import_cancel(request: Request, csrf: str = Form("")) -> Respons
         return _optout_error(request, True, _NOT_ADMIN, "forbidden", 403)
     cancelled = await archive_replay.cancel()
     msg = "Archive import cancelled." if cancelled else "No archive import is running."
-    return _optout_page(request, session=session, message=msg)
+    return await run_in_threadpool(_optout_page, request, session=session, message=msg)
 
 
 def _session_cookie_attrs() -> dict[str, Any]:
@@ -1004,7 +1075,9 @@ async def oauth_callback(
 # --------------------------------------------------------------------------- #
 @app.get("/stats")
 async def stats_json() -> Response:
-    return JSONResponse(collect_stats())
+    # From memory, kept warm by stats.stats_refresh_loop: some of these counts
+    # read millions of rows, and this route is polled by monitors.
+    return JSONResponse(cached_stats())
 
 
 def _work_name(obj: dict[str, Any]) -> str | None:
@@ -1082,11 +1155,7 @@ def _recent_posts(*where: Any) -> list[Record]:
         return list(
             session.scalars(
                 select(Record)
-                .where(
-                    Record.deleted_at.is_(None),
-                    Record.ap_object_json.isnot(None),
-                    *where,
-                )
+                .where(*_published(*where))
                 .order_by(Record.created_at.desc())
                 .limit(RECENT_POSTS)
             )
@@ -1095,7 +1164,8 @@ def _recent_posts(*where: Any) -> list[Record]:
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request) -> Response:
-    stats = collect_stats()
+    # Same cache as /stats: this page gets most of the anonymous traffic.
+    stats = cached_stats()
     ingest_task = getattr(app.state, "ingest_task", None)
     ingesting = ingest_task is not None and not ingest_task.done()
     return _TEMPLATES.TemplateResponse(
@@ -1120,22 +1190,37 @@ def _anonymous_hidden_dids() -> Any:
     return select(BridgedActor.did).where(BridgedActor.no_unauthenticated.is_(True))
 
 
+# How many of the newest records an /archive search reads. A substring match
+# over source_json can use no index, so an unbounded search reads the whole
+# archive: gigabytes, on a public page.
+ARCHIVE_SEARCH_ROWS = 50_000
+
+# Insertion order. `record` is a rowid table that never deletes a row, so its
+# rowid only grows; the primary key index on at_uri is a separate one.
+_RECORD_ROWID = literal_column("record.rowid")
+
+
 @app.get("/archive", response_class=HTMLResponse)
-async def archive(request: Request, q: str = "") -> Response:
+def archive(request: Request, q: str = "") -> Response:
     with session_scope() as session:
+        # Newest first by insertion, which the table itself is ordered by.
+        # Ordering by updated_at instead has no index to read in order, so it
+        # sorted every row of the archive on each request.
         stmt = (
             select(Record)
             .where(Record.did.not_in(_anonymous_hidden_dids()))
-            .order_by(Record.updated_at.desc())
+            .order_by(_RECORD_ROWID.desc())
         )
         if q:
             like = f"%{q}%"
+            newest = session.scalar(select(func.max(_RECORD_ROWID)).select_from(Record)) or 0
             stmt = stmt.where(
+                newest - ARCHIVE_SEARCH_ROWS < _RECORD_ROWID,
                 or_(
                     Record.collection.like(like),
                     Record.rkey.like(like),
                     Record.source_json.like(like),
-                )
+                ),
             )
         rows = list(session.scalars(stmt.limit(100)))
     return _TEMPLATES.TemplateResponse(
@@ -1161,7 +1246,7 @@ def _archive_uri(path: str) -> str:
 
 
 @app.get("/archive/{at_uri:path}", response_class=HTMLResponse)
-async def archive_detail(request: Request, at_uri: str) -> Response:
+def archive_detail(request: Request, at_uri: str) -> Response:
     at_uri = _archive_uri(at_uri)
     with session_scope() as session:
         record = session.get(Record, at_uri)
@@ -1172,7 +1257,7 @@ async def archive_detail(request: Request, at_uri: str) -> Response:
             # Same answer as a record we do not hold: this page shows the raw
             # source record, and there is no signed-in reader to show it to.
             return HTMLResponse("<h1>404</h1><p>No such record.</p>", status_code=404)
-        handle = _handle_of(record.did)
+        handle = author.handle if author is not None else record.did
         work = None
         if record.work_key:
             w = session.get(Work, record.work_key)
@@ -1206,9 +1291,14 @@ async def archive_detail(request: Request, at_uri: str) -> Response:
 
 
 @app.get("/catalog", response_class=HTMLResponse)
-async def catalog(request: Request) -> Response:
+def catalog(request: Request) -> Response:
     with session_scope() as session:
-        rows = list(session.scalars(select(Work).order_by(Work.first_seen.desc()).limit(200)))
+        # Newest first. first_seen is only ever its insert-time default and no
+        # row is deleted, so rowid order is first_seen order, and the table
+        # can be read backwards instead of sorting every work.
+        rows = list(
+            session.scalars(select(Work).order_by(literal_column("work.rowid").desc()).limit(200))
+        )
         works = []
         for w in rows:
             wt, _, wid = w.work_key.partition(":")

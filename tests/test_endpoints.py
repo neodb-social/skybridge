@@ -13,6 +13,7 @@ import json
 
 import pytest
 from fastapi.testclient import TestClient
+from skybridge import stats
 from skybridge.atproto import identity
 from skybridge.atproto.replay import replay_file
 from skybridge.db import session_scope
@@ -318,9 +319,16 @@ def test_neodb_marker_guards_against_protocol_relative_open_redirect(client):
 
 
 def test_stats_json(client):
+    # The route serves the cache the app's refresh loop keeps warm; a bare
+    # TestClient runs no lifespan, so refresh it here.
+    asyncio.run(stats.refresh_stats())
+    asyncio.run(stats.refresh_usage())
     r = client.get("/stats")
     assert r.status_code == 200
-    assert r.json()["records_total"] > 0
+    doc = r.json()
+    assert doc["records_total"] > 0
+    assert doc == {**stats.collect_stats(), "stats_updated_at": doc["stats_updated_at"]}
+    assert doc["stats_updated_at"] is not None
 
 
 def test_catalog_index_renders(client):

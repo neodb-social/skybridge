@@ -7,6 +7,7 @@ import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from time import monotonic
 
 from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
@@ -25,6 +26,11 @@ _Session: sessionmaker[Session] | None = None
 # long archive import in one process, with blocking DB work dispatched to
 # threads via asyncio.to_thread — so writers do genuinely contend.
 _BUSY_TIMEOUT_MS = 15_000
+
+# Connections kept open, and the extra ones allowed under load (see
+# _make_engine).
+_POOL_SIZE = 10
+_POOL_OVERFLOW = 70
 
 # Columns added after the initial release. Base.metadata.create_all() creates
 # missing *tables* but never alters existing ones, so an upgraded deployment
@@ -71,6 +77,11 @@ def _configure_connection(engine: Engine) -> None:
             cursor.close()
 
 
+# The rows that hold a published, live Note. Partial indexes over just these
+# rows serve every public listing; SQLite uses one only when the query's WHERE
+# clause repeats both terms.
+PUBLISHED_PREDICATE = "ap_object_json IS NOT NULL AND deleted_at IS NULL"
+
 # Indexes on columns added after the initial release. create_all() builds the
 # indexes of a table it creates and nothing else, so a column _ensure_columns
 # adds to an existing table arrives unindexed however the model declares it —
@@ -85,14 +96,26 @@ _ADDED_INDEXES: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
         "ix_record_play_holder",
         "record",
         ("did", "play_group", "rkey"),
-        "ap_object_json IS NOT NULL AND deleted_at IS NULL",
+        PUBLISHED_PREDICATE,
     ),
+    # Partial, over the published Notes only: an author's newest posts (the
+    # profile page and the outbox) and a work's newest posts (the catalog
+    # page), each one index walk that stops at the page size.
+    ("ix_record_author_posts", "record", ("did", "created_at"), PUBLISHED_PREDICATE),
+    ("ix_record_work_posts", "record", ("work_key", "created_at"), PUBLISHED_PREDICATE),
 )
 
 
 def _ensure_columns(engine: Engine) -> None:
     """Add any post-release columns, and their indexes, missing from an
-    existing database."""
+    existing database.
+
+    A new index on a large table is built here, at startup, on purpose. The
+    build holds the write lock for as long as it reads the table (minutes on
+    a multi-gigabyte archive). Before ingestion starts, nothing waits on that
+    lock. Built later, beside live ingestion, every writer would time out on
+    ``busy_timeout`` and the Jetstream loop would skip those events.
+    """
     with engine.begin() as conn:
         for table, column, coltype in _ADDED_COLUMNS:
             existing = {
@@ -100,16 +123,32 @@ def _ensure_columns(engine: Engine) -> None:
             }
             if existing and column not in existing:
                 conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+        indexes = {
+            row[0]
+            for row in conn.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
         for name, table, columns, predicate in _ADDED_INDEXES:
+            if name in indexes:
+                continue
             present = {
                 row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
             }
             if set(columns) <= present:
                 spec = ", ".join(columns)
                 where = f" WHERE {predicate}" if predicate else ""
+                log.warning(
+                    "building index %s on %s; this reads the whole table and can take "
+                    "minutes on a large database",
+                    name,
+                    table,
+                )
+                started = monotonic()
                 conn.exec_driver_sql(
                     f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({spec}){where}"
                 )
+                log.warning("built index %s in %.1fs", name, monotonic() - started)
 
 
 def _make_engine() -> Engine:
@@ -128,7 +167,16 @@ def _make_engine() -> Engine:
         )
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     return create_engine(
-        f"sqlite:///{path}", connect_args={"check_same_thread": False}, future=True
+        f"sqlite:///{path}",
+        connect_args={"check_same_thread": False},
+        # Sync route handlers run on Starlette's thread pool (40 threads), and
+        # background work on the event loop's default executor. SQLAlchemy's
+        # default of 5 + 10 connections would make those threads queue for a
+        # connection, and fail after pool_timeout. A SQLite connection is
+        # cheap, so allow enough for all of them.
+        pool_size=_POOL_SIZE,
+        max_overflow=_POOL_OVERFLOW,
+        future=True,
     )
 
 
@@ -179,12 +227,18 @@ def optimize() -> None:
     wrong where two index the same columns: the teal.fm holder lookup takes
     the full ix_record_play_session over the partial ix_record_play_holder and
     walks a whole listening session, per scrobble. One pass over a populated
-    table settles it. ``PRAGMA optimize`` analyses only what has changed
-    enough to be worth it, so most passes do nothing at all.
+    table settles it.
+
+    A plain ``ANALYZE`` under ``analysis_limit``, not ``PRAGMA optimize``. The
+    pragma only looks at tables that queries on the *same connection* have
+    used, and this runs on a pooled connection that has used none, so it
+    left ``sqlite_stat1`` stating 356k rows for a ``record`` table that had
+    grown to 3.77M. With the limit, each index is sampled rather than read,
+    so a pass holds the write lock for milliseconds, not for a table scan.
     """
     with get_engine().begin() as conn:
         conn.exec_driver_sql(f"PRAGMA analysis_limit={_ANALYSIS_LIMIT}")
-        conn.exec_driver_sql("PRAGMA optimize")
+        conn.exec_driver_sql("ANALYZE")
 
 
 async def optimize_loop(interval: float = OPTIMIZE_INTERVAL) -> None:
