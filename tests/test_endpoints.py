@@ -21,7 +21,7 @@ from skybridge.main import app
 from skybridge.models import BridgedActor, Record, utcnow
 from skybridge.pipeline import process_event
 from skybridge.stats import refresh_usage, usage_counts
-from sqlalchemy import select
+from sqlalchemy import func, literal_column, select
 
 AP = {"accept": "application/activity+json"}
 
@@ -554,8 +554,76 @@ def test_archive_only_list_records_not_published(client, settings):
     # ...and absent from the outbox.
     outbox = client.get(f"/users/{handle}/outbox", headers=AP).json()
     assert outbox["type"] == "OrderedCollection"
-    assert settings.post_id(handle, rkey) not in outbox["orderedItems"]
+    assert settings.post_id(handle, rkey) not in outbox["first"]["orderedItems"]
     assert outbox["totalItems"] > 0
+
+
+def test_outbox_pages_reach_every_note(client, monkeypatch):
+    """Paged, so a heavy author's outbox stays bounded, and following `next`
+    reaches every Note exactly once, newest first."""
+    from datetime import timedelta
+
+    from skybridge import main
+
+    handle, at_uri, _rkey, _post_url = _the_review()
+    with session_scope() as session:
+        review = session.get(Record, at_uri)
+        assert review is not None
+        did = review.did
+        base = utcnow()
+        # Five more Notes, two of them created in the same instant: a page
+        # boundary between those two must neither skip nor repeat one.
+        for i, minutes in enumerate((1, 2, 2, 3, 4)):
+            rkey = f"3lpage{i:07d}"
+            session.add(
+                Record(
+                    at_uri=f"at://{did}/social.popfeed.feed.review/{rkey}",
+                    did=did,
+                    collection="social.popfeed.feed.review",
+                    rkey=rkey,
+                    ap_object_json=json.dumps({"id": f"https://bridge.test/n/{rkey}"}),
+                    created_at=base + timedelta(minutes=minutes),
+                )
+            )
+    with session_scope() as session:
+        count = session.scalar(
+            select(func.count()).where(
+                Record.did == did, Record.ap_object_json.isnot(None), Record.deleted_at.is_(None)
+            )
+        )
+        expected = [
+            json.loads(note)["id"]
+            for note in session.scalars(
+                select(Record.ap_object_json)
+                .where(
+                    Record.did == did,
+                    Record.ap_object_json.isnot(None),
+                    Record.deleted_at.is_(None),
+                )
+                .order_by(Record.created_at.desc(), literal_column("record.rowid").desc())
+            )
+            if note
+        ]
+    assert count == 6
+    monkeypatch.setattr(main, "OUTBOX_ITEMS", 2)
+
+    outbox = client.get(f"/users/{handle}/outbox", headers=AP).json()
+    assert outbox["totalItems"] == count
+    page = outbox["first"]
+    assert page["type"] == "OrderedCollectionPage"
+    assert page["partOf"] == outbox["id"]
+    seen = list(page["orderedItems"])
+    while "next" in page:
+        path = page["next"].split("bridge.test", 1)[1]
+        page = client.get(path, headers=AP).json()
+        assert page["partOf"] == outbox["id"]
+        seen += page["orderedItems"]
+    assert seen == expected
+
+    # A cursor that names no record yields an empty page, not an error.
+    empty = client.get(f"/users/{handle}/outbox?page=true&max_id=999999999", headers=AP).json()
+    assert empty["orderedItems"] == []
+    assert "next" not in empty
 
 
 # --------------------------------------------------------------------------- #
@@ -734,6 +802,29 @@ def test_catalog_item_aggregates_its_ratings(client):
     assert review["reviewBody"] == "even better on second thought"
     # Nested in the item it is about, so it does not repeat itemReviewed.
     assert "itemReviewed" not in review
+
+
+def test_archive_search_states_its_window(client):
+    """A search reads only the newest records; an empty result must not read
+    as "not in the archive"."""
+    from skybridge import main
+
+    page = client.get("/archive?q=no-such-text-anywhere").text
+    assert f"newest {main.ARCHIVE_SEARCH_ROWS:,} records" in page
+    assert "newest" not in client.get("/archive").text.split("<table", 1)[0]
+
+
+def test_a_retracted_rating_leaves_the_cached_average_at_once(client):
+    """The average is cached, but a retraction must not wait out the cache:
+    on a work with one reviewer, the average is that reviewer's score."""
+    _handle, at_uri, _rkey, _post_url = _the_review()
+    item = "/catalog/movie/imdbId-tt6710474"
+    assert "aggregateRating" in _schema_of(client.get(item).text)
+    with session_scope() as session:
+        record = session.get(Record, at_uri)
+        assert record is not None
+        record.deleted_at = utcnow()
+    assert "aggregateRating" not in _schema_of(client.get(item).text)
 
 
 def test_catalog_item_without_ratings_has_no_aggregate(client):

@@ -21,6 +21,7 @@ import os
 import re
 import secrets
 import threading
+from collections.abc import Sequence
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,7 +32,7 @@ from fastapi import FastAPI, Form, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import func, literal_column, or_, select
+from sqlalchemy import Row, func, literal, literal_column, or_, select, tuple_
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
@@ -60,7 +61,9 @@ _TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "web"))
 async def lifespan(app: FastAPI):
     logging.basicConfig(level=os.environ.get("SKYBRIDGE_LOG", "INFO"))
     telemetry.init_sentry()  # first, so failures below are captured when enabled
-    init_db()
+    # Before any task below starts: this is the one place planner statistics
+    # are refreshed, and ANALYZE holds the write lock (see db._refresh_stats).
+    init_db(refresh_stats=True)
     get_relay_keys()  # operator-provided; fail fast if missing
     worker = DeliveryWorker()
     worker.start()
@@ -101,9 +104,6 @@ async def lifespan(app: FastAPI):
     stats_task = asyncio.create_task(stats_refresh_loop(), name="stats-refresh")
     app.state.stats_task = stats_task
 
-    # The query planner's statistics are refreshed by init_db above, before
-    # any of these tasks start: ANALYZE holds the write lock, and ingestion
-    # writes from this loop (see db._refresh_stats).
     try:
         yield
     finally:
@@ -254,6 +254,11 @@ async def relay_inbox(request: Request) -> Response:
 AUTHOR_POSTS = "ix_record_author_posts"
 WORK_POSTS = "ix_record_work_posts"
 
+# Insertion order. `record` is a rowid table that never deletes a row, so its
+# rowid only grows; the primary key index on at_uri is a separate one. Every
+# index also ends on the rowid, so it breaks ties in an index's own order.
+_record_rowid = literal_column("record.rowid")
+
 
 def _published(stmt: Any, index: str, *where: Any) -> Any:
     """``stmt`` limited to the records that hold a live, published Note,
@@ -344,47 +349,90 @@ def user_followers(ident: str) -> Response:
     )
 
 
-# How many Note ids the outbox lists: the newest ones, like the profile page.
-# totalItems still counts them all.
+# Note ids per outbox page. An author can hold hundreds of thousands of Notes,
+# and each id is read out of its stored Note, so the outbox is paged.
 OUTBOX_ITEMS = 100
+
+_AS_CONTEXT = "https://www.w3.org/ns/activitystreams"
+
+
+def _outbox_page(
+    session: Session, actor: BridgedActor, outbox: str, max_id: int | None
+) -> dict[str, Any]:
+    """One ``OrderedCollectionPage`` of the author's Notes, newest first.
+
+    Keyed on the last item's rowid (``max_id``), so a page is one walk of
+    ix_record_author_posts from where the last one stopped, however deep.
+    The rowid breaks ties between equal ``created_at`` values, in the
+    index's own order.
+    """
+    settings = get_settings()
+    query = _published(
+        select(Record.rkey, Record.ap_object_json, _record_rowid),
+        AUTHOR_POSTS,
+        Record.did == actor.did,
+    )
+    rows: Sequence[Row[Any]] = []
+    after = None
+    if max_id is not None:
+        after = session.scalar(select(Record.created_at).where(_record_rowid == max_id))
+        if after is not None:
+            cursor = tuple_(literal(after, Record.created_at.type), literal(max_id))
+            query = query.where(tuple_(Record.created_at, _record_rowid) < cursor)
+    # A cursor that names no record has nothing after it.
+    if max_id is None or after is not None:
+        rows = session.execute(
+            query.order_by(Record.created_at.desc(), _record_rowid.desc()).limit(OUTBOX_ITEMS + 1)
+        ).all()
+    page_id = f"{outbox}?page=true" + (f"&max_id={max_id}" if max_id is not None else "")
+    doc: dict[str, Any] = {
+        "id": page_id,
+        "type": "OrderedCollectionPage",
+        "partOf": outbox,
+        # Prefer each Note's own id: posts minted before a rename keep the
+        # handle they were published under.
+        "orderedItems": [
+            _stored_object_id(ap_object_json) or settings.post_id(actor.handle, rkey)
+            for rkey, ap_object_json, _rowid in rows[:OUTBOX_ITEMS]
+        ],
+    }
+    if len(rows) > OUTBOX_ITEMS:
+        doc["next"] = f"{outbox}?page=true&max_id={rows[OUTBOX_ITEMS - 1][2]}"
+    return doc
 
 
 @app.get("/users/{ident}/outbox")
-def user_outbox(ident: str) -> Response:
+def user_outbox(ident: str, page: bool = False, max_id: int | None = None) -> Response:
     settings = get_settings()
     with session_scope() as session:
         actor = _actor_for_ident(session, ident)
         actor_id = settings.actor_id(actor.handle if actor is not None else ident)
-        items: list[str] = []
-        total = 0
-        if actor is not None:
-            # Bounded: an author can hold hundreds of thousands of Notes, and
-            # each id is read out of its stored Note.
-            rows = session.execute(
-                _published(
-                    select(Record.rkey, Record.ap_object_json),
-                    AUTHOR_POSTS,
-                    Record.did == actor.did,
-                )
-                .order_by(Record.created_at.desc())
-                .limit(OUTBOX_ITEMS)
-            ).all()
-            # Prefer each Note's own id: posts minted before a rename keep the
-            # handle they were published under.
-            items = [
-                _stored_object_id(ap_object_json) or settings.post_id(actor.handle, rkey)
-                for rkey, ap_object_json in rows
-            ]
-            total = _post_count(session, actor.did)
-    return ap_response(
-        {
-            "@context": "https://www.w3.org/ns/activitystreams",
-            "id": f"{actor_id}/outbox",
-            "type": "OrderedCollection",
-            "totalItems": total,
-            "orderedItems": items,
-        }
-    )
+        outbox = f"{actor_id}/outbox"
+        if actor is None:
+            return ap_response(
+                {
+                    "@context": _AS_CONTEXT,
+                    "id": outbox,
+                    "type": "OrderedCollection",
+                    "totalItems": 0,
+                    "orderedItems": [],
+                }
+            )
+        if page or max_id is not None:
+            return ap_response(
+                {"@context": _AS_CONTEXT, **_outbox_page(session, actor, outbox, max_id)}
+            )
+        # The collection carries its first page inline, so a reader that only
+        # wants the newest Notes needs one request; `next` leads to the rest.
+        return ap_response(
+            {
+                "@context": _AS_CONTEXT,
+                "id": outbox,
+                "type": "OrderedCollection",
+                "totalItems": _post_count(session, actor.did),
+                "first": _outbox_page(session, actor, outbox, None),
+            }
+        )
 
 
 # Records stored before render_facets validated link schemes may carry unsafe
@@ -517,7 +565,8 @@ def _review_schema(obj: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any] |
 # preview card, so one Note brings a burst of requests for the same work.
 RATING_TTL = 600.0
 _RATING_CACHE_MAX = 4096
-_rating_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
+# work_key -> (the work's Notes when counted, when, the average)
+_rating_cache: dict[str, tuple[tuple[Any, ...], float, dict[str, Any] | None]] = {}
 _rating_lock = threading.Lock()
 # The burst arrives all at once, so concurrent misses for one work must wait
 # for a single count rather than each run their own. Striped, so the locks
@@ -531,27 +580,45 @@ def reset_caches() -> None:
         _rating_cache.clear()
 
 
-def _cached_rating(work_key: str) -> tuple[bool, dict[str, Any] | None]:
+def _rating_token(work_key: str) -> tuple[Any, ...]:
+    """How many Notes the work has, and the newest one's creation time.
+
+    Read from ix_record_work_posts alone. A retraction takes its Note out of
+    that index and a new Note adds one, so either changes this, and the
+    cached average is recounted at once rather than after the TTL: an
+    opted-out author's score must not stay on the page.
+    """
+    query = select(func.count(), func.max(Record.created_at)).select_from(Record)
+    with session_scope() as session:
+        return tuple(
+            session.execute(_published(query, WORK_POSTS, Record.work_key == work_key)).one()
+        )
+
+
+def _cached_rating(work_key: str, token: tuple[Any, ...]) -> tuple[bool, dict[str, Any] | None]:
     with _rating_lock:
         hit = _rating_cache.get(work_key)
-    if hit is not None and monotonic() - hit[0] < RATING_TTL:
-        return True, hit[1]
+    if hit is not None and hit[0] == token and monotonic() - hit[1] < RATING_TTL:
+        return True, hit[2]
     return False, None
 
 
 def _aggregate_rating(work_key: str) -> dict[str, Any] | None:
     """The mean of every rating bridged for a work, or ``None`` if it has none.
 
-    Reused for :data:`RATING_TTL` seconds. Computing it parses every
-    published Note of the work, and a popular album has a Note for every
-    listening session of every listener.
+    Reused while the work's Notes stay the same (see :func:`_rating_token`),
+    for at most :data:`RATING_TTL` seconds, which bounds how long an edited
+    rating takes to show. Computing it parses every published Note of the
+    work, and a popular album has a Note for every listening session of
+    every listener.
     """
-    found, aggregate = _cached_rating(work_key)
+    token = _rating_token(work_key)
+    found, aggregate = _cached_rating(work_key, token)
     if found:
         return aggregate
     with _rating_count_locks[hash(work_key) % len(_rating_count_locks)]:
         # Another request may have counted it while this one waited.
-        found, aggregate = _cached_rating(work_key)
+        found, aggregate = _cached_rating(work_key, token)
         if found:
             return aggregate
         aggregate = _count_rating(work_key)
@@ -560,7 +627,7 @@ def _aggregate_rating(work_key: str) -> dict[str, Any] | None:
                 # Crude, and enough: the cache only absorbs bursts, so
                 # starting over costs one recount per work.
                 _rating_cache.clear()
-            _rating_cache[work_key] = (monotonic(), aggregate)
+            _rating_cache[work_key] = (token, monotonic(), aggregate)
     return aggregate
 
 
@@ -990,15 +1057,30 @@ async def admin_import_start(
     settings = get_settings()
     if not settings.jetstream_is_v2 or not settings.jetstream_api_key:
         msg = "Archive import needs a Jetstream v2 endpoint and SKYBRIDGE_JETSTREAM_API_KEY."
-    elif archive_replay.is_running():
-        msg = "An archive import is already running."
     else:
-        # Async because the import is a task on this loop; the job row is
-        # written from a thread first.
-        job_id = await run_in_threadpool(archive_replay.create_job, after_seq=after_seq)
-        archive_replay.start(job_id, worker=getattr(app.state, "worker", None))
-        msg = f"Archive import #{job_id} started in the background."
+        # Held across the await below: without it two submissions could both
+        # find nothing running while the first one writes its job row, and
+        # the archive is metered by the byte.
+        async with _ADMIN_IMPORT_LOCK:
+            msg = await _start_archive_import(after_seq)
     return await run_in_threadpool(_optout_page, request, session=session, message=msg)
+
+
+_ADMIN_IMPORT_LOCK = asyncio.Lock()
+
+
+async def _start_archive_import(after_seq: int) -> str:
+    if archive_replay.is_running():
+        return "An archive import is already running."
+    # Async because the import is a task on this loop; the job row is written
+    # from a thread first.
+    job_id = await run_in_threadpool(archive_replay.create_job, after_seq=after_seq)
+    if archive_replay.start(job_id, worker=getattr(app.state, "worker", None)):
+        return f"Archive import #{job_id} started in the background."
+    # The watcher started a resumed import meanwhile. Left pending, this job
+    # would run after it and could download the same range a second time.
+    await run_in_threadpool(archive_replay.discard_job, job_id)
+    return "An archive import is already running."
 
 
 @app.post("/manage/admin/import/resume", response_class=HTMLResponse)
@@ -1218,10 +1300,6 @@ def _anonymous_hidden_dids() -> Any:
 # archive: gigabytes, on a public page.
 ARCHIVE_SEARCH_ROWS = 50_000
 
-# Insertion order. `record` is a rowid table that never deletes a row, so its
-# rowid only grows; the primary key index on at_uri is a separate one.
-_RECORD_ROWID = literal_column("record.rowid")
-
 
 @app.get("/archive", response_class=HTMLResponse)
 def archive(request: Request, q: str = "") -> Response:
@@ -1232,13 +1310,13 @@ def archive(request: Request, q: str = "") -> Response:
         stmt = (
             select(Record)
             .where(Record.did.not_in(_anonymous_hidden_dids()))
-            .order_by(_RECORD_ROWID.desc())
+            .order_by(_record_rowid.desc())
         )
         if q:
             like = f"%{q}%"
-            newest = session.scalar(select(func.max(_RECORD_ROWID)).select_from(Record)) or 0
+            newest = session.scalar(select(func.max(_record_rowid)).select_from(Record)) or 0
             stmt = stmt.where(
-                newest - ARCHIVE_SEARCH_ROWS < _RECORD_ROWID,
+                _record_rowid > newest - ARCHIVE_SEARCH_ROWS,
                 or_(
                     Record.collection.like(like),
                     Record.rkey.like(like),
@@ -1249,7 +1327,13 @@ def archive(request: Request, q: str = "") -> Response:
     return _TEMPLATES.TemplateResponse(
         request,
         "archive.html",
-        {"rows": _record_rows(rows), "total": len(rows), "q": q, "settings": get_settings()},
+        {
+            "rows": _record_rows(rows),
+            "total": len(rows),
+            "q": q,
+            "search_rows": ARCHIVE_SEARCH_ROWS,
+            "settings": get_settings(),
+        },
     )
 
 

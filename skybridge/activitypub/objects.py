@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select, text
@@ -49,7 +50,27 @@ def _record_for(ident: str, rkey: str) -> Record | None:
         uris = [f"at://{did}/{name}/{rkey}" for name in session.scalars(_COLLECTIONS)]
         if not uris:
             return None
-        return session.scalar(select(Record).where(Record.at_uri.in_(uris)).limit(1))
+        rows = [
+            row
+            for row in session.scalars(select(Record).where(Record.at_uri.in_(uris)))
+            if row is not None
+        ]
+    # Two collections can hold the same rkey: a teal.fm tracker copying its
+    # plays off the alpha namespace writes each rkey under both, and only one
+    # copy holds the Note (see pipeline._process_play). Serve the live Note,
+    # else a row peers know (a Tombstone, or a pending retraction), else an
+    # archive-only copy.
+    return min(rows, key=_post_order) if rows else None
+
+
+def _post_order(row: Record) -> tuple[int, datetime]:
+    if row.ap_object_json is not None and row.deleted_at is None:
+        rank = 0
+    elif row.ap_object_json is not None or row.ap_activity_json is not None:
+        rank = 1
+    else:
+        rank = 2
+    return rank, row.created_at
 
 
 @dataclass(frozen=True)

@@ -309,7 +309,10 @@ def test_no_route_queries_on_the_event_loop(operator):
         ("GET", "/actor"): [("/actor", {})],
         ("GET", "/users/{ident}"): [(f"/users/{handle}", {}), (f"/users/{handle}", ap)],
         ("GET", "/users/{ident}/followers"): [(f"/users/{handle}/followers", {})],
-        ("GET", "/users/{ident}/outbox"): [(f"/users/{handle}/outbox", {})],
+        ("GET", "/users/{ident}/outbox"): [
+            (f"/users/{handle}/outbox", {}),
+            (f"/users/{handle}/outbox?page=true&max_id=999999", {}),
+        ],
         ("GET", "/users/{ident}/posts/{rkey}"): [
             (f"/users/{handle}/posts/{post.rkey}", {}),
             (f"/users/{handle}/posts/{post.rkey}", ap),

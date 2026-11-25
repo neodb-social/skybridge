@@ -717,8 +717,8 @@ def test_the_holder_lookup_does_not_walk_a_long_session(settings):
     # The holder of a session's Note is its OLDEST play, and the lookup runs
     # newest-first per scrobble: without an index that holds only the
     # published rows, a session costs more to extend the longer it gets.
-    from skybridge.db import get_engine, optimize
-    from skybridge.pipeline import _active_plays
+    from skybridge.db import get_engine
+    from skybridge.pipeline import _holder_query
 
     group = "music:album#0000000000001"
     rows = [
@@ -738,9 +738,10 @@ def test_the_holder_lookup_does_not_walk_a_long_session(settings):
     ]
     with session_scope() as session:
         session.execute(insert(Record), rows)
-    optimize()  # the planner picks the partial index only with statistics
-
-    query = _active_plays(DID, group).where(Record.ap_object_json.is_not(None)).limit(1)
+    # No ANALYZE: a database populated after the server started has no
+    # statistics until the next start, and left to itself the planner then
+    # prefers ix_record_play_session. The lookup pins the partial index.
+    query = _holder_query(DID, group)
     engine = get_engine()
     sql = str(query.compile(engine, compile_kwargs={"literal_binds": True}))
     with engine.begin() as conn:
@@ -769,6 +770,21 @@ def test_the_same_rkey_under_both_nsids_shares_one_session(settings):
     assert alpha is not None and alpha.activity["type"] == "Create"
     assert _row(alpha.at_uri).play_group != _row(first.at_uri).play_group
     assert _json(_row(alpha.at_uri).ap_object_json)["id"].endswith("/posts/3lplay000002")
+
+
+def test_a_shared_rkey_serves_the_copy_that_holds_the_note(settings):
+    """The alpha copy's at:// URI sorts first, but it holds no Note: the post
+    URL both copies share must still dereference the original's Note."""
+    from skybridge.activitypub import objects
+
+    start = datetime(2026, 9, 7, 15, 22, tzinfo=UTC)
+    first = _run(_commit("3lplay000001", _played(PLAY, start)))
+    _run(_commit("3lplay000001", _played(_alpha(PLAY), start)))
+    assert first is not None
+    view = objects.get_post_view(DID, "3lplay000001")
+    assert view is not None
+    assert view.at_uri == first.at_uri
+    assert view.document["type"] == "Note"
 
 
 def test_a_real_change_is_not_held_back_by_the_refresh_interval(settings):

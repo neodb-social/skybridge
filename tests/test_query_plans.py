@@ -17,8 +17,8 @@ import pytest
 from skybridge import db, main
 from skybridge.activitypub import objects
 from skybridge.config import Settings, set_settings
-from skybridge.models import Record
-from sqlalchemy import event
+from skybridge.models import BridgedActor, Record
+from sqlalchemy import event, literal_column, select
 
 HEAVY = "did:plc:heavy0000000000000000000"
 WORK = "album:mb-popular"
@@ -136,6 +136,24 @@ def test_listings_walk_their_partial_index(upgraded, page, run, index):
     assert "TEMP B-TREE" not in plan, (page, plan)
 
 
+def test_a_deep_outbox_page_walks_the_index_from_its_cursor(upgraded):
+    with db.session_scope() as session:
+        actor = BridgedActor(did=HEAVY, handle="heavy.test", private_key_pem="", public_key_pem="")
+        session.add(actor)
+        session.flush()
+        cursor = session.scalar(
+            select(literal_column("rowid")).select_from(Record).where(Record.rkey == "r00001000")
+        )
+
+        def page() -> None:
+            main._outbox_page(session, actor, "https://bridge.test/outbox", cursor)
+
+        plans = _plans(page)
+    listing = [plan for plan in plans if "ix_record_author_posts" in plan]
+    assert listing, plans
+    assert "TEMP B-TREE" not in listing[0], listing[0]
+
+
 def test_listing_results(upgraded):
     """Pinning the index changes how the rows are found, not which."""
     assert _count(HEAVY) == 100
@@ -168,9 +186,9 @@ def _did_stat() -> str:
         ).scalar_one()
 
 
-def _reopen() -> None:
+def _reopen(*, server: bool = True) -> None:
     db.get_engine().dispose()
-    db.init_db()
+    db.init_db(refresh_stats=server)
 
 
 def test_startup_reanalyzes_a_table_that_outgrew_its_statistics(settings, tmp_path):
@@ -181,6 +199,10 @@ def test_startup_reanalyzes_a_table_that_outgrew_its_statistics(settings, tmp_pa
     db.optimize()
     assert _did_stat().startswith("12000 ")
     _insert_plays(12_000, 20_000)  # 32k rows: past twice the recorded 12k
+    # A CLI command may run beside the live server, so it leaves them be...
+    _reopen(server=False)
+    assert _did_stat().startswith("12000 ")
+    # ...and the server's own startup refreshes them.
     _reopen()
     assert _did_stat().startswith("32000 ")
     db.get_engine().dispose()
