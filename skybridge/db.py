@@ -9,7 +9,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from time import monotonic
 
-from sqlalchemy import Engine, create_engine, event
+from sqlalchemy import Connection, Engine, FromClause, create_engine, event
+from sqlalchemy.dialects.sqlite.base import SQLiteCompiler
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -17,6 +18,34 @@ from skybridge.config import get_settings
 from skybridge.models import Base
 
 log = logging.getLogger("skybridge.db")
+
+
+class _HintingCompiler(SQLiteCompiler):
+    """The SQLite compiler, rendering table hints.
+
+    SQLAlchemy's own drops them, so ``Select.with_hint()`` renders nothing
+    on SQLite; the MySQL and MSSQL compilers implement this same hook to
+    render theirs. With it, a query can pin its index: see :func:`indexed_by`.
+    """
+
+    def get_from_hint_text(self, table: FromClause, text: str | None) -> str | None:
+        return text
+
+
+def indexed_by(index: str) -> str:
+    """A ``with_hint`` text that makes SQLite use ``index`` for the table.
+
+    For the public listings, which each have a partial index made for them.
+    SQLite's statistics hold one average per index, and the archive is
+    skewed: published Notes cluster on popular works and heavy authors, so
+    the partial index can look wider on average than ``ix_record_work_key``
+    or ``ix_record_did``, which hold every row. The planner then reads every
+    row of an album with thousands of plays to find the hundred it lists.
+    Pinned, the query fails loudly if the index cannot serve it, rather than
+    quietly turning into that scan.
+    """
+    return f"INDEXED BY {index}"
+
 
 _engine: Engine | None = None
 _Session: sessionmaker[Session] | None = None
@@ -31,6 +60,8 @@ _BUSY_TIMEOUT_MS = 15_000
 # _make_engine).
 _POOL_SIZE = 10
 _POOL_OVERFLOW = 70
+# Seconds a pooled connection is reused before it is reopened.
+_POOL_RECYCLE = 3600
 
 # Columns added after the initial release. Base.metadata.create_all() creates
 # missing *tables* but never alters existing ones, so an upgraded deployment
@@ -115,7 +146,12 @@ def _ensure_columns(engine: Engine) -> None:
     a multi-gigabyte archive). Before ingestion starts, nothing waits on that
     lock. Built later, beside live ingestion, every writer would time out on
     ``busy_timeout`` and the Jetstream loop would skip those events.
+
+    A new index gets its statistics at once, too. Until it has some, SQLite
+    guesses its size by shape and can prefer an older, wider index plus a
+    sort, which for a popular work reads every one of its rows.
     """
+    built = False
     with engine.begin() as conn:
         for table, column, coltype in _ADDED_COLUMNS:
             existing = {
@@ -149,9 +185,18 @@ def _ensure_columns(engine: Engine) -> None:
                     f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({spec}){where}"
                 )
                 log.warning("built index %s in %.1fs", name, monotonic() - started)
+                built = True
+        if built:
+            _analyze(conn)
 
 
 def _make_engine() -> Engine:
+    engine = _new_engine()
+    engine.dialect.statement_compiler = _HintingCompiler
+    return engine
+
+
+def _new_engine() -> Engine:
     settings = get_settings()
     path = settings.db_path
     # check_same_thread=False so the async delivery worker and request handlers
@@ -176,6 +221,11 @@ def _make_engine() -> Engine:
         # cheap, so allow enough for all of them.
         pool_size=_POOL_SIZE,
         max_overflow=_POOL_OVERFLOW,
+        # A connection reads the planner statistics once, when it opens, and
+        # never sees a later ANALYZE run on another one. Reopening each
+        # connection after an hour lets the daily pass (see optimize) reach
+        # every connection the pool holds.
+        pool_recycle=_POOL_RECYCLE,
         future=True,
     )
 
@@ -234,11 +284,18 @@ def optimize() -> None:
     used, and this runs on a pooled connection that has used none, so it
     left ``sqlite_stat1`` stating 356k rows for a ``record`` table that had
     grown to 3.77M. With the limit, each index is sampled rather than read,
-    so a pass holds the write lock for milliseconds, not for a table scan.
+    so a pass holds the write lock briefly, not for a table scan.
+
+    Other open connections keep the statistics they loaded when they opened;
+    the pool reopens them within ``_POOL_RECYCLE`` seconds.
     """
     with get_engine().begin() as conn:
-        conn.exec_driver_sql(f"PRAGMA analysis_limit={_ANALYSIS_LIMIT}")
-        conn.exec_driver_sql("ANALYZE")
+        _analyze(conn)
+
+
+def _analyze(conn: Connection) -> None:
+    conn.exec_driver_sql(f"PRAGMA analysis_limit={_ANALYSIS_LIMIT}")
+    conn.exec_driver_sql("ANALYZE")
 
 
 async def optimize_loop(interval: float = OPTIMIZE_INTERVAL) -> None:

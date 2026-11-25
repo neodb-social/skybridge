@@ -45,7 +45,7 @@ from skybridge.activitypub.relays import reconcile_relays
 from skybridge.atproto import archive as archive_replay
 from skybridge.atproto import backfill, discover, identity, jetstream, oauth
 from skybridge.config import get_settings
-from skybridge.db import init_db, optimize_loop, session_scope
+from skybridge.db import indexed_by, init_db, optimize_loop, session_scope
 from skybridge.models import BridgedActor, Cursor, Record, Work
 from skybridge.stats import cached_stats, stats_refresh_loop, usage_refresh_loop
 from skybridge.translate import works
@@ -253,21 +253,29 @@ async def relay_inbox(request: Request) -> Response:
     return await _inbox(request, get_settings().relay_actor_id)
 
 
-def _published(*where: Any) -> tuple[Any, ...]:
-    """WHERE terms for the records that hold a live, published Note.
+# The partial indexes over the published Notes (see models.Record), one for
+# each way the public pages list them.
+AUTHOR_POSTS = "ix_record_author_posts"
+WORK_POSTS = "ix_record_work_posts"
 
-    The two terms are the predicate of the partial indexes that serve the
-    public listings (ix_record_author_posts, ix_record_work_posts,
-    ix_record_play_holder). SQLite uses such an index only when the query
-    repeats its predicate, so every listing goes through here.
+
+def _published(stmt: Any, index: str, *where: Any) -> Any:
+    """``stmt`` limited to the records that hold a live, published Note,
+    and read through ``index``, one of the partial indexes over exactly them.
+
+    The two terms below are those indexes' predicate: SQLite can use one
+    only when the query repeats it. The index is pinned rather than left to
+    the planner; see :func:`skybridge.db.indexed_by` for why.
     """
-    return (Record.ap_object_json.isnot(None), Record.deleted_at.is_(None), *where)
+    return stmt.with_hint(Record, indexed_by(index), "sqlite").where(
+        Record.ap_object_json.isnot(None), Record.deleted_at.is_(None), *where
+    )
 
 
 def _post_count(session: Session, did: str) -> int:
-    """How many live Notes ``did`` has: a count over the partial index."""
-    count = select(func.count()).select_from(Record).where(*_published(Record.did == did))
-    return session.scalar(count) or 0
+    """How many live Notes ``did`` has: a count over the partial index alone."""
+    count = select(func.count()).select_from(Record)
+    return session.scalar(_published(count, AUTHOR_POSTS, Record.did == did)) or 0
 
 
 @app.get("/users/{ident}")
@@ -302,7 +310,7 @@ def get_user(ident: str, request: Request) -> Response:
     posts = (
         []
         if profile["no_unauthenticated"]
-        else _record_rows(_recent_posts(Record.did == profile["did"]))
+        else _record_rows(_recent_posts(AUTHOR_POSTS, Record.did == profile["did"]))
     )
     return _TEMPLATES.TemplateResponse(
         request,
@@ -357,8 +365,11 @@ def user_outbox(ident: str) -> Response:
             # Bounded: an author can hold hundreds of thousands of Notes, and
             # each id is read out of its stored Note.
             rows = session.execute(
-                select(Record.rkey, Record.ap_object_json)
-                .where(*_published(Record.did == actor.did))
+                _published(
+                    select(Record.rkey, Record.ap_object_json),
+                    AUTHOR_POSTS,
+                    Record.did == actor.did,
+                )
                 .order_by(Record.created_at.desc())
                 .limit(OUTBOX_ITEMS)
             ).all()
@@ -553,7 +564,7 @@ def _count_rating(work_key: str) -> dict[str, Any] | None:
     """
     with session_scope() as session:
         notes = session.scalars(
-            select(Record.ap_object_json).where(*_published(Record.work_key == work_key))
+            _published(select(Record.ap_object_json), WORK_POSTS, Record.work_key == work_key)
         )
         facets = [_facets(json.loads(note)).get("Rating") for note in notes if note]
     scored = [(facet, _rating_value(facet)) for facet in facets if facet is not None]
@@ -710,6 +721,7 @@ def get_catalog(work_type: str, work_id: str, request: Request) -> Response:
     # of the listing. The rating average counts them all the same: see
     # _aggregate_rating.
     records = _recent_posts(
+        WORK_POSTS,
         Record.work_key == work_key,
         Record.did.not_in(_anonymous_hidden_dids()),
     )
@@ -1143,19 +1155,19 @@ def _record_rows(rows: list[Record]) -> list[dict[str, Any]]:
 RECENT_POSTS = 100
 
 
-def _recent_posts(*where: Any) -> list[Record]:
+def _recent_posts(index: str, *where: Any) -> list[Record]:
     """The most recently bridged live posts matching ``where``, newest first.
 
     Restricted to records that were actually published to AP and are not
     tombstoned — the ones with a post page to link to. Ordered like
     :func:`user_outbox`, so a profile listing agrees with the AP collection of
-    the same posts.
+    the same posts. ``index`` (:data:`AUTHOR_POSTS` or :data:`WORK_POSTS`)
+    holds these rows in this order, so the query stops at the page size.
     """
     with session_scope() as session:
         return list(
             session.scalars(
-                select(Record)
-                .where(*_published(*where))
+                _published(select(Record), index, *where)
                 .order_by(Record.created_at.desc())
                 .limit(RECENT_POSTS)
             )
