@@ -111,9 +111,9 @@ def _count(did: str) -> int:
             lambda: main._recent_posts(main.AUTHOR_POSTS, Record.did == HEAVY),
             "INDEX ix_record_author_posts",
         ),
-        # Not a covering read: SQLite still checks the predicate columns on
-        # each row of a partial index. Bounded by the author's Notes, though,
-        # not by every play they ever scrobbled.
+        # Labelled a plain, not covering, index search. The bytecode only
+        # defers a seek it never makes, since the index's own predicate
+        # already holds: 34k Notes counted in 2 ms on a 1M-row archive.
         ("post count", lambda: _count(HEAVY), "INDEX ix_record_author_posts"),
         (
             "catalog listing",
@@ -146,6 +146,57 @@ def test_listing_results(upgraded):
     listed = main._recent_posts(main.WORK_POSTS, Record.work_key == WORK)
     assert len(listed) == 75
     assert {r.work_key for r in listed} == {WORK}
+
+
+def _insert_plays(start: int, count: int) -> None:
+    with db.get_engine().begin() as conn:
+        conn.exec_driver_sql(
+            "INSERT INTO record (at_uri, did, collection, rkey, source_json, op, created_at,"
+            " updated_at) VALUES (?, ?, 'fm.teal.feed.play', ?, '{}', 'create',"
+            " '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
+            [
+                (f"at://did:plc:p{i % 97}/fm.teal.feed.play/{i}", f"did:plc:p{i % 97}", str(i))
+                for i in range(start, start + count)
+            ],
+        )
+
+
+def _did_stat() -> str:
+    with db.get_engine().connect() as conn:
+        return conn.exec_driver_sql(
+            "SELECT stat FROM sqlite_stat1 WHERE idx = 'ix_record_did'"
+        ).scalar_one()
+
+
+def _reopen() -> None:
+    db.get_engine().dispose()
+    db.init_db()
+
+
+def test_startup_reanalyzes_a_table_that_outgrew_its_statistics(settings, tmp_path):
+    """Production's sqlite_stat1 said 356k rows for a 3.77M-row record table."""
+    set_settings(replace(settings, db_path=str(tmp_path / "skybridge.db")))
+    db.init_db()
+    _insert_plays(0, 12_000)
+    db.optimize()
+    assert _did_stat().startswith("12000 ")
+    _insert_plays(12_000, 20_000)  # 32k rows: past twice the recorded 12k
+    _reopen()
+    assert _did_stat().startswith("32000 ")
+    db.get_engine().dispose()
+
+
+def test_startup_leaves_current_statistics_alone(settings, tmp_path):
+    """ANALYZE holds the write lock while it walks every index, so a boot
+    whose statistics still fit the table skips it."""
+    set_settings(replace(settings, db_path=str(tmp_path / "skybridge.db")))
+    db.init_db()
+    _insert_plays(0, 12_000)
+    db.optimize()
+    _insert_plays(12_000, 6_000)  # 18k rows: within twice the recorded 12k
+    _reopen()
+    assert _did_stat().startswith("12000 ")
+    db.get_engine().dispose()
 
 
 def test_post_lookups_read_no_table_scan(upgraded):

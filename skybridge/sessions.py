@@ -35,7 +35,9 @@ _SESSIONS: dict[str, Session] = {}
 def create(did: str, handle: str) -> str:
     """Open a session for a verified account; returns the cookie token."""
     now = time.time()
-    for key in [k for k, s in _SESSIONS.items() if s.expires_at < now]:
+    # Snapshot first: sync route handlers run on worker threads, and get()
+    # there pops expired sessions while this iterates.
+    for key in [k for k, s in list(_SESSIONS.items()) if s.expires_at < now]:
         _SESSIONS.pop(key, None)
     if len(_SESSIONS) >= _SESSIONS_MAX:
         _SESSIONS.clear()  # under abuse, drop sessions rather than memory

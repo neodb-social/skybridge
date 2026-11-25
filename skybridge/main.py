@@ -45,7 +45,7 @@ from skybridge.activitypub.relays import reconcile_relays
 from skybridge.atproto import archive as archive_replay
 from skybridge.atproto import backfill, discover, identity, jetstream, oauth
 from skybridge.config import get_settings
-from skybridge.db import indexed_by, init_db, optimize_loop, session_scope
+from skybridge.db import indexed_by, init_db, session_scope
 from skybridge.models import BridgedActor, Cursor, Record, Work
 from skybridge.stats import cached_stats, stats_refresh_loop, usage_refresh_loop
 from skybridge.translate import works
@@ -101,10 +101,9 @@ async def lifespan(app: FastAPI):
     stats_task = asyncio.create_task(stats_refresh_loop(), name="stats-refresh")
     app.state.stats_task = stats_task
 
-    # Keeps the query planner's statistics current as the archive grows; see
-    # db.optimize for what goes wrong without them.
-    optimize_task = asyncio.create_task(optimize_loop(), name="db-optimize")
-    app.state.optimize_task = optimize_task
+    # The query planner's statistics are refreshed by init_db above, before
+    # any of these tasks start: ANALYZE holds the write lock, and ingestion
+    # writes from this loop (see db._refresh_stats).
     try:
         yield
     finally:
@@ -122,9 +121,6 @@ async def lifespan(app: FastAPI):
         stats_task.cancel()
         with suppress(asyncio.CancelledError):
             await stats_task
-        optimize_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await optimize_task
         if not relay_task.done():
             relay_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -523,12 +519,24 @@ RATING_TTL = 600.0
 _RATING_CACHE_MAX = 4096
 _rating_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
 _rating_lock = threading.Lock()
+# The burst arrives all at once, so concurrent misses for one work must wait
+# for a single count rather than each run their own. Striped, so the locks
+# stay a fixed set however many works are requested.
+_rating_count_locks = tuple(threading.Lock() for _ in range(64))
 
 
 def reset_caches() -> None:
     """Forget the per-work rating averages (tests, and a swapped database)."""
     with _rating_lock:
         _rating_cache.clear()
+
+
+def _cached_rating(work_key: str) -> tuple[bool, dict[str, Any] | None]:
+    with _rating_lock:
+        hit = _rating_cache.get(work_key)
+    if hit is not None and monotonic() - hit[0] < RATING_TTL:
+        return True, hit[1]
+    return False, None
 
 
 def _aggregate_rating(work_key: str) -> dict[str, Any] | None:
@@ -538,18 +546,21 @@ def _aggregate_rating(work_key: str) -> dict[str, Any] | None:
     published Note of the work, and a popular album has a Note for every
     listening session of every listener.
     """
-    now = monotonic()
-    with _rating_lock:
-        hit = _rating_cache.get(work_key)
-    if hit is not None and now - hit[0] < RATING_TTL:
-        return hit[1]
-    aggregate = _count_rating(work_key)
-    with _rating_lock:
-        if len(_rating_cache) >= _RATING_CACHE_MAX:
-            # Crude, and enough: the cache only absorbs bursts, so starting
-            # over costs one recount per work.
-            _rating_cache.clear()
-        _rating_cache[work_key] = (now, aggregate)
+    found, aggregate = _cached_rating(work_key)
+    if found:
+        return aggregate
+    with _rating_count_locks[hash(work_key) % len(_rating_count_locks)]:
+        # Another request may have counted it while this one waited.
+        found, aggregate = _cached_rating(work_key)
+        if found:
+            return aggregate
+        aggregate = _count_rating(work_key)
+        with _rating_lock:
+            if len(_rating_cache) >= _RATING_CACHE_MAX:
+                # Crude, and enough: the cache only absorbs bursts, so
+                # starting over costs one recount per work.
+                _rating_cache.clear()
+            _rating_cache[work_key] = (monotonic(), aggregate)
     return aggregate
 
 

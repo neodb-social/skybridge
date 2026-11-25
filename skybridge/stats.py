@@ -219,12 +219,13 @@ def usage_counts() -> dict[str, int]:
         #
         # local_posts: archived-only records (lists, collection membership,
         # merged-away pairs) never became a Note, so they are not posts this
-        # node serves. count(column) skips the NULLs.
+        # node serves. Tested with IS NOT NULL rather than count(column), which
+        # would load every stored Note to count it.
         records_active, active_month, local_posts = session.execute(
             select(
                 func.count(),
                 func.count(func.distinct(case((Record.updated_at >= cutoff, Record.did)))),
-                func.count(Record.ap_object_json),
+                func.count(case((Record.ap_object_json.isnot(None), 1))),
             ).where(Record.deleted_at.is_(None))
         ).one()
         relays_accepted = session.scalar(
